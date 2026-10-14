@@ -1,0 +1,13 @@
+{
+  "name": "devcorner",
+  "owner": {
+    "name": "devcorner"
+  },
+  "plugins": [
+    {
+      "name": "devcorner",
+      "source": "./",
+      "description": "Connects Claude Code to devcorner, and opens and closes a devcorner session with each conversation."
+    }
+  ]
+}

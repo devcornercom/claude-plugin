@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "devcorner": {
+      "type": "http",
+      "url": "${DEVCORNER_URL:-https://devcorner.devcorner.workers.dev}/mcp"
+    }
+  }
+}
