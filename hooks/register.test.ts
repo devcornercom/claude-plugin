@@ -3,11 +3,13 @@ import type { TestBody } from "claude-code/testing";
 import type { On } from "claude-code";
 import type { Status, StatusWake } from "../types";
 import {
+  CLOSED_LINE,
   DOWN_MS,
   HOLD_MS,
   IDLE_MS,
   MAX_DOWN_MS,
   MAX_UPDATING_MS,
+  OPEN_LINE,
   QUICK_MAX,
   UPDATING_GRACE_MS,
   UPDATING_LINE,
@@ -24,7 +26,7 @@ import {
   backoff,
   capacityBody,
   capacityDue,
-  capacityFile,
+  CARRIER,
   capacityReading,
   markerFile,
   markerText,
@@ -980,6 +982,56 @@ describe("the row above the prompt, drawn", () => {
     // The row itself stays closed.
     expect((await drawn($)).lines).toHaveLength(1);
   });
+
+  test("/dc more and /dc less open and close the row as its button does, for a terminal that passes no click (dc-t225)", async ($, on) => {
+    const { clock, seen } = world(on);
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await clock.settle();
+    seen.answer = PICTURED;
+    const asked = seen.asks;
+    expect(await $.command.run({ command: "dc", args: " more " })).toEqual({
+      text: OPEN_LINE,
+    });
+    await clock.settle();
+    // Opened, it asks for the picture at once, as the button does.
+    expect(seen.asks).toBe(asked + 1);
+    expect(seen.statusBodies.at(-1)).toMatchObject({ expanded: true });
+    expect((await drawn($)).lines).toEqual(
+      lines(PICTURED).map((line, i) => (i === 0 ? line : `  ${line}`)),
+    );
+    expect(
+      (await (await mountRow($)).find({ type: "Button" }))?.props,
+    ).toMatchObject({ label: "less" });
+
+    // Opened by the command, the button closes it; less after it keeps it so.
+    await press($, "less");
+    await clock.settle();
+    expect((await drawn($)).lines).toHaveLength(1);
+    expect(await $.command.run({ command: "dc", args: "less" })).toEqual({
+      text: CLOSED_LINE,
+    });
+    expect((await drawn($)).lines).toHaveLength(1);
+
+    // Opened by the button, the command closes it, and asks nothing. The row
+    // already on screen is drawn again: the write alone redraws its readers.
+    await press($, "more");
+    await clock.settle();
+    const shown = await mountRow($);
+    expect((await shown.find({ type: "Button" }))?.props).toMatchObject({
+      label: "less",
+    });
+    const open = seen.asks;
+    expect(await $.command.run({ command: "dc", args: "less" })).toEqual({
+      text: CLOSED_LINE,
+    });
+    await clock.settle();
+    expect(seen.asks).toBe(open);
+    expect((await shown.find({ type: "Button" }))?.props).toMatchObject({
+      label: "more",
+    });
+    expect(seen.submitted).toEqual([]);
+  });
 });
 
 describe("while devcorner is updating, after a deploy", () => {
@@ -1342,8 +1394,7 @@ describe("capacity readings", () => {
   });
 });
 
-describe("the readings file, with no token (dc-t221)", () => {
-  const FILE = "/home/ann/.cache/devcorner/capacity.json";
+describe("a cloud session's reading rides on its devcorner calls, with no token (dc-t221)", () => {
   const RESETS = "2026-10-14T14:00:00.000Z";
   const WEEK = "2026-10-21T01:00:00.000Z";
   const limits = (five: number, seven: number) => [
@@ -1351,23 +1402,29 @@ describe("the readings file, with no token (dc-t221)", () => {
     { kind: "seven_day", percentUsed: seven, resetsAt: WEEK },
     { kind: "spend_limit", percentUsed: 1 },
   ];
-  const measure = (five: number, seven: number) => ({
-    changed: ["rateLimits"],
-    rateLimits: limits(five, seven),
-  });
-  const written = (seen: { writes: { path: string; text: string }[] }) =>
-    seen.writes
-      .filter((w) => w.path === FILE)
-      .map((w) => JSON.parse(w.text) as Record<string, any>);
-
-  test("is kept beside the marker, in the folder the hook script names", () => {
-    expect(capacityFile({ home: "/home/ann" })).toBe(FILE);
-    expect(capacityFile({ cache: "/c", home: "/home/ann" })).toBe(
-      "/c/devcorner/capacity.json",
-    );
-    expect(capacityFile({ state: "/s" })).toBe("/s/capacity.json");
-    expect(capacityFile({})).toBe(undefined);
-  });
+  /** The calls that reached the tools, as they went out; `failing` answers them with an error. */
+  const tools = (on: On) => {
+    const got = {
+      calls: [] as Record<string, unknown>[],
+      failing: false,
+      /** A permission check refuses any call that carries a reading. */
+      refusing: false,
+      /** While set, a call waits until the test lets it answer. */
+      held: null as Promise<void> | null,
+    };
+    on("tool.call", async (_$, e) => {
+      got.calls.push({ ...e });
+      if (got.held) await got.held;
+      if (got.refusing && "capacity" in e) return { deny: "Auto-Mode Bypass" };
+      return got.failing
+        ? { isError: true as const, result: "refused" }
+        : { result: "ok" };
+    });
+    return got;
+  };
+  /** The five-hour percent each call carried, or null for none. */
+  const carried = (got: { calls: Record<string, unknown>[] }) =>
+    got.calls.map((c) => (c.capacity as any)?.five_hour?.percent ?? null);
 
   test("holds each window's percent and reset time and when they were read, nothing else", () => {
     expect(capacityReading(limits(4, 1), Date.parse(RESETS))).toEqual({
@@ -1394,79 +1451,198 @@ describe("the readings file, with no token (dc-t221)", () => {
     expect(DUE_THRESHOLDS).toEqual([80, 95]);
   });
 
-  test("a measure writes a reading that is due, and posts nothing", async ($, on) => {
+  test("the calls that carry it are devcorner's start, check, note, finish and usage, by the connector's name or the plugin's", () => {
+    for (const tool of [
+      "mcp__Devcorner__start",
+      "mcp__devcorner__check",
+      "mcp__plugin_devcorner_devcorner__note",
+      "mcp__claude_ai_devcorner__finish",
+      "mcp__devcorner-app__usage",
+    ]) {
+      expect(CARRIER.test(tool)).toBe(true);
+    }
+    for (const tool of [
+      "mcp__Devcorner__show",
+      "mcp__linear__start",
+      "mcp__github__check",
+      "mcp__Devcorner__start_x",
+      "Bash",
+    ]) {
+      expect(CARRIER.test(tool)).toBe(false);
+    }
+  });
+
+  test("a devcorner call carries a reading that is due; nothing is posted and no file is written", async ($, on) => {
     const { clock, seen } = world(on, {
       token: false,
       remote: true,
       home: "/home/ann",
     });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
     await $.session.start(START);
     await flush(clock);
-    await ($.session as any).measure(measure(4, 1));
-    await flush(clock);
-    expect(written(seen)).toEqual([
-      {
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Work" });
+    expect(got.calls[0]).toEqual({
+      tool: "mcp__Devcorner__start",
+      tool_use_id: expect.any(String),
+      goal: "Work",
+      capacity: {
         five_hour: { percent: 4, resets_at: RESETS },
         seven_day: { percent: 1, resets_at: WEEK },
         read_at: new Date(1_000_000).toISOString(),
       },
-    ]);
-    // Three points on, a minute later: not due.
-    await clock.advance(60_000);
-    await ($.session as any).measure(measure(7, 1));
-    await flush(clock);
-    expect(written(seen)).toHaveLength(1);
-    // Five points from the last written: due.
-    await ($.session as any).measure(measure(9, 1));
-    await flush(clock);
-    expect(written(seen).map((r) => r.five_hour.percent)).toEqual([4, 9]);
-    expect(seen.capacity).toEqual([]);
-  });
-
-  test("a turn's end writes the last answer's windows once they are ten minutes newer", async ($, on) => {
-    const { clock, seen } = world(on, {
-      token: false,
-      remote: true,
-      home: "/home/ann",
     });
-    seen.limits = limits(4, 1);
-    await $.session.start(START);
-    await $.turn.start({ text: "x", turnId: "t1" });
-    await $.turn.complete(done("t1"));
-    await flush(clock);
-    expect(written(seen)).toHaveLength(1);
+    // Three points on, a minute later: not due, so the call goes as made.
     await clock.advance(60_000);
-    await $.turn.complete(done("t2", "agent-1"));
-    await flush(clock);
-    expect(written(seen)).toHaveLength(1);
+    seen.limits = limits(7, 1);
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "dc-s1" });
+    expect(got.calls[1]).not.toHaveProperty("capacity");
+    // Five points from the last carried: due.
+    seen.limits = limits(9, 1);
+    await $.tool.call({ tool: "mcp__Devcorner__note", text: "x" });
+    // Ten minutes on, whatever moved.
     await clock.advance(DUE_EVERY_MS);
-    await $.turn.complete(done("t3", "agent-1"));
-    await flush(clock);
-    expect(written(seen)).toHaveLength(2);
+    await $.tool.call({ tool: "mcp__Devcorner__finish", outcome: "done" });
+    expect(carried(got)).toEqual([4, null, 9, 9]);
+    expect(seen.capacity).toEqual([]);
+    expect(seen.writes.filter((w) => !w.path.endsWith(".waiting"))).toEqual([]);
   });
 
-  test("on a machine with no token and no cloud session, nothing is written that nothing reads", async ($, on) => {
-    const { clock, seen } = world(on, { token: false, home: "/home/ann" });
+  test("of usage only run_account carries it, and other servers' tools never do", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
     seen.limits = limits(4, 1);
     await $.session.start(START);
-    await ($.session as any).measure(measure(4, 1));
-    await $.turn.start({ text: "x", turnId: "t1" });
-    await $.turn.complete(done("t1"));
     await flush(clock);
-    expect(written(seen)).toEqual([]);
+    await $.tool.call({ tool: "mcp__linear__start" });
+    await $.tool.call({ tool: "mcp__Devcorner__show", id: "dc-t1" });
+    await $.tool.call({ tool: "mcp__Devcorner__usage", action: "show" });
+    await $.tool.call({ tool: "mcp__Devcorner__usage", action: "run_account" });
+    expect(carried(got)).toEqual([null, null, null, 4]);
+  });
+
+  test("a reading the agent passed itself is kept as it is", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    const own = { five_hour: { percent: 50 }, read_at: RESETS };
+    await $.tool.call({ tool: "mcp__Devcorner__check", capacity: own });
+    expect(got.calls[0]!.capacity).toEqual(own);
+    // Its own does not count as the plugin's: the next call carries one.
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(carried(got)).toEqual([50, 4]);
+  });
+
+  test("a call that failed may not have kept it, so the next one carries it again", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    got.failing = true;
+    await $.tool.call({ tool: "mcp__Devcorner__note", text: "x" });
+    got.failing = false;
+    await $.tool.call({ tool: "mcp__Devcorner__note", text: "y" });
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(carried(got)).toEqual([4, 4, null]);
+  });
+
+  test("a call refused for carrying it goes again as the agent made it, and no later call carries one", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    got.refusing = true;
+    const ran = await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(ran.deny).toBe(undefined);
+    await clock.advance(DUE_EVERY_MS);
+    await $.tool.call({ tool: "mcp__Devcorner__note", text: "x" });
+    expect(carried(got)).toEqual([4, null, null]);
+  });
+
+  test("a blank capacity of the agent's is no reading, so the plugin's goes", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    await $.tool.call({ tool: "mcp__Devcorner__check", capacity: " " });
+    expect(carried(got)).toEqual([4]);
+  });
+
+  test("calls made at once carry one reading between them", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    let land!: () => void;
+    got.held = new Promise<void>((resolve) => (land = resolve));
+    const both = Promise.all([
+      $.tool.call({ tool: "mcp__Devcorner__check" }),
+      $.tool.call({ tool: "mcp__Devcorner__note", text: "x" }),
+    ]);
+    await flush(clock);
+    land();
+    await both;
+    expect(carried(got).filter((p) => p !== null)).toEqual([4]);
+  });
+
+  test("a new session's first call carries one, whatever the last session carried", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    await $.session.start(START);
+    await flush(clock);
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(carried(got)).toEqual([4, 4]);
+  });
+
+  test("with no windows read yet, the call goes as made", async ($, on) => {
+    const { clock } = world(on, { token: false, remote: true });
+    const got = tools(on);
+    await $.session.start(START);
+    await flush(clock);
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Work" });
+    expect(got.calls[0]).not.toHaveProperty("capacity");
+  });
+
+  test("on a machine with no token and no cloud session, no call carries one", async ($, on) => {
+    const { clock, seen } = world(on, { token: false });
+    const got = tools(on);
+    seen.limits = limits(4, 1);
+    await $.session.start(START);
+    await flush(clock);
+    await ($.session as any).measure({
+      changed: ["rateLimits"],
+      rateLimits: limits(4, 1),
+    });
+    await $.tool.call({ tool: "mcp__devcorner__check" });
+    await flush(clock);
+    expect(carried(got)).toEqual([null]);
     expect(seen.capacity).toEqual([]);
   });
 
-  test("with a token the reading is posted and no file is written", async ($, on) => {
-    const { clock, seen } = world(on, { home: "/home/ann" });
+  test("with a token the reading is posted and no call carries one", async ($, on) => {
+    const { clock, seen } = world(on, { remote: true });
+    const got = tools(on);
     seen.limits = limits(4, 1);
     await $.session.start(START);
     await flush(clock);
-    await ($.session as any).measure(measure(4, 1));
-    await $.turn.start({ text: "x", turnId: "t1" });
-    await $.turn.complete(done("t1"));
+    await ($.session as any).measure({
+      changed: ["rateLimits"],
+      rateLimits: limits(4, 1),
+    });
+    await $.tool.call({ tool: "mcp__plugin_devcorner_devcorner__check" });
     await flush(clock);
-    expect(written(seen)).toEqual([]);
+    expect(carried(got)).toEqual([null]);
     expect(seen.capacity).toHaveLength(1);
   });
 });

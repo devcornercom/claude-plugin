@@ -2,6 +2,11 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.16.0 — 2026-10-14
+
+- In a cloud session with no `DEVCORNER_TOKEN`, the Claude account's capacity rides on the session's devcorner calls: when a reading is due, the module adds it as `capacity` to devcorner's `start`, `check`, `note`, `finish` or `usage` `run_account`, with no step of the agent's. It no longer writes `capacity.json`, whose Bash step to take it the cloud's permission check refused every time. With a token nothing changes.
+- `/dc more` and `/dc less` open and close the row above the prompt, as its more and less button does, for a terminal that passes the row no click and keeps ctrl+x for itself, as VS Code's integrated terminal does. Opening reads the project's picture at once, and the answer is one line: "The row is open." or "The row is closed." Only these exact words do it; any other words after `/dc` ask devcorner as before.
+
 ## 0.15.0 — 2026-10-14
 
 - A wake says what came, by its sender and kind, on its toast and in its prompt: "GitHub — #210 conflicts with main", "run dc-r312 finished", "your answer to dc-q110". Only a message the person wrote says "your". It still holds no message's text.

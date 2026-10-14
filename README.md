@@ -21,6 +21,10 @@ export DEVCORNER_TOKEN=<your hook token>
 
 or under `env` in `~/.claude/settings.json`, which the desktop app reads too. Without it the hooks do nothing.
 
+## In VS Code's terminal
+
+devcorner's line above the prompt opens with its more button, and closes with less. VS Code's integrated terminal may pass the line no click, and it keeps ctrl+x for itself. There, `/dc more` and `/dc less` open and close the line (from version 0.16.0). To have ctrl+x reach Claude Code instead, set `"terminal.integrated.sendKeybindingsToShell": true` in VS Code's settings.
+
 ## Another devcorner
 
 The plugin connects to the hosted devcorner, https://devcorner.devcorner.workers.dev. For a devcorner of your own, set `DEVCORNER_URL` to its address in the same place:

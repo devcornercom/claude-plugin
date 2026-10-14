@@ -216,17 +216,6 @@ export function stateDir(env: StateEnv): string | undefined {
   );
 }
 
-/**
- * Where the module writes a reading of the account's capacity that is due,
- * when it has no token to post it with (dc-t221): devcorner's CAPACITY_FILE
- * (src/hub/capacity-report.ts), which a cloud session's agent reads, passes
- * to devcorner as `capacity` on a call it makes anyway, and moves aside.
- */
-export function capacityFile(env: StateEnv): string | undefined {
-  const base = stateDir(env);
-  return base ? `${base}/capacity.json` : undefined;
-}
-
 /** What the row says while devcorner is updating, after a deploy. */
 export const UPDATING_LINE = "devcorner is updating, back in a moment";
 /** The longest a "try again in" from devcorner is waited, in case one is wrong. */
@@ -778,6 +767,21 @@ async function refresh(
   return got;
 }
 
+/**
+ * Opens or closes the row (dc-t218): its own more and less, and `/dc more`
+ * and `/dc less` for a terminal that passes it no click and no ctrl+x, as
+ * VS Code's does (dc-t225). Opened, it asks for the picture now, not at the
+ * next poll.
+ */
+async function setOpen($: Engine, open: boolean): Promise<void> {
+  await update($, expanded, () => open);
+  if (open) void refresh($, true);
+}
+
+/** What `/dc more` and `/dc less` answer: the row as they left it. */
+export const OPEN_LINE = "The row is open.";
+export const CLOSED_LINE = "The row is closed.";
+
 // The wake. While the main conversation is idle it asks devcorner whether a
 // message that wakes its session waits (see nextStep), and when one does it
 // submits `wakePrompt`, naming what came, once for it, and no other wake
@@ -1090,17 +1094,15 @@ type Limit = { kind: string; percentUsed: number; resetsAt?: string };
 
 /**
  * Keeps the latest reading and sends it now, or when the throttle opens. With
- * no token, as in a cloud session, it is written to the readings file instead,
- * when it is due (`fileCapacity`).
+ * no token, as in a cloud session, nothing is sent: a devcorner call carries
+ * the reading instead (`carriedCapacity`).
  */
 async function reportCapacity(
   $: Engine,
   limits: readonly Limit[],
 ): Promise<void> {
   try {
-    if (!(await $.env.get("DEVCORNER_TOKEN"))) {
-      return await fileCapacity($, limits);
-    }
+    if (!(await $.env.get("DEVCORNER_TOKEN"))) return;
     const body = capacityBody(limits);
     if (!body) return;
     capacityPending = body;
@@ -1157,7 +1159,7 @@ async function flushCapacity($: Engine): Promise<void> {
 }
 
 /**
- * A reading as the readings file holds it (dc-t221): each window's percent and
+ * A reading as a devcorner call carries it (dc-t221): each window's percent and
  * reset time, and when the module read them, nothing else. A cloud session
  * passes it to devcorner as it is.
  */
@@ -1167,7 +1169,7 @@ export type CapacityReading = {
   read_at: string;
 };
 
-/** The two windows of the engine's limits as the readings file holds them; null with neither. */
+/** The two windows of the engine's limits as a call carries them; null with neither. */
 export function capacityReading(
   limits: readonly Limit[],
   nowMs: number,
@@ -1187,7 +1189,7 @@ export function capacityReading(
 /**
  * When a reading is due, the person's rule (dc-c361), as devcorner holds it
  * (`capacityDue` in src/registry/claude-accounts.ts, its numbers in
- * src/hub/capacity-report.ts): ten minutes after the last one written, or
+ * src/hub/capacity-report.ts): ten minutes after the last one carried, or
  * sooner when a window moved five points or more, crossed 80% or 95% either
  * way, began anew or appeared or went. The plugin imports nothing of
  * devcorner's, so the numbers are copied here.
@@ -1226,61 +1228,65 @@ function windowMoved(
   );
 }
 
-/** The last reading written to the readings file, which the next is due against. */
-let capacityWritten: CapacityReading | null = null;
-let capacityWriting: Promise<void> = Promise.resolve();
+/**
+ * devcorner's tools that carry a cloud session's reading (dc-t221): start,
+ * check, note, finish and usage, on a server named for devcorner, as a
+ * person's connector or this plugin's own server is (`mcp__Devcorner__check`,
+ * `mcp__plugin_devcorner_devcorner__check`). Of usage, only its run_account.
+ */
+export const CARRIER =
+  /^mcp__[\w-]*devcorner[\w-]*__(start|check|note|finish|usage)$/i;
+
+/** The last reading a call carried out, which the next is due against. */
+let capacityCarried: CapacityReading | null = null;
+/**
+ * A call that carried a reading was refused (a permission check, a rule):
+ * no call of this session carries one again, so none is refused for it.
+ */
+let capacityRefused = false;
+
+/** A devcorner call as the `tool.call` hook sees it: the tool and its arguments. */
+type CarrierCall = { tool: string; action?: unknown; capacity?: unknown };
 
 /**
- * Whether the readings file is kept: in a cloud session (CLAUDE_CODE_REMOTE,
- * which Claude Code sets there), with no token, since one holds no credential
- * (dc-t141). Only a cloud session's instructions take the file, so a machine
- * with no token writes none that nothing reads.
+ * The reading a devcorner call is to carry, or null (dc-t221). Only in a
+ * cloud session (CLAUDE_CODE_REMOTE, which Claude Code sets there) with no
+ * token, since one holds no credential (dc-t141): with a token the module
+ * posts `Capacity` itself. The windows are the ones the session's last answer
+ * reported ($.session.usage()), which a call always follows, so even a
+ * session's first call has them. Only when one is due against the last a
+ * call carried, and never over one the agent passed itself. The reading is
+ * taken as carried as it is chosen, with the one it replaced, so calls made
+ * beside it carry none. Null on any failure, so the call goes out as the
+ * agent made it.
  */
-async function filesCapacity($: Engine): Promise<boolean> {
-  return (
-    !(await $.env.get("DEVCORNER_TOKEN")) &&
-    Boolean(await $.env.get("CLAUDE_CODE_REMOTE"))
-  );
-}
-
-/**
- * Where the readings file is kept (`filesCapacity`), writes a reading that is
- * due to it (`capacityFile`), whole, in place of the one there. The session's
- * agent takes it from there. One write at a time, so a turn's end and a
- * measure never race. Silent on any failure.
- */
-function fileCapacity($: Engine, limits: readonly Limit[]): Promise<void> {
-  capacityWriting = capacityWriting.then(async () => {
-    try {
-      if (!(await filesCapacity($))) return;
-      const next = capacityReading(limits, await $.clock.now());
-      if (!next || !capacityDue(capacityWritten, next)) return;
-      const file = capacityFile({
-        state: await $.env.get("DEVCORNER_HOOK_STATE"),
-        cache: await $.env.get("XDG_CACHE_HOME"),
-        home: await $.env.get("HOME"),
-      });
-      if (!file) return;
-      await $.fs.write(file, `${JSON.stringify(next)}\n`);
-      capacityWritten = next;
-    } catch {
-      /* stay silent */
-    }
-  });
-  return capacityWriting;
-}
-
-/**
- * At a turn's end, where the readings file is kept, the windows the turn's
- * last answer reported ($.session.usage()), so a reading that is due only by
- * its age is written though no window moved a whole point.
- */
-async function readCapacity($: Engine): Promise<void> {
+async function carriedCapacity(
+  $: Engine,
+  call: CarrierCall,
+): Promise<{
+  reading: CapacityReading;
+  before: CapacityReading | null;
+} | null> {
   try {
-    if (!(await filesCapacity($))) return;
-    await fileCapacity($, (await $.session.usage()).rateLimits);
+    if (capacityRefused) return null;
+    // Blank is no reading, as devcorner takes it, so the plugin's goes.
+    const own = call.capacity;
+    if (own != null && !(typeof own === "string" && !own.trim())) return null;
+    if (/__usage$/i.test(call.tool) && call.action !== "run_account") {
+      return null;
+    }
+    if (await $.env.get("DEVCORNER_TOKEN")) return null;
+    if (!(await $.env.get("CLAUDE_CODE_REMOTE"))) return null;
+    const reading = capacityReading(
+      (await $.session.usage()).rateLimits,
+      await $.clock.now(),
+    );
+    const before = capacityCarried;
+    if (!reading || !capacityDue(before, reading)) return null;
+    capacityCarried = reading;
+    return { reading, before };
   } catch {
-    /* stay silent */
+    return null;
   }
 }
 
@@ -1288,6 +1294,25 @@ export const register: Register = (on) => {
   // The engine raises this when a window moves a whole point, after a turn.
   on("session.measure", async ($, e, next) => {
     if (e.changed.includes("rateLimits")) void reportCapacity($, e.rateLimits);
+    return next(e);
+  });
+
+  // A cloud session's reading rides on a devcorner call the agent makes
+  // anyway, with no step of the agent's (dc-t221): a Bash step to carry it
+  // out reads as exfiltration to the cloud's permission check, which refused
+  // every one (dc-c383).
+  on("tool.call", { tool: CARRIER }, async ($, e, next) => {
+    const carried = await carriedCapacity($, e as CarrierCall);
+    if (!carried) return next(e);
+    const { reading, before } = carried;
+    const ran = await next({ ...e, capacity: reading });
+    if (ran.deny === undefined && ran.isError !== true) return ran;
+    // A failed call may not have kept it: the next one carries it.
+    if (capacityCarried === reading) capacityCarried = before;
+    if (ran.deny === undefined) return ran;
+    // Refused with it: the agent's call goes as it made it, and no later
+    // call carries one.
+    capacityRefused = true;
     return next(e);
   });
 
@@ -1299,15 +1324,17 @@ export const register: Register = (on) => {
       );
       await $.command.register({
         name: "dc",
-        description: "devcorner: status, or ask it something (/dc board)",
-        argumentHint: "[what to ask]",
+        description:
+          "devcorner: status, more or less to open or close the row, or ask it something (/dc board)",
+        argumentHint: "[more | less | what to ask]",
       });
     } catch {
       /* stay silent */
     }
     forgetSession();
     // A session's first reading is due, whatever an earlier one wrote.
-    capacityWritten = null;
+    capacityCarried = null;
+    capacityRefused = false;
     // Where nothing draws the session (a plain -p run, which may resume a
     // conversation that kept a marker), the marker says unknown before any
     // hook can read it, not once a read comes back.
@@ -1344,7 +1371,6 @@ export const register: Register = (on) => {
   });
 
   on("turn.complete", async ($, e, next) => {
-    void readCapacity($);
     // A subagent's turn is not the conversation's: it raises no turn.start,
     // and its end only refreshes the row, at most every 30 s.
     if (e.agentId !== undefined) {
@@ -1366,6 +1392,12 @@ export const register: Register = (on) => {
 
   on("command.run", { command: "dc" }, async ($, e) => {
     const arg = e.args.trim();
+    // The row's more and less, whole and exact (dc-t225); any other words ask.
+    if (arg === "more" || arg === "less") {
+      const open = arg === "more";
+      await setOpen($, open);
+      return { text: open ? OPEN_LINE : CLOSED_LINE };
+    }
     if (arg) {
       void $.prompt.submit({ text: `devcorner: ${arg}`, asUser: true });
       return { text: `Asking devcorner: ${arg}` };
@@ -1441,11 +1473,7 @@ export const register: Register = (on) => {
       <Button
         key={open ? "less" : "more"}
         label={open ? "less" : "more"}
-        onPress={async () => {
-          await update($, expanded, (was) => !was);
-          // Opened: ask for the picture now, not at the next poll.
-          if (!open) void refresh($, true);
-        }}
+        onPress={() => setOpen($, !open)}
       />
     );
     const [head, ...rest] = open ? expandedLines(s) : [collapsedSegments(s)];
