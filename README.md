@@ -11,19 +11,21 @@ claude plugin install devcorner@devcorner --scope user
 
 Then, in Claude Code, run `/mcp`, choose devcorner and sign in.
 
-## The hook token
+## Signing the plugin in
 
-The plugin's hooks run outside Claude Code's own sign-in, so they need a token of their own: a hook token from devcorner's connections page, [https://devcorner.devcorner.workers.dev/settings/connections](https://devcorner.devcorner.workers.dev/settings/connections). Set it in the shell that starts Claude Code:
+The plugin's hooks run outside Claude Code's own sign-in, so they need a token of their own. From version 0.17.0 the plugin gets one by itself. Run `/dc login` in Claude Code: it shows a code and a link, you approve the code in your browser, and the plugin keeps the token it is given, with none to copy by hand. Or ask Claude to sign the plugin in. `/dc logout` signs it out.
+
+The other way is a hook token from devcorner's connections page, [https://devcorner.devcorner.workers.dev/settings/connections](https://devcorner.devcorner.workers.dev/settings/connections). It wins over a sign-in. Set it in the shell that starts Claude Code:
 
 ```sh
 export DEVCORNER_TOKEN=<your hook token>
 ```
 
-or under `env` in `~/.claude/settings.json`, which the desktop app reads too. Without it the hooks do nothing.
+or under `env` in `~/.claude/settings.json`, which the desktop app reads too. Without a token or a sign-in the hooks do nothing.
 
-## In VS Code's terminal
+## The line above the prompt
 
-devcorner's line above the prompt opens with its more button, and closes with less. VS Code's integrated terminal may pass the line no click, and it keeps ctrl+x for itself. There, `/dc more` and `/dc less` open and close the line (from version 0.16.0). To have ctrl+x reach Claude Code instead, set `"terminal.integrated.sendKeybindingsToShell": true` in VS Code's settings.
+devcorner's line above the prompt is a line of links, with nothing to press (from version 0.24.0): `devcorner · s7 reviewer · waiting 2`. The project's name opens its home, `s7` the session this conversation works as, and `waiting 2` the project's inbox. `/dc` says in the transcript what the line leaves out, and `/dc login` signs the machine in when the line says it is not.
 
 ## Another devcorner
 

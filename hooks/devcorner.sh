@@ -38,18 +38,50 @@
 # session.
 #
 # The MCP connection signs in through the browser, and a hook cannot. So this
-# sends the token in DEVCORNER_TOKEN: a hook token, which a person makes on
-# devcorner's connections page, /settings/connections. It works on the hook
-# route alone. With no token set this does nothing, since it could not say
-# whose conversation it is.
+# sends a hook token, which works on the hook route alone: the one in
+# DEVCORNER_TOKEN, which a person makes on devcorner's connections page,
+# /settings/connections, and sets themselves; else the one the plugin's
+# module was given when this machine signed in from Claude Code (dc-t224:
+# /dc login, or Claude through its own connection). The module keeps that one in its own
+# store and hands it to these hooks as one file readable by its owner alone,
+# in their folder beside the markers (`tokenFile` in register.tsx), which it
+# removes at sign-out. With no token this does nothing, since it could not
+# say whose conversation it is.
 #
 # DEVCORNER_URL overrides the local address, as it does in the plugin's
 # .mcp.json.
+#
+# Claude Code waits for each hook, so a call to devcorner gets 2 seconds when
+# it asks and 3 when it passes an event on, and is given up after that.
+# DEVCORNER_HOOK_WAIT sets both, in whole seconds above 0, for a run outside
+# Claude Code: devcorner's own tests, which call a server busy with the rest
+# of their suite, give it longer. Under Claude Code the hook's own timeout in
+# hooks.json (5 or 10 seconds) still ends the script first.
 
 url="${DEVCORNER_URL:-https://devcorner.devcorner.workers.dev}"
 token="${DEVCORNER_TOKEN:-}"
 endpoint="$url/mcp/hooks/claude-code"
 event="$1"
+limit="${DEVCORNER_HOOK_WAIT:-}"
+case $limit in
+'' | *[!0-9]*) limit= ;;
+*) [ "$limit" -gt 0 ] || limit= ;;
+esac
+
+if [ -z "$token" ]; then
+  # The file holds the token, then the devcorner that made it: it is sent
+  # only to that one.
+  token_file="${DEVCORNER_HOOK_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/devcorner}/token"
+  token_url=
+  [ -r "$token_file" ] && { read -r token && read -r token_url; } <"$token_file"
+  [ "$token_url" = "${url%/}" ] || token=
+  # Only a hook token's shape is sent: dch_ and 43 letters of base64url.
+  case $token in
+  dch_*[!A-Za-z0-9_-]*) token= ;;
+  dch_*) [ ${#token} -eq 47 ] || token= ;;
+  *) token= ;;
+  esac
+fi
 
 [ -n "$token" ] || exit 0
 
@@ -89,7 +121,7 @@ forward() {
   dir="${CLAUDE_PROJECT_DIR:-$PWD}"
   repo=$(git -C "$dir" remote get-url origin 2>/dev/null || basename "$dir")
   branch=$(git -C "$dir" branch --show-current 2>/dev/null)
-  curl -sf --connect-timeout 1 -m 3 -X POST "$endpoint" \
+  curl -sf --connect-timeout 1 -m "${limit:-3}" -X POST "$endpoint" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     -H "X-Devcorner-Repo: $repo" \
@@ -175,7 +207,7 @@ body="{\"hook_event_name\":\"$event\",\"session_id\":\"$session\"${agent:+,\"age
 
 if [ "$event" = SubagentStop ]; then
   # Claude Code is told nothing: an answer here could keep the subagent going.
-  curl -sf --connect-timeout 1 -m 3 -X POST "$endpoint" \
+  curl -sf --connect-timeout 1 -m "${limit:-3}" -X POST "$endpoint" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     --data-binary "$body" >/dev/null 2>&1 || true
@@ -225,7 +257,7 @@ elif [ "$event" = PostToolUse ]; then
   [ "$now" -lt "$((last + every))" ] && exit 0
 fi
 
-if out=$(curl -sf --connect-timeout 1 -m 2 -X POST "$endpoint" \
+if out=$(curl -sf --connect-timeout 1 -m "${limit:-2}" -X POST "$endpoint" \
   -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
   --data-binary "$body" 2>/dev/null); then
