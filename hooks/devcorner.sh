@@ -10,7 +10,17 @@
 # has not seen, and SubagentStop tells it a subagent stopped. For these, only
 # the ids of the conversation and of the subagent are sent: the prompt, the
 # tool's input and output and the model's last message never leave this
-# machine.
+# machine. SubagentStop adds one number, how many background tasks the
+# subagent started itself still run (dc-t576): a subagent that ends its turn to
+# wait on its own background work, as one does for a check longer than a
+# foreground command may run, has not stopped, and Claude Code resumes it when
+# that work ends, so devcorner leaves its session and its run alone. Claude
+# Code lists every task in flight in the conversation, with no word of whose it
+# is, so a task counts when its id is in the subagent's own transcript, other
+# than as the name of an agent's worktree or transcript, which this reads on
+# this machine and never sends. With no such list (an older
+# Claude Code) or no transcript to read, the number is left out, and devcorner
+# takes the stop as one that may yet resume.
 #
 # PostToolUse runs after every tool call, so it asks devcorner at most once
 # every DEVCORNER_HOOK_EVERY seconds (10 unless set, 0 for every call), and
@@ -46,7 +56,9 @@
 # store and hands it to these hooks as one file readable by its owner alone,
 # in their folder beside the markers (`tokenFile` in register.tsx), which it
 # removes at sign-out. With no token this does nothing, since it could not
-# say whose conversation it is.
+# say whose conversation it is; the module says so instead, at each
+# session's start and in /dc, and on a machine's first run begins /dc login
+# itself (dc-t576).
 #
 # DEVCORNER_URL overrides the local address, as it does in the plugin's
 # .mcp.json.
@@ -116,6 +128,75 @@ field() {
   esac
 }
 
+# Prints how many background tasks the subagent $2 started itself are still in
+# flight as it stops, read from what follows the name of its SubagentStop
+# event, $1 (dc-t576): `background_tasks` lists every task in flight in the
+# conversation, so each counts whose id its own transcript, at
+# `agent_transcript_path`, names, as it names the tasks it started; the
+# subagent's own entry, there when it runs in the background, never counts.
+# An id is matched anywhere, not as a whole word: Claude Code's are random (a
+# shell's or a monitor's 9 letters and digits, an agent's 17), so none is part
+# of another, and a word's edge would miss one written right after an escape
+# such as `\n`. A name right after `agent-` is not counted: that is an agent's
+# worktree, its branch or its transcript file, which a tool's output shows for
+# a sibling as well (`git worktree list`), and never how a launch names its
+# task. A subagent's transcript keeps no structured task id of what it
+# launched, only the words of each tool's result, which Claude Code does not
+# promise; matching those words would take a wait for a stop the day they
+# change, so every other mention counts. Each key is matched with its quotes,
+# which a JSON string escapes, so nothing the model or a tool wrote can stand
+# for one. The transcript is read once, however many tasks are in flight.
+# Prints nothing when it cannot tell: no list, as from a Claude Code before
+# it, or no transcript to read.
+own_background() {
+  self=$2
+  case $1 in
+  *'"background_tasks":['*) list=${1#*'"background_tasks":['} ;;
+  *'"background_tasks": ['*) list=${1#*'"background_tasks": ['} ;;
+  *) return 0 ;;
+  esac
+  # The list is read to the end of the event, never cut where a key seems to
+  # follow it: an entry may carry an array field of its own, whose `],"` would
+  # end the list early, drop the ids after it and read a wait as a stop. What
+  # follows the list, as the scheduled tasks, adds ids that count only when the
+  # transcript names them, so the worst a longer read does is hold a wait.
+  case $list in
+  '' | ' ' | ']'* | ' ]'*)
+    echo 0
+    return 0
+    ;;
+  esac
+  case $1 in
+  *'"agent_transcript_path":"'*) transcript=${1#*'"agent_transcript_path":"'} ;;
+  *'"agent_transcript_path": "'*) transcript=${1#*'"agent_transcript_path": "'} ;;
+  *) return 0 ;;
+  esac
+  transcript=${transcript%%\"*}
+  # A path JSON had to escape is not read.
+  case $transcript in '' | *\\*) return 0 ;; esac
+  [ -f "$transcript" ] && [ -r "$transcript" ] || return 0
+  # The ids to look for, each as a pattern of grep's.
+  set --
+  while :; do
+    case $list in
+    *'"id":"'*) list=${list#*'"id":"'} ;;
+    *'"id": "'*) list=${list#*'"id": "'} ;;
+    *) break ;;
+    esac
+    id=${list%%\"*}
+    case $id in '' | *[!A-Za-z0-9_-]*) continue ;; esac
+    [ "$id" = "$self" ] && continue
+    set -- "$@" -e "$id"
+  done
+  if [ $# -eq 0 ]; then
+    echo 0
+    return 0
+  fi
+  count=$(sed 's/agent-[A-Za-z0-9_-]*//g' "$transcript" 2>/dev/null |
+    grep -oF "$@" | sort -u | wc -l)
+  echo $((count))
+}
+
 # Prints the remote of origin in folder $1, whose host devcorner keeps when it
 # is not GitHub, without a user or token an https remote may hold. A remote
 # that is a folder on this machine, an absolute path as a clone of a folder
@@ -166,7 +247,11 @@ SessionEnd | SubagentStart)
   forward
   exit 0
   ;;
-PostToolUse | UserPromptSubmit | Stop | SubagentStop)
+SubagentStop)
+  # Whole: the background tasks come after the model's last message.
+  chunk=$(cat)
+  ;;
+PostToolUse | UserPromptSubmit | Stop)
   # The start of each line is enough, and reading to the end lets Claude Code
   # finish writing.
   chunk=$(cut -b "1-$HEAD_BYTES")
@@ -231,6 +316,8 @@ fi
 body="{\"hook_event_name\":\"$event\",\"session_id\":\"$session\"${agent:+,\"agent_id\":\"$agent\"}${agent_type:+,\"agent_type\":\"$agent_type\"}}"
 
 if [ "$event" = SubagentStop ]; then
+  background=$(own_background "$rest" "$agent")
+  [ -n "$background" ] && body="${body%\}},\"background\":$background}"
   # Claude Code is told nothing: an answer here could keep the subagent going.
   curl -sf --connect-timeout 1 -m "${limit:-3}" -X POST "$endpoint" \
     -H "Authorization: Bearer $token" \

@@ -64,6 +64,9 @@ const RUN_NEWS: Record<string, string> = {
   cancelled: "was cancelled",
   // Not an end: an OA's run that waits for room on its accounts (dc-t254).
   held: "waits for room",
+  // Not an end: a run dispatched to the session, the person's own request
+  // (dc-t576).
+  dispatch: "was dispatched here",
 };
 
 /**
@@ -139,6 +142,12 @@ export function wakeWords(
       return `${from ?? "another conversation"} sent this on your word`;
     }
     return `a message ${from ? `${from} sent` : "sent"} on your user's word`;
+  }
+  // An OA the session gave, asking its person a question (dc-t576), named by
+  // the question.
+  if (w.from === "oa") {
+    if (w.what !== "asked" || !item) return null;
+    return `an OA asks ${you} ${item}`;
   }
   if (w.from !== "person" && w.from !== "member") return null;
   const own = w.from === "person";
@@ -597,6 +606,185 @@ export function nudgeSegments(s: Status): Segment[] {
     piece("devcorner", projectHome(s)),
     piece(" · new project here · /dc setup sets it up · /dc hide hides this"),
   ];
+}
+
+/**
+ * The environment variables Claude Code reads to decide whether its terminal
+ * draws links (dc-t577), each undefined while unset.
+ */
+export type LinkEnv = Readonly<Record<string, string | undefined>>;
+
+/** The terminals Claude Code takes to draw links by their name alone. */
+const LINK_TERMINALS = [
+  "ghostty",
+  "Hyper",
+  "kitty",
+  "alacritty",
+  "iTerm.app",
+  "iTerm2",
+  "WarpTerminal",
+];
+
+/** CI services whose logs draw colour, as Claude Code's colour check names them. */
+const COLOUR_CI = [
+  "TRAVIS",
+  "CIRCLECI",
+  "APPVEYOR",
+  "GITLAB_CI",
+  "GITHUB_ACTIONS",
+  "BUILDKITE",
+];
+
+/**
+ * A terminal's version as Claude Code's link check reads it: "3.5.0" as
+ * 3 and 5, and VTE's "6003" as 0 and 60. A part it cannot read is NaN, which
+ * no comparison holds.
+ */
+function versionOf(text: string): { major: number; minor: number } {
+  const vte = /^\d{3,4}$/.test(text) ? /(\d{1,2})(\d{2})/.exec(text) : null;
+  if (vte) return { major: 0, minor: parseInt(vte[1]!, 10) };
+  const [major, minor] = text.split(".").map((part) => parseInt(part, 10));
+  return { major: major ?? NaN, minor: minor ?? NaN };
+}
+
+/**
+ * Whether Claude Code draws colour on its terminal (the `supports-color`
+ * package it bundles, for a TTY): links are drawn only where colour is.
+ */
+function coloursIn(env: LinkEnv): boolean {
+  const force = env.FORCE_COLOR;
+  const forced =
+    force === undefined
+      ? undefined
+      : force === "true" || force === ""
+        ? 1
+        : force === "false"
+          ? 0
+          : Math.min(parseInt(force, 10), 3);
+  if (forced === 0) return false;
+  const floor = Boolean(forced);
+  const term = env.TERM ?? "";
+  if (term === "dumb") return floor;
+  if (env.CI !== undefined) {
+    return (
+      COLOUR_CI.some((name) => env[name] !== undefined) ||
+      env.CI_NAME === "codeship" ||
+      floor
+    );
+  }
+  if (env.TEAMCITY_VERSION !== undefined) {
+    return /^(9\.(0*[1-9]\d*)\.|\d{2,}\.)/.test(env.TEAMCITY_VERSION);
+  }
+  return (
+    env.COLORTERM !== undefined ||
+    env.TERM_PROGRAM === "iTerm.app" ||
+    env.TERM_PROGRAM === "Apple_Terminal" ||
+    /-256(color)?$/i.test(term) ||
+    /^screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(term) ||
+    floor
+  );
+}
+
+/**
+ * The `supports-hyperlinks` package's answer for Claude Code's terminal, a
+ * TTY, as Claude Code bundles it: FORCE_HYPERLINK first, then colour, then
+ * the terminal's name and version.
+ */
+function hyperlinkPackage(env: LinkEnv): boolean {
+  if (env.FORCE_HYPERLINK) return parseInt(env.FORCE_HYPERLINK, 10) !== 0;
+  if (env.NETLIFY) return true;
+  if (!coloursIn(env)) return false;
+  if (env.WT_SESSION !== undefined) return true;
+  if (env.CI || env.TEAMCITY_VERSION) return false;
+  const version = versionOf(env.TERM_PROGRAM_VERSION ?? "");
+  switch (env.TERM_PROGRAM) {
+    case "iTerm.app":
+      return version.major === 3 ? version.minor >= 1 : version.major > 3;
+    case "WezTerm":
+      return version.major >= 20200620;
+    case "vscode":
+      return version.major > 1 || (version.major === 1 && version.minor >= 72);
+    case "ghostty":
+      return true;
+  }
+  if (env.VTE_VERSION) {
+    if (env.VTE_VERSION === "0.50.0") return false;
+    const vte = versionOf(env.VTE_VERSION);
+    return vte.major > 0 || vte.minor >= 50;
+  }
+  return env.TERM === "alacritty";
+}
+
+/**
+ * Whether Claude Code draws a `Link` on its terminal as a link (dc-t577), by
+ * its own rule (Claude Code 2.1.312), which the plugin API does not expose:
+ * where it does not, a `Link` is drawn as its words then its whole address,
+ * so the row draws plain words there. The rule's parts a plugin cannot read
+ * are left out: what an attached client says it draws, which comes first,
+ * and the command-line flags it reads from Claude Code's own (such as
+ * `--no-hyperlink`, `--hyperlink=never` and `--no-color`).
+ */
+export function hyperlinksIn(env: LinkEnv): boolean {
+  if (env.FORCE_HYPERLINK !== undefined) return hyperlinkPackage(env);
+  if (hyperlinkPackage(env)) return true;
+  const program = env.TERM_PROGRAM;
+  if (program && LINK_TERMINALS.includes(program)) return true;
+  if (env.TERMINAL_EMULATOR === "JetBrains-JediTerm") return true;
+  if (env.WT_SESSION && program !== "tmux" && !env.TMUX) return true;
+  if (program === "tmux") {
+    const { major, minor } = versionOf(env.TERM_PROGRAM_VERSION ?? "");
+    if (major > 3 || (major === 3 && minor >= 4)) return true;
+  }
+  if (env.LC_TERMINAL && LINK_TERMINALS.includes(env.LC_TERMINAL)) return true;
+  return env.TERM?.includes("kitty") ?? false;
+}
+
+/** The variables `hyperlinksIn` reads, from Claude Code's environment, each named as written so `claude plugin validate` lists it. */
+async function linkEnv($: Engine): Promise<LinkEnv> {
+  const read = {
+    FORCE_HYPERLINK: $.env.get("FORCE_HYPERLINK"),
+    NETLIFY: $.env.get("NETLIFY"),
+    FORCE_COLOR: $.env.get("FORCE_COLOR"),
+    TERM: $.env.get("TERM"),
+    COLORTERM: $.env.get("COLORTERM"),
+    CI: $.env.get("CI"),
+    CI_NAME: $.env.get("CI_NAME"),
+    TRAVIS: $.env.get("TRAVIS"),
+    CIRCLECI: $.env.get("CIRCLECI"),
+    APPVEYOR: $.env.get("APPVEYOR"),
+    GITLAB_CI: $.env.get("GITLAB_CI"),
+    GITHUB_ACTIONS: $.env.get("GITHUB_ACTIONS"),
+    BUILDKITE: $.env.get("BUILDKITE"),
+    TEAMCITY_VERSION: $.env.get("TEAMCITY_VERSION"),
+    TERM_PROGRAM: $.env.get("TERM_PROGRAM"),
+    TERM_PROGRAM_VERSION: $.env.get("TERM_PROGRAM_VERSION"),
+    VTE_VERSION: $.env.get("VTE_VERSION"),
+    WT_SESSION: $.env.get("WT_SESSION"),
+    TMUX: $.env.get("TMUX"),
+    TERMINAL_EMULATOR: $.env.get("TERMINAL_EMULATOR"),
+    LC_TERMINAL: $.env.get("LC_TERMINAL"),
+  };
+  return Object.fromEntries(
+    await Promise.all(
+      Object.entries(read).map(async ([name, value]) => [name, await value]),
+    ),
+  );
+}
+
+/** Whether the terminal draws links, once read (dc-t577). */
+type LinksRead = { read?: Promise<boolean> };
+
+/**
+ * Whether the terminal draws links, by Claude Code's rule, read once into
+ * `kept`. A read that failed is not kept, so the next draw reads again;
+ * till then, links, as the row drew before.
+ */
+function terminalLinks($: Engine, kept: LinksRead): Promise<boolean> {
+  const read = (kept.read ??= linkEnv($).then(hyperlinksIn));
+  return read.catch(() => {
+    if (kept.read === read) delete kept.read;
+    return true;
+  });
 }
 
 /** The width of the label column in /dc's text (dc-t313): one lower-case label a line, its value after it. */
@@ -1545,6 +1733,7 @@ async function keepToken($: Engine, token: string): Promise<void> {
   const base = await baseOf($);
   await $.store.set(tokenKey(base), token);
   await handOver($, token, base);
+  await markOffered($, base);
 }
 
 /**
@@ -1578,6 +1767,66 @@ async function syncHandOver($: Engine): Promise<void> {
     if (there !== handedText(kept, base)) await handOver($, kept, base);
   } else if (there !== null) {
     await takeBack($, base);
+  }
+}
+
+/**
+ * What the plugin says while this machine has no hook token (dc-t576, part
+ * 4): at each session's start, in the transcript, and in /dc. `/mcp`'s
+ * sign-in gives the agent its tools only; the hooks, the wake and the line
+ * above the prompt need the machine's own hook token, and with none the hook
+ * script exits without a word, so the window looked connected and heard
+ * nothing.
+ */
+export const DELIVERY_OFF =
+  "devcorner: delivery is off in this window: this machine has no hook token, so devcorner's messages, dispatches and wakes never reach this conversation, though the agent's devcorner tools still work. /dc login signs this machine in, or ask Claude to sign it in, or set DEVCORNER_TOKEN to a hook token from devcorner's connections page.";
+
+/** What /dc says in a cloud session, which is never signed in (`NO_SIGN_IN.cloud`), so has no hooks' delivery. */
+export const CLOUD_DELIVERY =
+  "devcorner: this is a cloud session, whose plugin is never signed in, so devcorner's hooks and wake are off here; the agent's devcorner tools reach it through its own connection, and its check() reads its messages.";
+
+/**
+ * The store's key that says the devcorner at `base` was offered a sign-in on
+ * this machine's first run (dc-t576, part 4): the plugin starts /dc login
+ * itself once, and after that only says how.
+ */
+export const offeredKey = (base: string) => `offered:${base}`;
+
+/**
+ * Keeps that this machine needs no sign-in offered for the devcorner at
+ * `base` any more: once offered, once signed in (`keepToken`), and once
+ * signed out on purpose (`signOut`), so a person who chose to be signed
+ * out is never signed in for unasked.
+ */
+async function markOffered($: Engine, base: string): Promise<void> {
+  await $.store.set(offeredKey(base), true);
+}
+
+/**
+ * At a session's start with no token on a machine that may sign in
+ * (`noSignIn`): says delivery is off, and on the machine's first run for this
+ * devcorner starts the sign-in itself, as /dc login does, so the person has
+ * only to approve the code the line above the prompt shows. Never in a cloud
+ * session, nor with DEVCORNER_TOKEN or a kept token, nor where nothing draws
+ * the session. Silent on any failure.
+ */
+async function offerDelivery($: Engine): Promise<void> {
+  try {
+    if ((await noSignIn($)) !== null) return;
+    // A plain -p run draws nowhere, and has no person to approve a code.
+    if (!(await draws($))) return;
+    $.ui.log(DELIVERY_OFF);
+    const base = await baseOf($);
+    if ((await $.store.get(offeredKey(base))) !== undefined) return;
+    const got = await showCode($);
+    // A code devcorner could not give is offered again at the next start.
+    if ("problem" in got) return;
+    await markOffered($, base);
+    $.ui.log(
+      `devcorner: this is the plugin's first run on this machine, so it began /dc login for you. ${await codeText($, got)} /dc logout stops it.`,
+    );
+  } catch {
+    /* stay silent */
   }
 }
 
@@ -1830,6 +2079,11 @@ async function startSignIn($: Engine): Promise<string> {
   if (no) return NO_SIGN_IN[no];
   const got = await showCode($);
   if ("problem" in got) return `Could not sign in: ${got.problem}.`;
+  return codeText($, got);
+}
+
+/** What a sign-in says of the code it shows: where to approve it, and how long it lasts. */
+async function codeText($: Engine, got: KeptCode): Promise<string> {
   const minutes = Math.max(
     1,
     Math.round((got.expiresAt - (await $.clock.now())) / 60_000),
@@ -2071,6 +2325,8 @@ async function signOut($: Engine): Promise<string> {
     if (await inCloud($)) {
       return "This is a cloud session, whose plugin is never signed in.";
     }
+    // Signed out on purpose: no start begins a sign-in by itself (dc-t576).
+    await markOffered($, base);
     const at = await read($, signIn);
     const stopped = at?.step === "asking" || at?.step === "code";
     endFlow();
@@ -2111,6 +2367,7 @@ async function signOut($: Engine): Promise<string> {
     said = `devcorner could not be reached, so revoke this machine on ${base}/settings/connections`;
   }
   await forgetToken($, held.token);
+  await markOffered($, base);
   stopAsking();
   stopFresh();
   await update($, status, () => null);
@@ -2747,9 +3004,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     const held = await tokenOf($);
     if (!held) {
       return {
-        ...failed(
-          "This machine is not signed in to devcorner: run /dc login, or ask Claude to sign it in.",
-        ),
+        ...failed((await inCloud($)) ? CLOUD_DELIVERY : DELIVERY_OFF),
         signedOut: "none",
       };
     }
@@ -3496,6 +3751,8 @@ export const register: Register = (on) => {
     }
     // The hooks' copy of the machine's token is made what the store says.
     await syncHandOver($).catch(() => {});
+    // With no token, delivery is off: said, and offered once (dc-t576).
+    void offerDelivery($);
     forgetSession();
     // A session's first reading is due, whatever an earlier one wrote.
     capacityCarried = null;
@@ -3681,14 +3938,24 @@ export const register: Register = (on) => {
     return { text: who ? `${who}\n${text}` : text };
   });
 
+  // Whether the terminal draws links (dc-t577), read once a load: the
+  // terminal does not change under a session.
+  const linksOnTerminal: LinksRead = {};
+
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e);
     const { Box, Link, Text } = $.ui.resolve(e);
+    // Another surface draws a link as an anchor; a terminal draws it as a
+    // link only where Claude Code says it can, and else as its words then
+    // its whole address, which would make the row long, so there the row is
+    // its words alone (dc-t577).
+    const links =
+      e.surface !== "terminal" || (await terminalLinks($, linksOnTerminal));
     // The row's words, dim, each part linked to the page devcorner named
     // (dc-t533): links and nothing to press.
     const linked = (segments: Segment[]) =>
       segments.map(({ text, href }, i) =>
-        href ? (
+        href && links ? (
           <Link key={`link-${i}`} href={href}>
             {text}
           </Link>
@@ -3724,7 +3991,12 @@ export const register: Register = (on) => {
             <Text color="cyan">● </Text>
             <Text dimColor>
               devcorner · Open{" "}
-              <Link href={at.link}>{shownAddress(at.page)}</Link> and enter{" "}
+              {links ? (
+                <Link href={at.link}>{shownAddress(at.page)}</Link>
+              ) : (
+                at.link
+              )}{" "}
+              and enter{" "}
             </Text>
             <Text weight="bold">{at.code}</Text>
           </Box>

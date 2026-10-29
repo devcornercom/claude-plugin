@@ -257,9 +257,9 @@ export type StatusLinks = {
 export type StatusWake = {
   /** The message, such as acme-m42 or me-m42. */
   id: string;
-  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent, or another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from). */
-  from: "person" | "member" | "github" | "run" | "relay" | (string & {});
-  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, or "held" for an OA's run that waits for room. */
+  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), or an OA it gave asking its person ("oa", dc-t576, `item` the question). */
+  from: "person" | "member" | "github" | "run" | "relay" | "oa" | (string & {});
+  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, or "asked" for an OA's question. */
   what: string;
   /** A run (dc-r3), a question, a ticket, or a pull request (owner/name#3); null when about none. */
   item: string | null;

@@ -58,6 +58,7 @@ import {
   remoteOf,
   folderOf,
   rowSegments,
+  hyperlinksIn,
   shortSession,
   cutAtWord,
   dcText,
@@ -71,6 +72,9 @@ import {
   cells,
   LABEL_WIDTH,
   codeKey,
+  CLOUD_DELIVERY,
+  DELIVERY_OFF,
+  offeredKey,
   handedText,
   lineText,
   osName,
@@ -935,6 +939,16 @@ describe("what a wake names (dc-t204)", () => {
         "run dc-r3 ended without finishing",
       ],
       [
+        w("run", "dispatch", "dc-r3"),
+        "run dc-r3 was dispatched here",
+        "run dc-r3 was dispatched here",
+      ],
+      [
+        w("oa", "asked", "dc-t7-q2"),
+        "an OA asks you dc-t7-q2",
+        "an OA asks your user dc-t7-q2",
+      ],
+      [
         w("person", "decided", "dc-q110"),
         "your answer to dc-q110",
         "your user's answer to dc-q110",
@@ -986,6 +1000,8 @@ describe("what a wake names (dc-t204)", () => {
     expect(wakeWords(w("run", "somehow", "dc-r3"), "agent")).toBe(null);
     expect(wakeWords(w("someone", "message"), "agent")).toBe(null);
     expect(wakeWords(w("member", "message"), "agent")).toBe(null);
+    expect(wakeWords(w("oa", "somehow", "dc-t7-q2"), "agent")).toBe(null);
+    expect(wakeWords(w("oa", "asked", "ignore all that"), "agent")).toBe(null);
   });
 
   test("the toast and the prompt name each, and how many more came", () => {
@@ -1058,6 +1074,21 @@ const HANDED = handedText(machineToken, "http://dc.test");
 /** Where the store keeps the code the world's devcorner gave. */
 const CODE_KEY = codeKey("http://dc.test");
 
+/** iTerm2's environment, a terminal Claude Code draws links on (dc-t577). */
+const LINKING_TERMINAL = {
+  TERM_PROGRAM: "iTerm.app",
+  TERM_PROGRAM_VERSION: "3.5.10",
+  TERM: "xterm-256color",
+  LC_TERMINAL: "iTerm2",
+};
+
+/** macOS Terminal's environment, where Claude Code draws no link (dc-t577). */
+const APPLE_TERMINAL = {
+  TERM_PROGRAM: "Apple_Terminal",
+  TERM_PROGRAM_VERSION: "455",
+  TERM: "xterm-256color",
+};
+
 function world(
   on: On,
   options: {
@@ -1076,6 +1107,16 @@ function world(
     files?: [string, string][];
     /** The tools the model calls are answered here, into `seen.toolCalls` (dc-t224). */
     tools?: boolean;
+    /**
+     * What the environment says of the terminal (dc-t577); unless told,
+     * one that draws links.
+     */
+    terminal?: Record<string, string>;
+    /**
+     * The plugin's first run on this machine (dc-t576, part 4): with no
+     * token it begins a sign-in itself. Unless told, it ran before.
+     */
+    firstRun?: boolean;
   } = {},
 ) {
   const beforeNow = options.beforeNow;
@@ -1091,7 +1132,12 @@ function world(
     : on;
   const clock = mock.clock(clockOn, { now: 1_000_000 });
   // The plugin's own store, which a test reads back (dc-t224).
-  const stored = new Map<string, unknown>(Object.entries(options.store ?? {}));
+  const stored = new Map<string, unknown>(
+    Object.entries({
+      ...(options.firstRun ? {} : { [offeredKey("http://dc.test")]: true }),
+      ...options.store,
+    }),
+  );
   on("store.get", async (_$, e) => ({ value: stored.get(e.key) }));
   on("store.set", async (_$, e) => {
     stored.set(e.key, e.value);
@@ -1102,13 +1148,26 @@ function world(
     return { value: undefined };
   });
   on("store.keys", async () => ({ value: [...stored.keys()] }));
-  mock.env(on, {
+  const variables: Record<string, string> = {
     DEVCORNER_URL: "http://dc.test",
     ...(options.token === false ? {} : { DEVCORNER_TOKEN: "dch_test" }),
     ...(options.home ? { HOME: options.home } : {}),
     ...(options.remote ? { CLAUDE_CODE_REMOTE: "true" } : {}),
+    ...(options.terminal ?? LINKING_TERMINAL),
+  };
+  // The environment, as mock.env answers it, but for a read the test makes
+  // fail once (`seen.envFails`, dc-t577).
+  on("env.get", async (_$, e) => {
+    const at = seen.envFails.indexOf(e.name);
+    if (at >= 0) {
+      seen.envFails.splice(at, 1);
+      throw new Error(`${e.name} was not read`);
+    }
+    return { value: variables[e.name] };
   });
   const seen = {
+    /** Variables whose next read fails, once each (dc-t577). */
+    envFails: [] as string[],
     asks: 0,
     submitted: [] as string[],
     /** Which of them went as the person's own words (`asUser`), in order. */
@@ -1587,10 +1646,11 @@ type Size = { columns: number; rows: number };
 const mountRow = (
   $: Parameters<TestBody>[0],
   size: Size = { columns: 120, rows: 10 },
+  surface: "terminal" | "desktop" = "terminal",
 ) =>
   $.ui.mount({
     plugin: "devcorner",
-    surface: "terminal",
+    surface,
     component: "AbovePrompt",
     props: {
       hasSurvey: false,
@@ -1626,8 +1686,12 @@ type Drawn =
  * it has to press, which is none. A link's words are the link's own
  * children, since the harness's `text` of a Link also holds its address.
  */
-async function drawn($: Parameters<TestBody>[0], size?: Size) {
-  const ui = await mountRow($, size);
+async function drawn(
+  $: Parameters<TestBody>[0],
+  size?: Size,
+  surface?: "terminal" | "desktop",
+) {
+  const ui = await mountRow($, size, surface);
   const dim = (await ui.findAll({ type: "Text" })).filter(
     (found) => found.props.dimColor === true,
   );
@@ -1940,6 +2004,244 @@ describe("the row above the prompt, drawn (dc-t533)", () => {
     await clock.settle();
     expect(await rowText($)).toBe("");
   });
+});
+
+describe("the row in a terminal that draws no links (dc-t577)", () => {
+  test("macOS Terminal: the same words, none linked, so no address follows them and the line stays short", async ($, on) => {
+    const { clock, seen } = world(on, { terminal: APPLE_TERMINAL });
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await clock.settle();
+    expect(await drawn($)).toEqual({
+      line: "devcorner · s7 · waiting 2",
+      links: [],
+      buttons: 0,
+    });
+    // What the terminal shows: the words alone, no address after any.
+    expect(await rowText($)).toBe(`${BULLET}devcorner · s7 · waiting 2`);
+    // The nudge's "devcorner" too.
+    seen.answer = { ...base, known: false };
+    await $.command.run({ command: "dc", args: "" });
+    expect(await drawn($)).toEqual({
+      line: "devcorner · new project here · /dc setup sets it up · /dc hide hides this",
+      links: [],
+      buttons: 0,
+    });
+  });
+
+  test("the label is laid out as before, in the same cells", async ($, on) => {
+    const { clock, seen } = world(on, { terminal: APPLE_TERMINAL });
+    const long: Status = {
+      ...BUSY,
+      thisConversation: { id: "me-h3", name: "reviews the row layout" },
+    };
+    seen.answer = long;
+    await $.session.start(START);
+    await clock.settle();
+    for (const columns of [120, 54, 41, 40]) {
+      const text = await (
+        await mountRow($, { columns, rows: 1 })
+      ).find({
+        type: "Box",
+      });
+      expect(text?.text).toBe(BULLET + row(long, columns));
+      expect(cells(text?.text ?? "")).toBeLessThanOrEqual(columns);
+    }
+  });
+
+  test("another surface draws its links as anchors, whatever the terminal", async ($, on) => {
+    const { clock, seen } = world(on, { terminal: APPLE_TERMINAL });
+    // The desktop draws no link whose address holds a raw @, so the
+    // session's page is named here as it would be encoded.
+    const session = "https://dc.test/s/dc-s7%40acme";
+    seen.answer = { ...WHOLE, links: { ...LINKS, session } };
+    await $.session.start(START);
+    await clock.settle();
+    expect((await drawn($, undefined, "desktop")).links).toEqual([
+      { text: "devcorner", href: LINKS.project },
+      { text: "s7", href: session },
+      { text: "waiting 2", href: LINKS.inbox },
+    ]);
+  });
+
+  test("a read of the environment that failed draws links, as before, and is not kept: the next draw reads again", async ($, on) => {
+    const { clock, seen } = world(on, { terminal: APPLE_TERMINAL });
+    seen.envFails.push("TERM_PROGRAM");
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await clock.settle();
+    expect((await drawn($)).links).toHaveLength(3);
+    expect((await drawn($)).links).toEqual([]);
+  });
+
+  test("FORCE_HYPERLINK=1 links them, as it makes Claude Code draw links", async ($, on) => {
+    const { clock, seen } = world(on, {
+      terminal: { ...APPLE_TERMINAL, FORCE_HYPERLINK: "1" },
+    });
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await clock.settle();
+    expect((await drawn($)).links).toHaveLength(3);
+  });
+});
+
+describe("whether Claude Code draws links on the terminal: its rule, from the environment (dc-t577)", () => {
+  const cases: [string, Record<string, string>, boolean][] = [
+    ["macOS Terminal", APPLE_TERMINAL, false],
+    ["iTerm2", LINKING_TERMINAL, true],
+    [
+      "iTerm2 before 3.1, named a linking terminal all the same",
+      {
+        TERM_PROGRAM: "iTerm.app",
+        TERM_PROGRAM_VERSION: "3.0.15",
+        TERM: "xterm-256color",
+      },
+      true,
+    ],
+    ["Ghostty", { TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty" }, true],
+    [
+      "WezTerm",
+      {
+        TERM_PROGRAM: "WezTerm",
+        TERM_PROGRAM_VERSION: "20240203-110809-5046fc22",
+        TERM: "xterm-256color",
+      },
+      true,
+    ],
+    [
+      "VS Code's terminal",
+      {
+        TERM_PROGRAM: "vscode",
+        TERM_PROGRAM_VERSION: "1.95.3",
+        TERM: "xterm-256color",
+      },
+      true,
+    ],
+    [
+      "VS Code's terminal before 1.72",
+      {
+        TERM_PROGRAM: "vscode",
+        TERM_PROGRAM_VERSION: "1.71.0",
+        TERM: "xterm-256color",
+      },
+      false,
+    ],
+    ["kitty, by TERM", { TERM: "xterm-kitty" }, true],
+    ["Warp", { TERM_PROGRAM: "WarpTerminal", TERM: "xterm-256color" }, true],
+    ["Alacritty", { TERM: "alacritty", COLORTERM: "truecolor" }, true],
+    ["Alacritty's TERM with no colour said", { TERM: "alacritty" }, false],
+    [
+      "a JetBrains IDE",
+      { TERMINAL_EMULATOR: "JetBrains-JediTerm", TERM: "xterm-256color" },
+      true,
+    ],
+    ["Windows Terminal", { WT_SESSION: "b0e9", TERM: "xterm-256color" }, true],
+    [
+      "GNOME Terminal (VTE 0.76)",
+      { VTE_VERSION: "7600", TERM: "xterm-256color" },
+      true,
+    ],
+    ["VTE 0.50.0", { VTE_VERSION: "0.50.0", TERM: "xterm-256color" }, false],
+    [
+      "tmux 3.4",
+      {
+        TERM_PROGRAM: "tmux",
+        TERM_PROGRAM_VERSION: "3.4",
+        TERM: "tmux-256color",
+        TMUX: "/tmp/tmux-501/default,1,0",
+      },
+      true,
+    ],
+    [
+      "tmux 3.3a",
+      {
+        TERM_PROGRAM: "tmux",
+        TERM_PROGRAM_VERSION: "3.3a",
+        TERM: "tmux-256color",
+        TMUX: "/tmp/tmux-501/default,1,0",
+      },
+      false,
+    ],
+    [
+      "tmux 3.3a in iTerm2",
+      {
+        TERM_PROGRAM: "tmux",
+        TERM_PROGRAM_VERSION: "3.3a",
+        TERM: "tmux-256color",
+        LC_TERMINAL: "iTerm2",
+      },
+      true,
+    ],
+    [
+      "Windows Terminal under tmux 3.3",
+      {
+        WT_SESSION: "b0e9",
+        TERM_PROGRAM: "tmux",
+        TERM_PROGRAM_VERSION: "3.3",
+        TERM: "tmux-256color",
+        TMUX: "/tmp/t,1,0",
+      },
+      true,
+    ],
+    ["a plain xterm", { TERM: "xterm-256color" }, false],
+    ["nothing said", {}, false],
+    [
+      "FORCE_HYPERLINK=1 in macOS Terminal",
+      { ...APPLE_TERMINAL, FORCE_HYPERLINK: "1" },
+      true,
+    ],
+    [
+      "FORCE_HYPERLINK=0 in iTerm2",
+      { ...LINKING_TERMINAL, FORCE_HYPERLINK: "0" },
+      false,
+    ],
+    [
+      "FORCE_HYPERLINK set empty in iTerm2",
+      { ...LINKING_TERMINAL, FORCE_HYPERLINK: "" },
+      true,
+    ],
+    [
+      "FORCE_HYPERLINK set empty in macOS Terminal",
+      { ...APPLE_TERMINAL, FORCE_HYPERLINK: "" },
+      false,
+    ],
+    [
+      "no colour (FORCE_COLOR=0) in Ghostty, named a linking terminal all the same",
+      { TERM_PROGRAM: "ghostty", FORCE_COLOR: "0" },
+      true,
+    ],
+    [
+      "no colour (FORCE_COLOR=0) in VS Code's terminal",
+      {
+        TERM_PROGRAM: "vscode",
+        TERM_PROGRAM_VERSION: "1.95.3",
+        TERM: "xterm-256color",
+        FORCE_COLOR: "0",
+      },
+      false,
+    ],
+    [
+      "a dumb terminal in VS Code",
+      { TERM_PROGRAM: "vscode", TERM_PROGRAM_VERSION: "1.95.3", TERM: "dumb" },
+      false,
+    ],
+    [
+      "CI in VS Code's terminal",
+      {
+        TERM_PROGRAM: "vscode",
+        TERM_PROGRAM_VERSION: "1.95.3",
+        TERM: "xterm-256color",
+        CI: "true",
+      },
+      false,
+    ],
+    ["Netlify", { NETLIFY: "true" }, true],
+  ];
+  for (const [name, env, links] of cases) {
+    test(`${name}: ${links ? "links" : "no links"}`, () => {
+      expect(hyperlinksIn(env)).toBe(links);
+    });
+  }
 });
 
 describe("what this session is on and did lately: /dc now (dc-t489)", () => {
@@ -2991,6 +3293,125 @@ describe("signing this machine in from Claude Code (dc-t224)", () => {
     );
   });
 
+  test("with no token, each session's start says delivery is off, and /dc says it too (dc-t576)", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, home: "/home/ann" });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.logs).toEqual([DELIVERY_OFF]);
+    expect(DELIVERY_OFF).toContain("delivery is off in this window");
+    expect(DELIVERY_OFF).toContain("/dc login signs this machine in");
+    // A machine that ran before is not signed in for: it is told how.
+    expect(seen.deviceAsks).toEqual([]);
+    expect(said(await $.command.run({ command: "dc", args: "" }))).toBe(
+      DELIVERY_OFF,
+    );
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.logs).toEqual([DELIVERY_OFF, DELIVERY_OFF]);
+  });
+
+  test("the first run on a machine with no token begins /dc login itself, once (dc-t576)", async ($, on) => {
+    const { clock, seen, stored } = world(on, {
+      token: false,
+      home: "/home/ann",
+      firstRun: true,
+    });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.deviceAsks).toHaveLength(1);
+    expect(stored.get(offeredKey("http://dc.test"))).toBe(true);
+    expect(seen.logs[0]).toBe(DELIVERY_OFF);
+    expect(seen.logs[1]).toMatch(
+      /^devcorner: this is the plugin's first run on this machine, so it began \/dc login for you\. Open http:\/\/dc\.test\/device\?code=KQ4F-9XZT\nand approve the code KQ4F-9XZT, .* \/dc logout stops it\.$/s,
+    );
+    // The line above the prompt shows the code to approve.
+    expect(await rowText($)).toContain("KQ4F-9XZT");
+    // Approved on the page: the machine is signed in, and says nothing more.
+    seen.polls.push({
+      status: 200,
+      body: {
+        access_token: machineToken,
+        token_type: "Bearer",
+        name: "Ann's laptop",
+      },
+    });
+    seen.answer = WHOLE;
+    await clock.advance(5_000);
+    await flush(clock);
+    expect(stored.get(STORE_KEY)).toBe(machineToken);
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.logs).toHaveLength(2);
+    expect(seen.deviceAsks).toHaveLength(1);
+  });
+
+  test("a first run's sign-in, once stopped, is not begun again at the next start (dc-t576)", async ($, on) => {
+    const first = world(on, {
+      token: false,
+      home: "/home/ann",
+      firstRun: true,
+    });
+    await $.session.start(START);
+    await flush(first.clock);
+    expect(first.seen.deviceAsks).toHaveLength(1);
+    // Stopped: the next start says how, and asks for no code.
+    await $.command.run({ command: "dc", args: "logout" });
+    await $.session.start(START);
+    await flush(first.clock);
+    expect(first.seen.deviceAsks).toHaveLength(1);
+    expect(first.seen.logs.at(-1)).toBe(DELIVERY_OFF);
+  });
+
+  test("a cloud session, or a machine with a token, is told nothing of delivery (dc-t576)", async ($, on) => {
+    const cloud = world(on, {
+      token: false,
+      remote: true,
+      firstRun: true,
+    });
+    await $.session.start(START);
+    await flush(cloud.clock);
+    expect(cloud.seen.logs).toEqual([]);
+    expect(cloud.seen.deviceAsks).toEqual([]);
+    // /dc says why there, never to /dc login.
+    expect(said(await $.command.run({ command: "dc", args: "" }))).toBe(
+      CLOUD_DELIVERY,
+    );
+  });
+
+  test("a first run whose code devcorner could not give begins it again at the next start, and a sign-out on purpose is never undone (dc-t576)", async ($, on) => {
+    const { clock, seen, stored } = world(on, {
+      token: false,
+      home: "/home/ann",
+      firstRun: true,
+    });
+    seen.deviceAnswer = "down";
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.deviceAsks).toHaveLength(1);
+    expect(stored.get(offeredKey("http://dc.test"))).toBeUndefined();
+    expect(seen.logs).toEqual([DELIVERY_OFF]);
+    seen.deviceAnswer = DEVICE_CODE;
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.deviceAsks).toHaveLength(2);
+    expect(stored.get(offeredKey("http://dc.test"))).toBe(true);
+
+    // A machine that never had the key, signed out by its person, is not
+    // signed in for unasked.
+    stored.delete(offeredKey("http://dc.test"));
+    await $.command.run({ command: "dc", args: "logout" });
+    expect(stored.get(offeredKey("http://dc.test"))).toBe(true);
+  });
+
+  test("a machine with DEVCORNER_TOKEN is told nothing of delivery, on its first run too (dc-t576)", async ($, on) => {
+    const { clock, seen } = world(on, { firstRun: true });
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.logs).toEqual([]);
+    expect(seen.deviceAsks).toEqual([]);
+  });
+
   const connectPlugin = (device?: string) =>
     ({
       tool: "mcp__plugin_devcorner_devcorner__workspace",
@@ -3265,6 +3686,22 @@ describe("signing this machine in from Claude Code (dc-t224)", () => {
     expect(seen.toolCalls).toEqual([
       expect.objectContaining({ action: "list" }),
     ]);
+  });
+
+  test("in a terminal that draws no links, the line says the code's address once, whole, which the terminal can open (dc-t577)", async ($, on) => {
+    const { clock } = world(on, {
+      token: false,
+      home: "/home/ann",
+      terminal: APPLE_TERMINAL,
+    });
+    await $.session.start(START);
+    await flush(clock);
+    await login($);
+    await flush(clock);
+    expect(await rowText($)).toBe(
+      `● devcorner · Open ${DEVICE_CODE.verification_uri_complete} and enter KQ4F-9XZT`,
+    );
+    expect(await rowLinks($)).toEqual([]);
   });
 
   test("/dc login asks for a code, the row shows where to open and what to enter, with nothing to press, and the approved token is kept", async ($, on) => {
