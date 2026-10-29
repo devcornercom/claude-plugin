@@ -352,10 +352,36 @@ export function updatingFor(res: {
   return Math.min(seconds * 1000, MAX_UPDATING_MS);
 }
 
-/** "git@github.com:acme/shop.git", "https://github.com/acme/shop" -> "acme/shop". */
-export function repoOf(remote: string): string | undefined {
-  const m = remote.trim().match(/([^/:\s]+)\/([^/:\s]+?)(?:\.git)?\/?$/);
-  return m ? `${m[1]}/${m[2]}` : undefined;
+/**
+ * The remote git prints for origin (dc-t565): devcorner folds it into the
+ * repo's name, owner/name on GitHub and with its host on another, as
+ * bitbucket.org/acme/shop, so the plugin never drops the host. A user or a
+ * token an https remote holds is left out, as the hook script leaves it
+ * out. Undefined when git printed none.
+ */
+export function remoteOf(printed: string): string | undefined {
+  const remote = printed
+    .trim()
+    .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/\s]*@/i, "$1");
+  return remote && !/\s/.test(remote) ? remote : undefined;
+}
+
+/** How many folders a remote that is a folder is followed through to the remote its repo came from. */
+const FOLDER_HOPS = 3;
+
+/**
+ * The folder a remote names when it is one on this machine, as git prints
+ * it: an absolute path, as a clone of a folder keeps, or a file:/// URL
+ * (dc-t565). devcorner names no repo for it, so the plugin reads the remote
+ * that folder's repo came from in its place, as the hook script does.
+ * Undefined for a remote on a host, and for a relative path, which git
+ * reads from the repo's own top folder, not the conversation's.
+ */
+export function folderOf(printed: string): string | undefined {
+  const remote = printed.trim();
+  const file = /^file:\/\/(\/.+)$/i.exec(remote);
+  if (file) return file[1];
+  return /^(?:\/|[a-z]:[\\/])./i.test(remote) ? remote : undefined;
 }
 
 /**
@@ -1252,13 +1278,29 @@ async function noteUpdating($: Engine, ms: number | null): Promise<void> {
 /** The repo last read from git, by folder: asked every 15 s, it rarely changes. */
 let lastRepo: { cwd: string; repo: string } | undefined;
 
+/**
+ * The remote of origin in a folder, followed through a remote that is a
+ * folder to the remote that folder's repo came from (`folderOf`), up to
+ * FOLDER_HOPS folders on. Undefined when no remote on a host is reached.
+ */
 async function repoIn($: Engine, cwd: string): Promise<string | undefined> {
   if (lastRepo?.cwd === cwd) return lastRepo.repo;
-  const git = await $.process.run(["git", "remote", "get-url", "origin"], {
-    cwd,
-    timeoutMs: 5000,
-  });
-  const repo = git.exitCode === 0 ? repoOf(git.stdout) : undefined;
+  let at: string[] = [];
+  let repo: string | undefined;
+  for (let hop = 0; hop <= FOLDER_HOPS; hop++) {
+    const git = await $.process.run(
+      ["git", ...at, "remote", "get-url", "origin"],
+      { cwd, timeoutMs: 5000 },
+    );
+    // A relative folder names no repo either, and is not followed (`folderOf`).
+    if (git.exitCode !== 0 || /^\.{1,2}[\\/]/.test(git.stdout.trim())) break;
+    const folder = folderOf(git.stdout);
+    if (folder === undefined) {
+      repo = remoteOf(git.stdout);
+      break;
+    }
+    at = ["-C", folder];
+  }
   lastRepo = repo ? { cwd, repo } : undefined;
   return repo;
 }
@@ -2716,7 +2758,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     const repo = await repoIn($, cwd);
     if (!repo) {
       return failed(
-        "This folder has no git remote named origin, so devcorner cannot tell which repo it is.",
+        "This folder has no git remote named origin on a host, nor does a folder its origin names, so devcorner cannot tell which repo it is.",
       );
     }
     const sessionId = await $.session.id();

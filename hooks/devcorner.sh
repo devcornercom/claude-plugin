@@ -116,10 +116,35 @@ field() {
   esac
 }
 
+# Prints the remote of origin in folder $1, whose host devcorner keeps when it
+# is not GitHub, without a user or token an https remote may hold. A remote
+# that is a folder on this machine, an absolute path as a clone of a folder
+# keeps or a file:/// URL, names no repo to devcorner, so the remote that
+# folder's repo came from is read in its place, up to three folders on
+# (dc-t565), as the plugin's module does. Prints nothing when there is none.
+remote() {
+  folder=$1
+  for hop in 0 1 2 3; do
+    origin=$(git -C "$folder" remote get-url origin 2>/dev/null) || return 0
+    case $origin in
+    file:///?*) folder=${origin#file://} ;;
+    /?* | [A-Za-z]:[\\/]?*) folder=$origin ;;
+    # A relative folder, which git reads from the repo's own top folder.
+    ./* | ../*) return 0 ;;
+    *)
+      printf '%s\n' "$origin" |
+        sed 's#^\([A-Za-z][A-Za-z0-9+.-]*://\)[^@/]*@#\1#'
+      return 0
+      ;;
+    esac
+  done
+}
+
 # Passes the whole event on, with the repo and branch from git.
 forward() {
   dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-  repo=$(git -C "$dir" remote get-url origin 2>/dev/null || basename "$dir")
+  repo=$(remote "$dir")
+  [ -n "$repo" ] || repo=$(basename "$dir")
   branch=$(git -C "$dir" branch --show-current 2>/dev/null)
   curl -sf --connect-timeout 1 -m "${limit:-3}" -X POST "$endpoint" \
     -H "Authorization: Bearer $token" \

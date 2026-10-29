@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.25.0 — 2026-10-29
+
+- A repo on Bitbucket, GitLab or a server of its own keeps its host (dc-t565). The line above the prompt sends devcorner the remote as git prints it, where it sent only the owner and name it cut from it, so devcorner names the repo with its host, as `bitbucket.org/acme/shop` or `gitlab.com/group/sub/repo`, and never takes it for the GitHub repo of the same owner and name. A GitHub repo is `acme/shop` as before. The hooks already sent the whole remote. Neither sends a user or token an https remote holds any more. A remote that is a folder on this machine (its absolute path or a `file:///` URL, as a clone of a local mirror has) names no repo to devcorner, so both follow it to the remote that folder's repo came from, up to three folders on, where they sent the folder and the line went quiet. `/devcorner:cloud-agent` names a repo on another host to devcorner by its remote, and sets the routine up without a repo, since a routine's repo is a GitHub one.
+
 ## 0.24.0 — 2026-10-27
 
 - The worker agent hands its result back and never watches (dc-t528): only the session that owns the work watches it, so a worker hands its result to its coordinator and never watches its coordinator's runs or OAs, with no polling or sleep loop and no `show` or `check` only to see whether something changed. devcorner's ways of working give every subagent the same line (`hand-back`).

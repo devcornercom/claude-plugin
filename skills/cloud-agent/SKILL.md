@@ -9,7 +9,7 @@ You are setting up devcorner's cloud agent for the user: a Claude Code routine o
 
 ## 1. Find the repo and ask once
 
-- Run `git remote get-url origin` and take the owner and name, such as `acme/shop`, and the repo URL `https://github.com/acme/shop`. If there is no GitHub remote, say so and continue without a repo.
+- Run `git remote get-url origin`. On GitHub, take the owner and name, such as `acme/shop`, and the repo URL `https://github.com/acme/shop`. On another host (Bitbucket, GitLab or a server of its own), the repo you name to devcorner is the remote as git printed it, so devcorner keeps its host (it names it as `bitbucket.org/acme/shop`); a routine's repo is a GitHub repo, so say that the routine goes without one, and continue without it. If there is no remote, say so and continue without a repo.
 - Find devcorner's address: the URL of the devcorner MCP server the user uses, minus `/mcp` (the plugin's `.mcp.json` uses `${DEVCORNER_URL:-https://devcorner.devcorner.workers.dev}`). The routine reaches devcorner through the user's claude.ai devcorner connector, which needs a public address. If the address is `localhost` or `127.0.0.1`, say that a cloud session cannot reach a local devcorner, and stop.
 - Tell the user, and ask for a yes ONCE before anything is created:
   - It creates a routine named "devcorner cloud agent" on their claude.ai account, with their default environment, the repo if their account can reach it, the tools Bash, Read, Write, Edit, Glob, Grep, Skill and Agent (so it can run /simplify, /code-review and subagents), only the devcorner connector, and no schedule.

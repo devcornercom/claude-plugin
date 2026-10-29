@@ -55,7 +55,8 @@ import {
   wokenOf,
   nudgePrompt,
   nudgeSegments,
-  repoOf,
+  remoteOf,
+  folderOf,
   rowSegments,
   shortSession,
   cutAtWord,
@@ -95,10 +96,73 @@ const base = {
   page: "x",
 };
 
-test("repoOf normalises remotes", () => {
-  expect(repoOf("git@github.com:acme/shop.git\n")).toBe("acme/shop");
-  expect(repoOf("https://github.com/acme/shop")).toBe("acme/shop");
-  expect(repoOf("")).toBe(undefined);
+test("remoteOf passes the remote as git prints it, its host kept for devcorner to fold (dc-t565)", () => {
+  expect(remoteOf("git@github.com:acme/shop.git\n")).toBe(
+    "git@github.com:acme/shop.git",
+  );
+  expect(remoteOf("git@bitbucket.org:acme/shop.git\n")).toBe(
+    "git@bitbucket.org:acme/shop.git",
+  );
+  expect(remoteOf("https://gitlab.com/group/sub/repo.git")).toBe(
+    "https://gitlab.com/group/sub/repo.git",
+  );
+  // A token an https remote holds never leaves the machine.
+  expect(
+    remoteOf("https://x-access-token:ghp_secret@github.com/acme/shop.git"),
+  ).toBe("https://github.com/acme/shop.git");
+  expect(remoteOf("")).toBe(undefined);
+});
+
+test("folderOf tells a remote that is a folder on this machine from one on a host (dc-t565)", () => {
+  expect(folderOf("/srv/git/shop.git")).toBe("/srv/git/shop.git");
+  expect(folderOf("file:///srv/git/shop.git\n")).toBe("/srv/git/shop.git");
+  expect(folderOf("/Users/me/My Repos/shop.git\n")).toBe(
+    "/Users/me/My Repos/shop.git",
+  );
+  expect(folderOf("C:\\code\\shop")).toBe("C:\\code\\shop");
+  // A relative folder is read by git from the repo's top folder: not followed.
+  expect(folderOf("../shop")).toBe(undefined);
+  expect(folderOf("git@bitbucket.org:acme/shop.git")).toBe(undefined);
+  expect(folderOf("https://gitlab.com/group/sub/repo.git")).toBe(undefined);
+});
+
+describe("a remote that is a folder (dc-t565)", () => {
+  test("is followed to the remote its repo came from, which Status sends", async ($, on) => {
+    const { clock, seen } = world(on);
+    seen.origins = {
+      "": "/srv/mirror/shop.git",
+      "/srv/mirror/shop.git": "file:///srv/My Mirrors/upstream.git",
+      "/srv/My Mirrors/upstream.git": "git@bitbucket.org:acme/shop.git",
+    };
+    await $.session.start(START);
+    await clock.settle();
+    expect(seen.statusBodies.at(-1)).toMatchObject({
+      repo: "git@bitbucket.org:acme/shop.git",
+    });
+  });
+
+  const unreached: [string, Record<string, string | null>][] = [
+    ["a folder with no remote", { "/srv/mirror/shop.git": null }],
+    ["a relative folder", { "/srv/mirror/shop.git": "../upstream" }],
+    [
+      "more folders than it follows",
+      {
+        "/srv/mirror/shop.git": "/srv/a.git",
+        "/srv/a.git": "/srv/b.git",
+        "/srv/b.git": "/srv/c.git",
+        "/srv/c.git": "git@bitbucket.org:acme/shop.git",
+      },
+    ],
+  ];
+  for (const [why, origins] of unreached) {
+    test(`names no repo when no remote on a host is reached: ${why}`, async ($, on) => {
+      const { clock, seen } = world(on);
+      seen.origins = { "": "/srv/mirror/shop.git", ...origins };
+      await $.session.start(START);
+      await clock.settle();
+      expect(seen.statusBodies).toEqual([]);
+    });
+  }
 });
 
 /** The row above the prompt as it reads, links or not: whole, or laid out in `columns` cells (dc-t533). */
@@ -1061,6 +1125,12 @@ function world(
     statusBodies: [] as Record<string, unknown>[],
     /** The branch `git branch --show-current` prints in the folder (dc-t334); empty on a detached head. */
     branch: "main",
+    /**
+     * What `git remote get-url origin` prints, by the folders its -C args
+     * name, joined by a space ("" for the conversation's own); null for none.
+     * A folder not named prints the GitHub remote.
+     */
+    origins: {} as Record<string, string | null>,
     /** Whether devcorner says back the branch a Status said, as it does once it took it. */
     takesBranch: true,
     held: [] as ((text: string) => void)[],
@@ -1259,6 +1329,22 @@ function world(
     // file) and its removal, as the files they leave.
     if (e.argv[0] === "sh") seen.files.set(e.argv[4]!, e.init?.stdin ?? "");
     if (e.argv[0] === "rm") seen.files.delete(e.argv[2]!);
+    if (e.argv[0] === "git" && e.argv.at(-1) === "origin") {
+      const folders = e.argv.filter((_, i) => e.argv[i - 1] === "-C");
+      const origin = seen.origins[folders.join(" ")];
+      return {
+        value: {
+          exitCode: origin === null ? 2 : 0,
+          stdout:
+            origin === undefined
+              ? "git@github.com:acme/shop.git\n"
+              : `${origin ?? ""}\n`,
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    }
     const stdout =
       e.argv[0] === "uname"
         ? "Darwin\n"
