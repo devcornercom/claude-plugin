@@ -12,6 +12,10 @@ import type {
 import {
   PASTE_USAGE,
   PASTER,
+  STARTER,
+  FINISHER,
+  startedSession,
+  claimFile,
   agoText,
   expiresText,
   pasteNote,
@@ -5448,5 +5452,174 @@ describe("what waits on you, by work stream, latest first: /dc and /dc waits (dc
     await $.command.run({ command: "dc", args: "waits please" } as never);
     await clock.settle();
     expect(seen.submitted.at(-1)).toBe("devcorner: waits please");
+  });
+});
+
+describe("the window states the session it runs as (dc-t588)", () => {
+  const CLAIMS = "/home/ann/.cache/devcorner/claims/conversation-1.claim";
+  const started = (id: string, child = "") =>
+    `devcorner · session ${id} · no ticket${child}\n\nYour instructions …`;
+  /** The claim the latest Status carried, or undefined for none. */
+  const lastClaim = (seen: { statusBodies: Record<string, unknown>[] }) =>
+    seen.statusBodies.at(-1)?.claim;
+  /** A Status read now, as /dc now asks one. */
+  const now = async (
+    $: Parameters<TestBody>[0],
+    clock: { settle: () => Promise<void> },
+  ) => {
+    await $.command.run({ command: "dc", args: "now" });
+    await clock.settle();
+  };
+
+  test("a start's reply names the session it started, never a child's, and the tools are devcorner's", () => {
+    expect(startedSession(started("acm-s4"))).toBe("acm-s4");
+    expect(startedSession(started("dc-s4@acme"))).toBe("dc-s4@acme");
+    expect(
+      startedSession(
+        "devcorner · session me-s9 · ticket me-t3 (existing ticket)\n",
+      ),
+    ).toBe("me-s9");
+    expect(startedSession(started("acm-s5", " · child of acm-s4"))).toBeNull();
+    expect(
+      startedSession(started("dc-s5@acme", " · child of dc-s4@acme · review")),
+    ).toBeNull();
+    // A ticket's title may say anything: only the line's end is a child's.
+    expect(
+      startedSession(
+        'devcorner · session me-s9 · ticket me-t3 "Why · child of me-s1 shows" (existing ticket)',
+      ),
+    ).toBe("me-s9");
+    expect(startedSession("A connection holds a session already.")).toBeNull();
+    expect(startedSession(started("not-an-id"))).toBeNull();
+    expect(startedSession(undefined)).toBeNull();
+    for (const tool of [
+      "mcp__Devcorner__start",
+      "mcp__plugin_devcorner_devcorner__start",
+    ]) {
+      expect(STARTER.test(tool)).toBe(true);
+    }
+    expect(STARTER.test("mcp__linear__start")).toBe(false);
+    expect(FINISHER.test("mcp__Devcorner__finish")).toBe(true);
+    expect(FINISHER.test("mcp__Devcorner__start")).toBe(false);
+    expect(claimFile("conversation-1", { home: "/home/ann" })).toBe(CLAIMS);
+    expect(claimFile("../x", { home: "/home/ann" })).toBeUndefined();
+    expect(claimFile("conversation-1", {})).toBeUndefined();
+  });
+
+  test("the main conversation's start is kept and said with each Status; a subagent's, a child's or a refused one is not", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    expect(lastClaim(seen)).toBeUndefined();
+
+    // A subagent's start never says the window's session.
+    seen.toolText = started("acm-s9");
+    await $.tool.call({
+      tool: "mcp__Devcorner__start",
+      goal: "Piece A",
+      agentId: "agent-1",
+    } as never);
+    // Nor a child's started in the main conversation, nor a refusal.
+    seen.toolText = started("acm-s8", " · child of acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Child" });
+    seen.toolRefused = true;
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Again" });
+    seen.toolRefused = false;
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+
+    // The main conversation's own start is kept, in the module and in its
+    // file for the hooks, and said with the next Status.
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    expect(seen.files.get(CLAIMS)).toBe("acm-s4\n");
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    // The call went on as the agent made it.
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      tool: "mcp__Devcorner__start",
+      goal: "Coordinate",
+    });
+  });
+
+  test("its finish ends the claim, a child's finish does not, and devcorner's final refusal forgets it", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+
+    // A finish the coordinator makes for a child leaves it.
+    seen.toolText = "Finished acm-s5.";
+    await $.tool.call({
+      tool: "mcp__Devcorner__finish",
+      session: "acm-s5",
+      outcome: "done",
+    });
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+
+    // Its own finish ends it, and its file goes.
+    await $.tool.call({ tool: "mcp__Devcorner__finish", outcome: "done" });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+
+    // A refusal that can pass keeps it; one that can never hold forgets it.
+    seen.toolText = started("acm-s6");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Next" });
+    const answered = (final: boolean): Status => ({
+      ...waiting(0, null),
+      claim: {
+        session: "acm-s6",
+        outcome: "refused",
+        was: null,
+        why: "acm-s6 is not live now.",
+        final,
+      },
+    });
+    seen.answer = answered(false);
+    await now($, clock);
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s6");
+    seen.answer = answered(true);
+    await now($, clock);
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+  });
+
+  test("a claim kept before a reload is read back from its file", async ($, on) => {
+    const { clock, seen } = world(on, {
+      home: "/home/ann",
+      files: [[CLAIMS, "dc-s4@acme\n"]],
+    });
+    await $.session.start(START);
+    await clock.settle();
+    expect(lastClaim(seen)).toBe("dc-s4@acme");
+  });
+
+  test("devcorner's ask for the claim on the held request is answered with a Status, and held again", async ($, on) => {
+    expect(readHeld('{"claim":"me-h1"}')).toEqual({ kind: "claim" });
+    expect(readHeld('{"claim":1}')).toEqual({ kind: "empty" });
+    const { clock, seen } = world(on, {
+      hold: true,
+      home: "/home/ann",
+      files: [[CLAIMS, "acm-s4\n"]],
+    });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    const asked = seen.asks;
+    seen.held.shift()!('{"claim":"me-h1"}');
+    await flush(clock);
+    expect(seen.asks).toBe(asked + 1);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    expect(seen.toasts).toEqual([]);
+    expect(seen.submitted).toEqual([]);
+    expect(seen.waitBodies).toHaveLength(2);
   });
 });

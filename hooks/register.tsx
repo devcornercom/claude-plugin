@@ -1386,6 +1386,7 @@ export function nextStep(
 export type Held =
   | { kind: "wake"; session: string; id: string }
   | { kind: "notice"; id: string }
+  | { kind: "claim" }
   | { kind: "empty" }
   | { kind: "failed" }
   | { kind: "updating"; after: number };
@@ -1402,6 +1403,9 @@ export function readHeld(text: string): Held {
       return { kind: "wake", session: o.wake, id: o.id };
     }
     if (typeof o.notice === "string") return { kind: "notice", id: o.notice };
+    // The session the conversation works as changed (dc-t588): a Status says
+    // the one it kept from its start.
+    if (typeof o.claim === "string") return { kind: "claim" };
     return { kind: "empty" };
   } catch {
     return { kind: "failed" };
@@ -3003,6 +3007,123 @@ async function notePaste($: Engine, written: string): Promise<void> {
 }
 
 /**
+ * devcorner's start and finish tools, on a server named for devcorner, as
+ * `CARRIER`'s are (dc-t588): the session the main conversation's start
+ * returned is the one this window states it runs as, until its finish.
+ */
+export const STARTER = /^mcp__[\w-]*devcorner[\w-]*__start$/i;
+export const FINISHER = /^mcp__[\w-]*devcorner[\w-]*__finish$/i;
+
+/**
+ * The session a start's reply says it started or carried on as, by its first
+ * line as the model reads it, "devcorner · session acm-s4 · …" (dc-t588);
+ * null for a child's, whose line ends " · child of acm-s3" (then its role,
+ * " · review", when it has one), which is never the window's, and for a
+ * reply that names none, as a refusal or another devcorner's wording. The
+ * end is read, not the whole line, since a ticket's quoted title may say
+ * anything.
+ */
+export function startedSession(text: string | undefined): string | null {
+  const line = /^devcorner · session (\S+) · .*$/m.exec(text ?? "");
+  if (!line || CHILD_END.test(line[0])) return null;
+  const id = line[1]!;
+  return CLAIMED.test(id) ? id : null;
+}
+
+/** How a child's start line ends: its parent, then its role when it has one. */
+const CHILD_END =
+  / · child of [a-z][a-z0-9]*-s\d{1,12}(?:@[a-z0-9-]{1,64})?(?: · [^·]+)?$/i;
+
+/** A session's id as devcorner shows it: me-s4, acm-s4, dc-s4@acme. */
+const CLAIMED = /^[a-z][a-z0-9]*-s\d{1,12}(?:@[a-z0-9-]{1,64})?$/i;
+
+/**
+ * Where the session this conversation states it runs as is kept (dc-t588):
+ * beside the markers, named from the same variables (`claims` in
+ * hooks/devcorner.sh, which sends it with a SessionStart), so a reload of
+ * the module, a resume and a compaction state it too. Undefined with no
+ * home to keep it in, or an id the hook would not read.
+ */
+export function claimFile(id: string, env: StateEnv): string | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return undefined;
+  const base = stateDir(env);
+  return base ? `${base}/claims/${id}.claim` : undefined;
+}
+
+/** The session this conversation states it runs as, once read or kept: for which conversation, and null for none. */
+let claim: { id: string; session: string | null } | undefined;
+
+/**
+ * The session this conversation states it runs as (dc-t588): the one its
+ * main conversation's last `start` returned, kept by `keepClaim`, read back
+ * from its file once a load; null for none. Never throws.
+ */
+async function claimOf($: Engine): Promise<string | null> {
+  try {
+    const id = await $.session.id();
+    if (claim?.id === id) return claim.session;
+    const file = claimFile(id, await stateEnvOf($));
+    // A read that fails is not kept as none: the next one reads again.
+    const there =
+      file && (await $.fs.exists(file))
+        ? String(await $.fs.read(file)).trim()
+        : "";
+    claim = { id, session: CLAIMED.test(there) ? there : null };
+    return claim.session;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keeps `session` as the one this conversation states it runs as, or forgets
+ * it with null (dc-t588): in the module, and in its file for the hooks and a
+ * later load. Silent on any failure: the module still holds it.
+ */
+async function keepClaim($: Engine, session: string | null): Promise<void> {
+  try {
+    const id = await $.session.id();
+    claim = { id, session };
+    const file = claimFile(id, await stateEnvOf($));
+    if (!file) return;
+    if (session !== null) await writePrivate($, file, `${session}\n`);
+    else await $.process.run(["rm", "-f", file], { timeoutMs: 5000 });
+  } catch {
+    /* stay silent */
+  }
+}
+
+/**
+ * What a finish of the main conversation's means to its claim (dc-t588):
+ * one that names no session, or the claimed one, ends it, and the window
+ * states none until its next start; one that names another session, as a
+ * child's finish its coordinator makes for it, leaves it.
+ */
+async function finishedHere($: Engine, named: unknown): Promise<void> {
+  const kept = await claimOf($);
+  if (kept === null) return;
+  if (
+    named === undefined ||
+    named === null ||
+    (typeof named === "string" &&
+      (!named.trim() || named.trim().toLowerCase() === kept.toLowerCase()))
+  ) {
+    await keepClaim($, null);
+  }
+}
+
+/**
+ * What a Status said of the claim it carried (dc-t588): one devcorner can
+ * never take (the session finished, is a child's or another's, or its
+ * connection moved on) is forgotten, unless a newer start kept another
+ * meanwhile.
+ */
+async function heardClaim($: Engine, sent: string, s: Status): Promise<void> {
+  if (s.claim?.final !== true || s.claim.session !== sent) return;
+  if ((await claimOf($)) === sent) await keepClaim($, null);
+}
+
+/**
  * What a Status read asks devcorner for besides the row's own, which it
  * reads only when asked: the repo's picture for /dc and /dc waits (dc-t218,
  * dc-t492), what the conversation's session is on and did lately for /dc
@@ -3048,6 +3169,9 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
       branch !== undefined &&
       (branchTaken?.key !== key || branchTaken.branch !== branch);
     if (moved) branchSaying = saying = true;
+    // The session this window runs as, as its start said (dc-t588): devcorner
+    // checks it and ties the window to it when that had drifted.
+    const stated = await claimOf($);
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -3060,6 +3184,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
         session_id: sessionId,
         cwd,
         ...(moved ? { branch } : {}),
+        ...(stated !== null ? { claim: stated } : {}),
         ...(asks.picture ? { expanded: true } : {}),
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
@@ -3105,6 +3230,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     // Taken once devcorner says it back; until then each Status says it
     // again, as when a store could not take it, or devcorner is older.
     if (moved && body.branch === branch) branchTaken = { key, branch };
+    if (stated !== null) await heardClaim($, stated, body);
     return {
       status: { ...body, repo: body.repo ?? repo },
       down: false,
@@ -3275,6 +3401,15 @@ async function hold($: Engine): Promise<void> {
         await refresh($, true);
         if (mine !== epoch) return;
         $.ui.toast(noticeToast(held.id));
+        continue;
+      }
+      if (held.kind === "claim") {
+        // devcorner asks for the session this window runs as (dc-t588): a
+        // fresh Status states it, and the row shows what it works as now.
+        // Held again at once.
+        quick = 0;
+        await refresh($, true);
+        if (mine !== epoch) return;
         continue;
       }
       const wokeFor = held.kind === "wake" ? await read($, woke) : null;
@@ -3864,6 +3999,35 @@ export const register: Register = (on) => {
           deny: "This machine's devcorner plugin could not get its sign-in code. Nothing was sent to devcorner.",
         },
   );
+
+  // The main conversation's start says the session this window runs as, and
+  // its finish ends that (dc-t588); a subagent's never does. What the
+  // model reads is left as it was.
+  on("tool.call", { tool: STARTER }, async ($, e, next) => {
+    const ran = await next(e);
+    if (
+      e.agentId === undefined &&
+      ran.deny === undefined &&
+      ran.isError !== true
+    ) {
+      const started = startedSession(ran.text);
+      if (started !== null && started !== (await claimOf($))) {
+        await keepClaim($, started);
+      }
+    }
+    return ran;
+  }).catch(($, e, next) => next(e));
+  on("tool.call", { tool: FINISHER }, async ($, e, next) => {
+    const ran = await next(e);
+    if (
+      e.agentId === undefined &&
+      ran.deny === undefined &&
+      ran.isError !== true
+    ) {
+      await finishedHere($, (e as { session?: unknown }).session);
+    }
+    return ran;
+  }).catch(($, e, next) => next(e));
 
   // The session wrote a paste for its person (dc-t490): the transcript says so
   // in one line the model never reads, and /dc paste copies it.

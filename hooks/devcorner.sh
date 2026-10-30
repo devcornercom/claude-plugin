@@ -4,7 +4,12 @@
 #
 # SessionStart, SessionEnd and SubagentStart are passed on as they are, with
 # the repo and branch that only this side can read from git. devcorner answers
-# the two starts with the JSON Claude Code adds to the model's context.
+# the two starts with the JSON Claude Code adds to the model's context. A
+# SessionStart also says the session its conversation states it runs as
+# (dc-t588): the one the conversation's own start returned, which the
+# plugin's module keeps in a file of its own (claimFile in register.tsx), so
+# devcorner ties the window back to it before it briefs a resume or a
+# compaction.
 #
 # PostToolUse, UserPromptSubmit and Stop ask devcorner for messages the session
 # has not seen, and SubagentStop tells it a subagent stopped. For these, only
@@ -244,7 +249,12 @@ remote() {
   done
 }
 
-# Passes the whole event on, with the repo and branch from git.
+# The module's claims (dc-t588): the session each conversation's own start
+# returned, one small file a conversation (claimFile in register.tsx).
+claims="${DEVCORNER_HOOK_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/devcorner}/claims"
+
+# Passes the whole event on, with the repo and branch from git, and the
+# session the conversation states it runs as when $1 names one (dc-t588).
 forward() {
   dir="${CLAUDE_PROJECT_DIR:-$PWD}"
   repo=$(remote "$dir")
@@ -255,15 +265,47 @@ forward() {
     -H "Content-Type: application/json" \
     -H "X-Devcorner-Repo: $repo" \
     -H "X-Devcorner-Branch: $branch" \
+    ${1:+-H "X-Devcorner-Claim: $1"} \
     --data-binary @- || true
+}
+
+# Prints the session conversation $1 states it runs as (dc-t588): the one
+# its own start returned, which the module keeps, or nothing. Only an id's
+# shape is sent: me-s4, acm-s4 or dc-s4@acme.
+claim_of() {
+  [ -r "$claims/$1.claim" ] || return 0
+  said=
+  read -r said <"$claims/$1.claim" || :
+  case $said in
+  '' | *[!A-Za-z0-9@-]*) return 0 ;;
+  *-s[0-9]*) printf '%s' "$said" ;;
+  esac
+}
+
+# Passes a SessionStart on with the session its conversation states it runs
+# as (dc-t588), so a resume or a compaction is briefed on that session when
+# the window had drifted from it. The event holds no words of the model's,
+# so its session_id is read wherever it stands.
+start_event() {
+  chunk=$(cat)
+  said=
+  if field "$chunk" session_id; then
+    case $value in
+    *[!A-Za-z0-9_-]*) ;;
+    *) said=$(claim_of "$value") ;;
+    esac
+  fi
+  printf '%s' "$chunk" | forward "$said"
 }
 
 case $event in
 SessionStart)
-  forward
-  # Stamps and markers of conversations that ended a day or more ago are no use.
+  start_event
+  # Stamps and markers of conversations that ended a day or more ago are no
+  # use; a claim is kept a month, for a resume.
   find "$state" -maxdepth 1 -type f -name '*.stamp' -mtime +1 -delete 2>/dev/null
   find "$markers" -maxdepth 1 -type f -name '*.waiting' -mtime +1 -delete 2>/dev/null
+  find "$claims" -maxdepth 1 -type f -name '*.claim' -mtime +30 -delete 2>/dev/null
   exit 0
   ;;
 SessionEnd | SubagentStart)
@@ -288,7 +330,11 @@ PostToolUse | UserPromptSubmit | Stop)
   esac
   event=${event%%\"*}
   case $event in
-  SessionStart | SessionEnd | SubagentStart)
+  SessionStart)
+    printf '%s' "$chunk" | start_event
+    exit 0
+    ;;
+  SessionEnd | SubagentStart)
     printf '%s' "$chunk" | forward
     exit 0
     ;;

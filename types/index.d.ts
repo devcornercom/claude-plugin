@@ -87,6 +87,28 @@ export type Status = {
    * from an older devcorner: either way the next Status says it again.
    */
   branch?: string | null;
+  /**
+   * What devcorner made of the session this Status stated the window runs
+   * as (dc-t588); null when it stated none, and absent from an older
+   * devcorner, which reads no claim.
+   */
+  claim?: StatusClaim | null;
+};
+
+/**
+ * devcorner's word on the session a window stated it runs as (dc-t588):
+ * `kept` when it works as it already, `repaired` when it does now, `refused`
+ * with why.
+ */
+export type StatusClaim = {
+  /** The session stated, as it was sent. */
+  session: string;
+  outcome: "kept" | "repaired" | "refused";
+  /** What the window worked as before a repair; null for none, and otherwise. */
+  was: string | null;
+  why: string | null;
+  /** It can never be taken (finished, a child's or another's, its connection moved on): the plugin forgets it. */
+  final: boolean;
 };
 
 /** A ticket the picture names, with its page. */

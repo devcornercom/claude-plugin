@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.30.0 — 2026-10-30
+
+- Your window states the session it runs as, and devcorner ties it back when that drifted (dc-t588). When this conversation's own devcorner `start` succeeds, the plugin keeps the session it returned, never a subagent's or a child's, until that session's finish. Each status read says it, and so does a resume or a compaction, and devcorner checks it (the session is live, yours, top-level and still its connection's) and ties the window to it when the window worked as another session or none, so the line above the prompt, your mail and your wakes reach that session again with no turn of the model's. A session devcorner can never take, as one that finished, is forgotten. While the conversation is idle, devcorner asks for it on the held request when the window's session changes, and the plugin answers with a status read. The plugin keeps it in a small file per conversation beside its markers. An older devcorner reads no claim and answers as before.
+
 ## 0.29.0 — 2026-10-30
 
 - A wake names an OA's news its coordinator must act on (dc-t536). devcorner now wakes the idle conversation that gave an OA when its mind stops at a cap over its life, when it ends (once it has written how it went), and when a checkpoint of its plan waits on your go, as it already did for its question to you, each within the hour's limit. The toast and the wake's prompt say `dc-o3's mind stopped`, `dc-o3 ended` and `dc-o3 waits on your go` ("your user's go" to the agent), from the wake's kind and the OA's id alone. An older plugin wakes for them too, and says only that a message woke it.
