@@ -143,11 +143,29 @@ export function wakeWords(
     }
     return `a message ${from ? `${from} sent` : "sent"} on your user's word`;
   }
-  // An OA the session gave, asking its person a question (dc-t576), named by
-  // the question.
+  // Another of the person's sessions answering what woke it (dc-t585): on
+  // nobody's word, so it never says "your".
+  if (w.from === "reply") {
+    const from = item && CONVERSATION.test(item) ? item : null;
+    return `${from ?? "another conversation"} replied`;
+  }
+  // An OA the session gave, with news it must act on: asking its person a
+  // question (dc-t576), named by the question; its mind's stop, its end or a
+  // checkpoint that waits on the person's go (dc-t536), named by the OA.
   if (w.from === "oa") {
-    if (w.what !== "asked" || !item) return null;
-    return `an OA asks ${you} ${item}`;
+    if (!item) return null;
+    switch (w.what) {
+      case "asked":
+        return `an OA asks ${you} ${item}`;
+      case "mind-stopped":
+        return `${item}'s mind stopped`;
+      case "ended":
+        return `${item} ended`;
+      case "checkpoint":
+        return `${item} waits on ${your} go`;
+      default:
+        return null;
+    }
   }
   if (w.from !== "person" && w.from !== "member") return null;
   const own = w.from === "person";
@@ -909,12 +927,16 @@ function othersText(items: StatusOther[], total: number): string {
   ].join(" · ");
 }
 
-/** The repo's OA (dc-t213), as /dc says it: "dc-o3 Working (lands), 2/7 landed, 3 acts, 1 wait on you". */
+/**
+ * The repo's OA (dc-t213), as /dc says it: "dc-o3 Working (lands), 2/7
+ * landed, 3 acts, 1 wait on you", and what of it nobody hears (dc-t536).
+ */
 function oaText(night: StatusOvernight): string {
   const facts = [
     night.room ? oneLine(night.room) : "",
     night.tasks ? oneLine(night.tasks) : "",
     ...oneLine(night.counts).split(", "),
+    night.unheard ? oneLine(night.unheard) : "",
   ].filter((fact) => fact);
   return [`${night.id} ${oneLine(night.state)}`, ...facts].join(", ");
 }

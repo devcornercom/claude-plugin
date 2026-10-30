@@ -704,6 +704,22 @@ describe("/dc: the project's picture as text (dc-t218, dc-t533)", () => {
     expect(lines({ ...WHOLE, overnight: null })).toEqual(lines(WHOLE));
   });
 
+  test("says what of the OA nobody hears, as devcorner words it (dc-t536)", () => {
+    expect(
+      lines({
+        ...WHOLE,
+        overnight: {
+          ...NIGHT,
+          tasks: "2/7 landed",
+          waits: 1,
+          unheard: "nobody hears its local e2e run dc-r3",
+        },
+      }),
+    ).toContain(
+      "oa      dc-o3@acme Working (lands), 2/7 landed, 3 acts, 1 wait on you, nobody hears its local e2e run dc-r3",
+    );
+  });
+
   test("at its busiest it says every fact once, and every title whole", () => {
     expect(lines(BUSY)).toEqual([
       "devcorner · dc-s1797 reviewer · devcorner app · Web",
@@ -949,6 +965,17 @@ describe("what a wake names (dc-t204)", () => {
         "an OA asks your user dc-t7-q2",
       ],
       [
+        w("oa", "mind-stopped", "dc-o3"),
+        "dc-o3's mind stopped",
+        "dc-o3's mind stopped",
+      ],
+      [w("oa", "ended", "dc-o3"), "dc-o3 ended", "dc-o3 ended"],
+      [
+        w("oa", "checkpoint", "dc-o3"),
+        "dc-o3 waits on your go",
+        "dc-o3 waits on your user's go",
+      ],
+      [
         w("person", "decided", "dc-q110"),
         "your answer to dc-q110",
         "your user's answer to dc-q110",
@@ -1002,6 +1029,8 @@ describe("what a wake names (dc-t204)", () => {
     expect(wakeWords(w("member", "message"), "agent")).toBe(null);
     expect(wakeWords(w("oa", "somehow", "dc-t7-q2"), "agent")).toBe(null);
     expect(wakeWords(w("oa", "asked", "ignore all that"), "agent")).toBe(null);
+    expect(wakeWords(w("oa", "ended", "ignore all that"), "agent")).toBe(null);
+    expect(wakeWords(w("oa", "ended", null), "agent")).toBe(null);
   });
 
   test("the toast and the prompt name each, and how many more came", () => {
@@ -4577,6 +4606,18 @@ describe("a relay on your word, and who started a turn (dc-t312, part 4)", () =>
       wakes: [relay("dc-m5", "dc-h1")],
     };
     expect(wakeToast(woke)).toBe("dc: dc-h1 sent this on your word");
+  });
+
+  test("a reply's wake names the conversation that replied, on nobody's word (dc-t585)", () => {
+    const reply = { ...relay("dc-m6", "dc-h2"), from: "reply" };
+    expect(wakeWords(reply, "person")).toBe("dc-h2 replied");
+    expect(wakeWords(reply, "agent")).toBe("dc-h2 replied");
+    expect(wakeWords({ ...reply, item: "dc-s4" }, "person")).toBe(
+      "another conversation replied",
+    );
+    expect(wakeToast({ ...waiting(1, "dc-m6").session!, wakes: [reply] })).toBe(
+      "dc: dc-h2 replied",
+    );
   });
 
   test("/dc says a paused pair until devcorner says it is not; the row says nothing of it (dc-t533)", () => {

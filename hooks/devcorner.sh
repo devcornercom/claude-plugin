@@ -145,7 +145,9 @@ field() {
 # promise; matching those words would take a wait for a stop the day they
 # change, so every other mention counts. Each key is matched with its quotes,
 # which a JSON string escapes, so nothing the model or a tool wrote can stand
-# for one. The transcript is read once, however many tasks are in flight.
+# for one. Only the list's own entries are read, to its closing bracket: a
+# scheduled task after it is no task in flight. The transcript is read once,
+# however many tasks are in flight.
 # Prints nothing when it cannot tell: no list, as from a Claude Code before
 # it, or no transcript to read.
 own_background() {
@@ -155,17 +157,38 @@ own_background() {
   *'"background_tasks": ['*) list=${1#*'"background_tasks": ['} ;;
   *) return 0 ;;
   esac
-  # The list is read to the end of the event, never cut where a key seems to
-  # follow it: an entry may carry an array field of its own, whose `],"` would
-  # end the list early, drop the ids after it and read a wait as a stop. What
-  # follows the list, as the scheduled tasks, adds ids that count only when the
-  # transcript names them, so the worst a longer read does is hold a wait.
   case $list in
   '' | ' ' | ']'* | ' ]'*)
     echo 0
     return 0
     ;;
   esac
+  # The list ends at its own closing bracket (dc-t582), found by depth outside
+  # strings: an entry may carry an array or object of its own, or a string
+  # with a bracket, whose `]` would end the list early, drop the ids after it
+  # and read a wait as a stop; and what follows the list, as the scheduled
+  # tasks, is no task in flight, so an id there that the transcript names
+  # never counts. A list that never closes, as in an event cut short, is read
+  # to the end, where an id counts only when the transcript names it.
+  list=$(printf '%s' "$list" | awk '
+    BEGIN { depth = 1; quoted = 0; escaped = 0 }
+    {
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") quoted = 0
+        } else if (c == "\"") quoted = 1
+        else if (c == "[" || c == "{") depth++
+        else if ((c == "]" || c == "}") && --depth == 0) {
+          printf "%s", substr($0, 1, i - 1)
+          exit
+        }
+      }
+      print
+    }')
   case $1 in
   *'"agent_transcript_path":"'*) transcript=${1#*'"agent_transcript_path":"'} ;;
   *'"agent_transcript_path": "'*) transcript=${1#*'"agent_transcript_path": "'} ;;

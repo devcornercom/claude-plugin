@@ -227,6 +227,8 @@ export type StatusOvernight = {
   tasks?: string;
   /** Its questions that wait on the person. Absent from an older devcorner. */
   waits?: number;
+  /** What of it waits on its coordinator that no live session hears (dc-t536): "nobody hears its local e2e run dc-r3"; null when every one is heard, and absent from an older devcorner. */
+  unheard?: string | null;
   page: string | null;
 };
 
@@ -257,9 +259,17 @@ export type StatusLinks = {
 export type StatusWake = {
   /** The message, such as acme-m42 or me-m42. */
   id: string;
-  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), or an OA it gave asking its person ("oa", dc-t576, `item` the question). */
-  from: "person" | "member" | "github" | "run" | "relay" | "oa" | (string & {});
-  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, or "asked" for an OA's question. */
+  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), another of its person's sessions replying to what woke it ("reply", dc-t585, `item` the conversation it was sent from), or an OA it gave with news it must act on ("oa": asking its person, dc-t576, `item` the question; its mind's stop, its end or a checkpoint, dc-t536, `item` the OA). */
+  from:
+    | "person"
+    | "member"
+    | "github"
+    | "run"
+    | "relay"
+    | "reply"
+    | "oa"
+    | (string & {});
+  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, or from an OA "asked", "mind-stopped", "ended" or "checkpoint". */
   what: string;
   /** A run (dc-r3), a question, a ticket, or a pull request (owner/name#3); null when about none. */
   item: string | null;
@@ -267,7 +277,7 @@ export type StatusWake = {
   detail: string | null;
   /** When it was sent (ms). Absent from an older devcorner. */
   at?: number;
-  /** A relay's place in its chain of wakes (dc-t312); 0 for any other. Absent from an older devcorner. */
+  /** A relay's or a reply's place in its chain of wakes (dc-t312, dc-t585); 0 for any other. Absent from an older devcorner. */
   hops?: number;
 };
 
