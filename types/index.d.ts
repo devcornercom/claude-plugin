@@ -18,6 +18,20 @@ export type Status = {
    */
   thisConversation?: { id: string; name: string | null } | null;
   /**
+   * The machine this window runs on (dc-t589): the name its hook token's
+   * grant gives it, at /device, by `connect_plugin` or on the connections
+   * page. Null for a token that names none, and absent from an older
+   * devcorner.
+   */
+  machine?: string | null;
+  /**
+   * This window's label (dc-t589): the conversation's `/dc name`, else the
+   * machine and the place the repo is in, "MacBook Air 1 (Web)". The row
+   * draws it before the session's short id. Null with neither, and absent
+   * from an older devcorner: the row is then as before.
+   */
+  label?: string | null;
+  /**
    * This conversation's chain of relays on the person's word, paused with
    * another conversation after that many wakes (dc-t312) until the person
    * types in either; null when not paused. Absent from an older devcorner.
@@ -72,9 +86,15 @@ export type Status = {
    * The person's other live sessions, in every project and store (dc-t491),
    * when the plugin asked for them (`others: true`) or for the picture: those
    * that wait on them first, then the last alive first; `count` of them all,
-   * `items` the first few. Null otherwise, and absent from an older devcorner.
+   * `items` the first few; `windows`, their other plugin windows heard from
+   * lately that work as no session (dc-t610), absent from a devcorner before
+   * it. Null otherwise, and absent from an older devcorner.
    */
-  others?: { count: number; items: StatusOther[] } | null;
+  others?: {
+    count: number;
+    items: StatusOther[];
+    windows?: StatusWindow[];
+  } | null;
   /**
    * What devcorner could not read of the registry for this answer (dc-t137),
    * each a sentence: with any, `waiting` counts only what it read. Absent
@@ -201,16 +221,42 @@ export type StatusExpanded = {
 export type StatusOther = {
   /** Such as acme-s4. */
   id: string;
+  /** Its title, the short name devcorner lists it by (dc-t627); absent from a devcorner before it. */
+  title?: string;
   /** Its page; null where none opens. */
   page: string | null;
-  /** The conversation it works in, such as me-h3, and that conversation's name. */
-  conversation: string;
+  /** The conversation it works in, such as me-h3, and that conversation's name; null in none (dc-t610). */
+  conversation: string | null;
   name: string | null;
+  /** Where it runs, in a few words: "cloud · Routine Ivo (Max)", else its conversation's name, then "this machine" when it runs on this one, as "reviewer · this machine"; null when devcorner holds none of these (dc-t627); absent from a devcorner before it. */
+  where?: string | null;
   repo: string | null;
   /** The ticket it works on, with its page; null on none. */
   ticket: { id: string; title: string; page: string | null } | null;
   /** How it stands, in devcorner's words: "waits on you", "idle 2 h", "working". */
   state: string;
+  /** Whether your /dc send wakes it now (dc-t610); absent from a devcorner before it. */
+  wakes?: boolean;
+  /** That in devcorner's words: "wakes", or "no wake: an MCP connection's, read at its next devcorner call" (dc-t610); absent before it. */
+  reach?: string;
+};
+
+/** One of the person's other plugin windows heard from lately that works as no session, as devcorner names it (dc-t610). */
+export type StatusWindow = {
+  /** The conversation, such as me-h3. */
+  id: string;
+  /** Its page; null where none opens. */
+  page: string | null;
+  name: string | null;
+  /** Where it runs, in a few words: its name, then "this machine" when it runs on this one, as "reviewer · this machine"; null for neither; absent from a devcorner before it. */
+  where?: string | null;
+  repo: string | null;
+  /** When it was last heard from, in devcorner's words: "last heard 2 min ago". */
+  state: string;
+  /** Whether your /dc send wakes it now. */
+  wakes: boolean;
+  /** That in devcorner's words: "wakes". */
+  reach: string;
 };
 
 /**
@@ -281,7 +327,7 @@ export type StatusLinks = {
 export type StatusWake = {
   /** The message, such as acme-m42 or me-m42. */
   id: string;
-  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), another of its person's sessions replying to what woke it ("reply", dc-t585, `item` the conversation it was sent from), or an OA it gave with news it must act on ("oa": asking its person, dc-t576, `item` the question; its mind's stop, its end or a checkpoint, dc-t536, `item` the OA). */
+  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), another of its person's sessions replying to what woke it or answering their ask ("reply", dc-t585, dc-t611, `item` the conversation it was sent from), or an OA it gave with news it must act on ("oa": asking its person, dc-t576, `item` the question; its mind's stop, its end or a checkpoint, dc-t536, `item` the OA). */
   from:
     | "person"
     | "member"
@@ -291,7 +337,7 @@ export type StatusWake = {
     | "reply"
     | "oa"
     | (string & {});
-  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, or from an OA "asked", "mind-stopped", "ended" or "checkpoint". */
+  /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, from an OA "asked", "mind-stopped", "ended" or "checkpoint", or from a reply "message", or "answer" for an answer to its person's ask (dc-t611). */
   what: string;
   /** A run (dc-r3), a question, a ticket, or a pull request (owner/name#3); null when about none. */
   item: string | null;

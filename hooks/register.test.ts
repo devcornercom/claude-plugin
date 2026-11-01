@@ -5,6 +5,7 @@ import type {
   Status,
   StatusNow,
   StatusOther,
+  StatusWindow,
   StatusPaste,
   StatusWait,
   StatusWake,
@@ -14,6 +15,10 @@ import {
   PASTER,
   STARTER,
   FINISHER,
+  DEVCORNER_TOOL,
+  CALL_CLAIM_AGAIN_MS,
+  inAnotherWindow,
+  namedSession,
   startedSession,
   claimFile,
   agoText,
@@ -30,6 +35,7 @@ import {
   MAX_UPDATING_MS,
   QUICK_MAX,
   SEND_USAGE,
+  ASK_USAGE,
   UPDATING_GRACE_MS,
   UPDATING_LINE,
   WAIT_RETRY_MS,
@@ -1275,6 +1281,11 @@ function world(
     nameAnswer: { status: 200, body: {} as unknown } as
       | { status: number; body: unknown }
       | "down",
+    /** What each Machine carried (dc-t590), and how devcorner answers it. */
+    machines: [] as { body: Record<string, unknown>; token: string }[],
+    machineAnswer: { status: 200, body: {} as unknown } as
+      | { status: number; body: unknown }
+      | "down",
     /** What each Turn carried (dc-t312, part 4), and how devcorner answers it. */
     turns: [] as { body: Record<string, unknown>; token: string }[],
     turnAnswer: { ok: true, cleared: [] } as Record<string, unknown>,
@@ -1356,6 +1367,14 @@ function world(
         return { value: { status: 204, ok: true, headers: {}, text: "" } };
       }
       return reply(seen.nameAnswer.status, seen.nameAnswer.body);
+    }
+    if (sent.hook_event_name === "Machine") {
+      seen.machines.push({ body: sent, token: bearer });
+      if (seen.machineAnswer === "down") return { deny: "unreachable" };
+      if (seen.machineAnswer.status === 204) {
+        return { value: { status: 204, ok: true, headers: {}, text: "" } };
+      }
+      return reply(seen.machineAnswer.status, seen.machineAnswer.body);
     }
     if (sent.hook_event_name === "Send") {
       seen.sends.push({ body: sent, token: bearer });
@@ -4376,6 +4395,135 @@ describe("/dc send: your own words to another conversation of yours (dc-t312)", 
     });
   });
 
+  test("/dc ask posts your task as Send with ask, to one target, and says its answer comes back here (dc-t611)", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    seen.sendAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        ask: true,
+        messages: ["dc-m90"],
+        from: "dc-h1",
+        to: [
+          {
+            id: "dc-s4@acme",
+            name: null,
+            session: "dc-s4@acme",
+            state: "waiting",
+          },
+        ],
+      },
+    };
+    const out = said(
+      await $.command.run({
+        command: "dc",
+        args: "ask dc-s4@acme   Run the e2e tests,\nthen tell me. ",
+      }),
+    );
+    expect(seen.sends).toEqual([
+      {
+        body: {
+          hook_event_name: "Send",
+          session_id: "conversation-1",
+          to: "dc-s4@acme",
+          text: "Run the e2e tests,\nthen tell me.",
+          ask: true,
+        },
+        token: "dch_test",
+      },
+    ]);
+    expect(out).toBe(
+      "Asked dc-m90 of dc-s4@acme: at its next hook event. An idle one wakes for it now; a busy one is handed it at its next hook event. Its answer comes back to this window and wakes it, within 24 h.",
+    );
+    await clock.settle();
+    expect(seen.submitted).toEqual([]);
+
+    // One that cannot be woken now still answers here.
+    seen.sendAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        ask: true,
+        messages: ["dc-m91"],
+        to: [
+          {
+            id: "dc-h5",
+            name: null,
+            session: "dc-s6",
+            state: "waiting",
+            wakes: false,
+            reach: "no wake: a cloud session, read at its next devcorner call",
+          },
+        ],
+      },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "ask dc-h5 Verify it" })),
+    ).toBe(
+      "Asked dc-m91 of dc-h5: no wake: a cloud session, read at its next devcorner call. Its answer comes back to this window and wakes it, within 24 h.",
+    );
+
+    // An older devcorner takes it as a plain send, and says no ask.
+    seen.sendAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        messages: ["dc-m92"],
+        to: [{ id: "dc-h5", session: null, state: "queued" }],
+      },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "ask dc-h5 Verify it" })),
+    ).toBe(
+      "Sent dc-m92 to dc-h5: queued, no session yet, as a plain /dc send: this devcorner does not take /dc ask yet, so a reply wakes this window only if it comes in the turn your words woke.",
+    );
+  });
+
+  test("/dc ask needs one target and a task, and says why nothing was asked (dc-t611)", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    for (const args of ["ask", "ask dc-h2", "ask dc-h2,dc-h3 Test it"]) {
+      expect(said(await $.command.run({ command: "dc", args }))).toBe(
+        ASK_USAGE,
+      );
+    }
+    expect(seen.sends).toEqual([]);
+    const answers: [typeof seen.sendAnswer, string][] = [
+      [
+        {
+          status: 400,
+          body: {
+            error:
+              'An ask goes to one session or conversation of yours, whose answer comes back: not a list or "mine". Nothing was sent.',
+          },
+        },
+        'devcorner did not ask it: An ask goes to one session or conversation of yours, whose answer comes back: not a list or "mine". Nothing was sent.',
+      ],
+      [
+        { status: 429, body: {} },
+        "devcorner did not ask it: that is more sends than a minute allows. Nothing was asked; try again shortly.",
+      ],
+      [
+        { status: 204, body: null },
+        "This devcorner does not take /dc ask yet, so nothing was asked.",
+      ],
+      ["down", "devcorner could not be reached, so nothing was asked."],
+    ];
+    for (const [answer, words] of answers) {
+      seen.sendAnswer = answer;
+      expect(
+        said(await $.command.run({ command: "dc", args: "ask mine Test it" })),
+      ).toBe(words);
+    }
+    // "asking" is a question for devcorner, not an ask.
+    expect(
+      await $.command.run({ command: "dc", args: "asking what?" }),
+    ).toEqual({ text: "Asking devcorner: asking what?" });
+  });
+
   test("/dc send on a machine that is not signed in sends nothing", async ($, on) => {
     const { clock, seen } = world(on, { token: false, home: "/home/ann" });
     await $.session.start(START);
@@ -4563,6 +4711,36 @@ describe("this conversation in the row, and /dc name (dc-t312, part 5)", () => {
     );
   });
 
+  test("/dc send says why a conversation does not wake in devcorner's words (dc-t610)", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    // A cloud session's conversation has hooks, but devcorner never hears them.
+    seen.sendAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        messages: ["dc-m84"],
+        from: "dc-h1",
+        to: [
+          {
+            id: "dc-h6",
+            name: null,
+            session: "dc-s9",
+            state: "waiting",
+            wakes: false,
+            reach: "no wake: a cloud session, read at its next devcorner call",
+          },
+        ],
+      },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "send dc-h6 Hi" })),
+    ).toBe(
+      "Sent dc-m84 to dc-h6: no wake: a cloud session, read at its next devcorner call.",
+    );
+  });
+
   test("/dc name on a machine that is not signed in names nothing", async ($, on) => {
     const { clock, seen } = world(on, { token: false, home: "/home/ann" });
     await $.session.start(START);
@@ -4573,6 +4751,164 @@ describe("this conversation in the row, and /dc name (dc-t312, part 5)", () => {
       "This machine is not signed in to devcorner, so nothing was named. /dc login signs it in.",
     );
     expect(seen.names).toEqual([]);
+  });
+});
+
+describe("/dc machine renames this machine (dc-t590)", () => {
+  const said = (out: unknown) => (out as { text: string }).text;
+
+  test("posts Machine with the machine's token, says the new name and devcorner's warning, and reads the row again", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    seen.machineAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        renamed: true,
+        name: "MacBook Air 2",
+        from: "MacBook Air",
+        warning: null,
+      },
+    };
+    const asked = seen.asks;
+    expect(
+      said(
+        await $.command.run({ command: "dc", args: "machine  MacBook Air 2 " }),
+      ),
+    ).toBe(
+      "This machine is MacBook Air 2 now, renamed from MacBook Air: the line above the prompt names your windows here by it, and your connections page lists it so.",
+    );
+    expect(seen.machines).toEqual([
+      {
+        body: {
+          hook_event_name: "Machine",
+          session_id: "conversation-1",
+          name: "MacBook Air 2",
+        },
+        token: "dch_test",
+      },
+    ]);
+    expect(seen.asks).toBeGreaterThan(asked);
+
+    // A name another machine has: renamed all the same, and the warning said.
+    seen.machineAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        renamed: true,
+        name: "Studio",
+        from: "MacBook Air 2",
+        warning:
+          "Another machine of yours, signed in 12 Oct and last used 3 d ago, is also Studio. If it is this machine's old sign-in, revoke it on your connections page; otherwise give one of them another name.",
+      },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "machine Studio" })),
+    ).toMatch(
+      /lists it so\. Another machine of yours, signed in 12 Oct and last used 3 d ago, is also Studio\./,
+    );
+
+    // The same name again renames nothing.
+    seen.machineAnswer = {
+      status: 200,
+      body: { ok: true, renamed: false, name: "Studio", from: "Studio" },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "machine Studio" })),
+    ).toBe("This machine is Studio already. Nothing was renamed.");
+
+    // Renamed to one of devcorner's own default names, it names no machine.
+    seen.machineAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        renamed: true,
+        name: null,
+        from: "Studio",
+        warning: null,
+      },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "machine Claude Code" })),
+    ).toBe(
+      "Renamed from Studio to a name devcorner gives a machine with none, so the line above the prompt names no machine now. /dc machine <name> names it.",
+    );
+  });
+
+  test("alone, it says the machine's name, or that it has none, and renames nothing", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    seen.machineAnswer = {
+      status: 200,
+      body: { ok: true, renamed: false, name: "MacBook Air" },
+    };
+    const asked = seen.asks;
+    expect(said(await $.command.run({ command: "dc", args: "machine" }))).toBe(
+      "This machine is MacBook Air to devcorner: the line above the prompt names your windows here by it. /dc machine <name> renames it.",
+    );
+    expect(seen.machines.at(-1)!.body).toEqual({
+      hook_event_name: "Machine",
+      session_id: "conversation-1",
+    });
+    expect(seen.asks).toBe(asked);
+    seen.machineAnswer = {
+      status: 200,
+      body: { ok: true, renamed: false, name: null },
+    };
+    expect(said(await $.command.run({ command: "dc", args: "machine" }))).toBe(
+      "This machine has no name in devcorner, so the line above the prompt names no machine. /dc machine <name> names it.",
+    );
+    // "machines" is a question for devcorner, not /dc machine.
+    expect(
+      await $.command.run({ command: "dc", args: "machines of mine" }),
+    ).toEqual({ text: "Asking devcorner: machines of mine" });
+  });
+
+  test("says why nothing was renamed: devcorner's refusal, an older devcorner, no answer, no sign-in", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    const answers: [typeof seen.machineAnswer, string][] = [
+      [
+        {
+          status: 403,
+          body: {
+            error:
+              "Only this machine's hook token names its machine here (the plugin's /dc machine). Rename other connections on the connections page.",
+          },
+        },
+        "devcorner did not rename it: Only this machine's hook token names its machine here (the plugin's /dc machine). Rename other connections on the connections page.",
+      ],
+      [
+        { status: 500, body: null },
+        "devcorner did not rename it (HTTP 500), so nothing was renamed.",
+      ],
+      [
+        { status: 204, body: null },
+        "This devcorner does not take /dc machine yet: rename the machine on your connections page.",
+      ],
+      ["down", "devcorner could not be reached, so nothing was renamed."],
+    ];
+    for (const [answer, words] of answers) {
+      seen.machineAnswer = answer;
+      expect(
+        said(await $.command.run({ command: "dc", args: "machine Studio" })),
+      ).toBe(words);
+    }
+  });
+
+  test("on a machine that is not signed in renames nothing", async ($, on) => {
+    const { clock, seen } = world(on, { token: false, home: "/home/ann" });
+    await $.session.start(START);
+    await flush(clock);
+    expect(
+      said(await $.command.run({ command: "dc", args: "machine Studio" })),
+    ).toBe(
+      "This machine is not signed in to devcorner, so nothing was renamed. /dc login signs it in.",
+    );
+    expect(seen.machines).toEqual([]);
   });
 });
 
@@ -4622,6 +4958,22 @@ describe("a relay on your word, and who started a turn (dc-t312, part 4)", () =>
     expect(wakeToast({ ...waiting(1, "dc-m6").session!, wakes: [reply] })).toBe(
       "dc: dc-h2 replied",
     );
+  });
+
+  test("an answer to the person's ask names the conversation that answered, and whose ask it was (dc-t611)", () => {
+    const answer = {
+      ...relay("dc-m7", "dc-h2"),
+      from: "reply",
+      what: "answer",
+    };
+    expect(wakeWords(answer, "person")).toBe("dc-h2 answered your ask");
+    expect(wakeWords(answer, "agent")).toBe("dc-h2 answered your user's ask");
+    expect(wakeWords({ ...answer, item: "dc-s4" }, "person")).toBe(
+      "another conversation answered your ask",
+    );
+    expect(
+      wakeToast({ ...waiting(1, "dc-m7").session!, wakes: [answer] }),
+    ).toBe("dc: dc-h2 answered your ask");
   });
 
   test("/dc says a paused pair until devcorner says it is not; the row says nothing of it (dc-t533)", () => {
@@ -5144,6 +5496,150 @@ describe("your other live sessions in every project: /dc's others line and /dc s
       SESSIONS_SEND,
     ]);
   });
+
+  test("/dc sessions says whether a /dc send wakes each, and names the windows that work as no session (dc-t610)", () => {
+    const TESTER: StatusWindow = {
+      id: "dc-h9",
+      page: "https://dc.test/c/dc-h9",
+      name: "tester",
+      repo: "ann/notes",
+      state: "heard from 2 min ago",
+      wakes: true,
+      reach: "wakes",
+    };
+    const reached = {
+      count: 2,
+      items: [
+        { ...BUILDER, wakes: true, reach: "wakes" },
+        {
+          ...NOTES,
+          conversation: null,
+          wakes: false,
+          reach:
+            "no wake: an MCP connection's, read at its next devcorner call",
+        },
+      ],
+      windows: [TESTER],
+    };
+    expect(sessionsText({ ...WITH, others: reached }).split("\n")).toEqual([
+      "here    dc-s7@acme reviewer  a/b · on dc-t10@acme",
+      "others  dc-s4@beta builder  beta/api · waits on you · on dc-t2@beta · wakes",
+      "        dc-s2       ann/notes · idle 2 h · no wake: an MCP connection's, read at its next devcorner call",
+      "windows dc-h9 tester  ann/notes · heard from 2 min ago · wakes",
+      SESSIONS_SEND,
+    ]);
+    // A window alone, with no other session live.
+    expect(
+      sessionsText({
+        ...WITH,
+        others: { count: 0, items: [], windows: [TESTER] },
+      }).split("\n"),
+    ).toEqual([
+      "here    dc-s7@acme reviewer  a/b · on dc-t10@acme",
+      "others  none live, in any project",
+      "windows dc-h9 tester  ann/notes · heard from 2 min ago · wakes",
+      SESSIONS_SEND,
+    ]);
+    // A devcorner before it says neither, and the lines are as they were.
+    expect(sessionsText({ ...WITH, others: OTHERS })).not.toContain("wake");
+    // The row above the prompt and /dc's others line name no windows.
+    expect(othersLine({ ...WITH, others: reached })).toBe(
+      "others  dc-s4@beta builder beta/api, waits on you · dc-s2 ann/notes, idle 2 h",
+    );
+  });
+
+  test("/dc sessions names each other session by its title (dc-t627); an older devcorner names none", () => {
+    const titled = {
+      count: 2,
+      items: [
+        { ...BUILDER, title: "Rate limits" },
+        { ...NOTES, title: "Notes  sync\nfixed" },
+      ],
+    };
+    expect(sessionsText({ ...WITH, others: titled }).split("\n")).toEqual([
+      "here    dc-s7@acme reviewer  a/b · on dc-t10@acme",
+      'others  dc-s4@beta builder  "Rate limits" · beta/api · waits on you · on dc-t2@beta',
+      '        dc-s2       "Notes sync fixed" · ann/notes · idle 2 h',
+      SESSIONS_SEND,
+    ]);
+    // /dc's others line stays short, with no titles.
+    expect(othersLine({ ...WITH, others: titled })).toBe(
+      "others  dc-s4@beta builder beta/api, waits on you · dc-s2 ann/notes, idle 2 h",
+    );
+  });
+
+  test("/dc sessions says where each runs (dc-t627): a cloud session its routine, a local one its conversation's name; an older devcorner the name alone", () => {
+    const placed = {
+      count: 3,
+      items: [
+        // A local one: its conversation's name.
+        { ...BUILDER, title: "Rate limits", where: "builder" },
+        // A cloud one: its routine, on one line.
+        {
+          ...NOTES,
+          id: "dc-s9",
+          conversation: null,
+          title: "Runs of Max",
+          where: "cloud · Routine\n Max",
+        },
+        // Neither: nothing in its place.
+        { ...NOTES, title: "Notes", where: null },
+      ],
+    };
+    expect(sessionsText({ ...WITH, others: placed }).split("\n")).toEqual([
+      "here    dc-s7@acme reviewer  a/b · on dc-t10@acme",
+      'others  dc-s4@beta builder  "Rate limits" · beta/api · waits on you · on dc-t2@beta',
+      '        dc-s9      cloud · Routine Max  "Runs of Max" · ann/notes · idle 2 h',
+      '        dc-s2       "Notes" · ann/notes · idle 2 h',
+      SESSIONS_SEND,
+    ]);
+    // A devcorner before it sends no where, and the line names the conversation.
+    expect(sessionsText({ ...WITH, others: OTHERS }).split("\n")[1]).toBe(
+      "others  dc-s4@beta builder  beta/api · waits on you · on dc-t2@beta",
+    );
+  });
+
+  test("/dc sessions says which sessions and windows run on this machine; an older devcorner names the window alone", () => {
+    const window: StatusWindow = {
+      id: "dc-h9",
+      page: "https://dc.test/c/dc-h9",
+      name: "tester",
+      where: "tester · this machine",
+      repo: "ann/notes",
+      state: "last heard 2 min ago",
+      wakes: true,
+      reach: "wakes",
+    };
+    const placed = {
+      count: 3,
+      items: [
+        // Named, on this machine.
+        { ...BUILDER, title: "Rate limits", where: "builder · this machine" },
+        // Unnamed, on this machine.
+        { ...NOTES, title: "Notes", where: "this machine" },
+        // On another machine: its name alone.
+        { ...NOTES, id: "dc-s3", title: "Docs", where: "writer" },
+      ],
+      windows: [window, { ...window, id: "dc-h8", name: null, where: null }],
+    };
+    expect(sessionsText({ ...WITH, others: placed }).split("\n")).toEqual([
+      "here    dc-s7@acme reviewer  a/b · on dc-t10@acme",
+      'others  dc-s4@beta builder · this machine  "Rate limits" · beta/api · waits on you · on dc-t2@beta',
+      '        dc-s2      this machine  "Notes" · ann/notes · idle 2 h',
+      '        dc-s3      writer  "Docs" · ann/notes · idle 2 h',
+      "windows dc-h9 tester · this machine  ann/notes · last heard 2 min ago · wakes",
+      "        dc-h8  ann/notes · last heard 2 min ago · wakes",
+      SESSIONS_SEND,
+    ]);
+    // A devcorner before it sends no window's where: its name.
+    const { where: _none, ...older } = window;
+    expect(
+      sessionsText({
+        ...WITH,
+        others: { count: 0, items: [], windows: [older] },
+      }).split("\n")[2],
+    ).toBe("windows dc-h9 tester  ann/notes · last heard 2 min ago · wakes");
+  });
 });
 
 describe("what waits on you, by work stream, latest first: /dc and /dc waits (dc-t492)", () => {
@@ -5462,6 +5958,9 @@ describe("the window states the session it runs as (dc-t588)", () => {
   /** The claim the latest Status carried, or undefined for none. */
   const lastClaim = (seen: { statusBodies: Record<string, unknown>[] }) =>
     seen.statusBodies.at(-1)?.claim;
+  /** Whether the latest Status marked its claim as one taken from a call. */
+  const lastFromCall = (seen: { statusBodies: Record<string, unknown>[] }) =>
+    seen.statusBodies.at(-1)?.claim_from === "call";
   /** A Status read now, as /dc now asks one. */
   const now = async (
     $: Parameters<TestBody>[0],
@@ -5544,6 +6043,47 @@ describe("the window states the session it runs as (dc-t588)", () => {
     });
   });
 
+  test("the main conversation's start names this window as its harness, whatever the model passed (dc-t610)", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    // devcorner names no conversation for the window yet: sent as it is.
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
+
+    seen.answer = {
+      ...waiting(0, null),
+      thisConversation: { id: "me-h1", name: null },
+    };
+    // Left out, or another conversation's: this window's.
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      goal: "Coordinate",
+      harness: "me-h1",
+    });
+    await $.tool.call({
+      tool: "mcp__Devcorner__start",
+      goal: "Coordinate",
+      harness: "me-h9",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ harness: "me-h1" });
+    // A child's start and a subagent's are sent as they are.
+    await $.tool.call({
+      tool: "mcp__Devcorner__start",
+      goal: "Child",
+      parent: "acm-s4",
+    });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
+    await $.tool.call({
+      tool: "mcp__Devcorner__start",
+      goal: "Piece A",
+      agentId: "agent-1",
+      harness: "me-h7",
+    } as never);
+    expect(seen.toolCalls.at(-1)).toMatchObject({ harness: "me-h7" });
+  });
+
   test("its finish ends the claim, a child's finish does not, and devcorner's final refusal forgets it", async ($, on) => {
     const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
     await $.session.start(START);
@@ -5592,6 +6132,311 @@ describe("the window states the session it runs as (dc-t588)", () => {
     expect(seen.files.has(CLAIMS)).toBe(false);
   });
 
+  /** This window as devcorner answers before it is tied: no session. */
+  const UNTIED: Status = {
+    ...base,
+    thisConversation: { id: "me-h12", name: null },
+  };
+  /** Another of the person's sessions as a Status's others name it. */
+  const other = (
+    id: string,
+    conversation: string | null,
+    wakes: boolean,
+  ): StatusOther => ({
+    id,
+    page: null,
+    conversation,
+    name: null,
+    repo: "a/b",
+    ticket: null,
+    state: "working",
+    wakes,
+    reach: wakes ? "wakes" : "no wake",
+  });
+  /** A Status that refuses the claim `session`, for good or not. */
+  const refusing = (session: string, final: boolean): Status => ({
+    ...UNTIED,
+    claim: { session, outcome: "refused", was: null, why: "no", final },
+  });
+
+  test("a resumed window whose start the plugin never saw learns its session from a call of the main conversation's that names it", async ($, on) => {
+    expect(DEVCORNER_TOOL.test("mcp__Devcorner__note")).toBe(true);
+    expect(DEVCORNER_TOOL.test("mcp__plugin_devcorner_devcorner__check")).toBe(
+      true,
+    );
+    expect(DEVCORNER_TOOL.test("mcp__linear__note")).toBe(false);
+    expect(namedSession({ session: " dc-s66@acme " })).toBe("dc-s66@acme");
+    expect(namedSession({ session: "me-s4" })).toBe("me-s4");
+    expect(namedSession({ session: "dc-t4" })).toBeNull();
+    expect(namedSession({ session: 4 })).toBeNull();
+    expect(namedSession({})).toBeNull();
+
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = {
+      ...UNTIED,
+      others: {
+        count: 1,
+        items: [other("dc-s66@acme", "me-h18", false)],
+      },
+    };
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = "Noted.";
+    // A subagent's call, one with no session, and a refused one say nothing.
+    await $.tool.call({
+      tool: "mcp__Devcorner__note",
+      session: "acm-s9",
+      text: "x",
+      agentId: "agent-1",
+    } as never);
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    seen.toolRefused = true;
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s4" });
+    seen.toolRefused = false;
+    // Nor a finish, which names the session it ends.
+    await $.tool.call({
+      tool: "mcp__Devcorner__finish",
+      session: "acm-s5",
+      outcome: "done",
+    });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    expect(lastClaim(seen)).toBeUndefined();
+
+    // The main conversation's call that names its session, which works in
+    // its connection's own conversation and in no window: kept in the
+    // module, never in the file a SessionStart states, and said by a Status
+    // at once as a call's, which devcorner holds to more.
+    await $.tool.call({
+      tool: "mcp__Devcorner__check",
+      session: "dc-s66@acme",
+    });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    expect(lastClaim(seen)).toBe("dc-s66@acme");
+    expect(lastFromCall(seen)).toBe(true);
+    // The call went on as the agent made it.
+    const { tool_use_id: _id, ...sent } = seen.toolCalls.at(-1)!;
+    expect(sent).toEqual({
+      tool: "mcp__Devcorner__check",
+      session: "dc-s66@acme",
+    });
+
+    // One kept stands: a call made for another session, as a coordinator's
+    // for its child, leaves it.
+    await $.tool.call({
+      tool: "mcp__Devcorner__note",
+      session: "dc-s70@acme",
+      text: "for the child",
+    });
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("dc-s66@acme");
+    expect(lastFromCall(seen)).toBe(true);
+  });
+
+  test("a call never takes a session from another window or the cloud, nor while devcorner ties this one to a session", async ($, on) => {
+    expect(
+      inAnotherWindow(
+        {
+          ...UNTIED,
+          others: { count: 1, items: [other("me-s4", "me-h2", true)] },
+        },
+        "ME-S4",
+      ),
+    ).toBe(true);
+    // A cloud session, by where devcorner says it runs, whether or not its
+    // conversation can be woken or devcorner names one.
+    for (const where of ["cloud", "cloud · Routine Ivo gmail (Max)"]) {
+      for (const conversation of [null, "me-h9"]) {
+        expect(
+          inAnotherWindow(
+            {
+              ...UNTIED,
+              others: {
+                count: 1,
+                items: [{ ...other("me-s4", conversation, false), where }],
+              },
+            },
+            "me-s4",
+          ),
+        ).toBe(true);
+      }
+    }
+    // A local conversation whose name starts with the word is not.
+    expect(
+      inAnotherWindow(
+        {
+          ...UNTIED,
+          others: {
+            count: 1,
+            items: [{ ...other("me-s4", null, false), where: "cloudy" }],
+          },
+        },
+        "me-s4",
+      ),
+    ).toBe(false);
+    // Its connection's own conversation, none, or this window: not another's.
+    for (const [conversation, wakes] of [
+      ["me-h9", false],
+      [null, false],
+      ["me-h12", true],
+    ] as const) {
+      expect(
+        inAnotherWindow(
+          {
+            ...UNTIED,
+            others: { count: 1, items: [other("me-s4", conversation, wakes)] },
+          },
+          "me-s4",
+        ),
+      ).toBe(false);
+    }
+
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    // Made as a session another window works as: that window's.
+    seen.answer = {
+      ...UNTIED,
+      others: { count: 1, items: [other("me-s4", "me-h2", true)] },
+    };
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = "Sent.";
+    await $.tool.call({ tool: "mcp__Devcorner__message", session: "me-s4" });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    // Nor while devcorner already ties this window to a session.
+    seen.answer = waiting(0, null);
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "me-s5" });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+
+    // Tied to the very session its calls name: that is settled, so later
+    // calls ask devcorner nothing more.
+    const tied = waiting(0, null);
+    seen.answer = tied;
+    const as = tied.session!.id;
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: as });
+    await clock.settle();
+    const asked = seen.statusBodies.filter((b) => b.others === true).length;
+    for (let i = 0; i < 3; i++) {
+      await $.tool.call({ tool: "mcp__Devcorner__check", session: as });
+      await clock.settle();
+    }
+    expect(seen.statusBodies.filter((b) => b.others === true)).toHaveLength(
+      asked,
+    );
+    expect(lastClaim(seen)).toBeUndefined();
+  });
+
+  test("a start's claim stands over a call's, and a session devcorner refused for good as a call's claim is not taken again; one refused for now is", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = UNTIED;
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    seen.toolText = "Noted.";
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__finish", outcome: "done" });
+    await clock.settle();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+
+    // A start's claim is no call's.
+    expect(seen.statusBodies.some((b) => "claim_from" in b)).toBe(false);
+
+    // A call's claim refused for now (its store not read, the session not
+    // live) is forgotten, and taken again at a call a minute on, not before.
+    seen.answer = refusing("acm-s5", false);
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await clock.settle();
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    seen.answer = UNTIED;
+    const asked = seen.statusBodies.length;
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await clock.settle();
+    expect(seen.statusBodies).toHaveLength(asked);
+    await clock.advance(CALL_CLAIM_AGAIN_MS);
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await clock.settle();
+    expect(lastClaim(seen)).toBe("acm-s5");
+    expect(lastFromCall(seen)).toBe(true);
+
+    // One refused for good (a cloud session, another window's) is forgotten
+    // and not taken from a call again.
+    seen.answer = refusing("acm-s5", true);
+    await now($, clock);
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    seen.answer = UNTIED;
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await clock.settle();
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    expect(seen.files.has(CLAIMS)).toBe(false);
+    // Its own session's call is then taken.
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "ACM-S6" });
+    await clock.settle();
+    expect(lastClaim(seen)).toBe("ACM-S6");
+
+    // A start's claim refused not for good stays, as before.
+    seen.toolText = started("acm-s7");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Next" });
+    seen.answer = refusing("acm-s7", false);
+    await now($, clock);
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s7");
+  });
+
+  test("a start's claim kept while a call's is being taken stands", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = UNTIED;
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = "Noted.";
+    seen.holdStatus = true;
+    // The call's read of where the session works is out...
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s5" });
+    await flush(clock);
+    expect(seen.heldStatus).toHaveLength(1);
+    // ...while the main conversation starts, whose read names this window.
+    seen.toolText = started("acm-s4");
+    const starting = $.tool.call({
+      tool: "mcp__Devcorner__start",
+      goal: "Coordinate",
+    });
+    await flush(clock);
+    expect(seen.heldStatus).toHaveLength(2);
+    seen.heldStatus.pop()!(UNTIED);
+    await starting;
+    await flush(clock);
+    expect(seen.files.get(CLAIMS)).toBe("acm-s4\n");
+    // The call's read comes back after: the start's claim stands.
+    seen.heldStatus.shift()!(UNTIED);
+    await flush(clock);
+    seen.holdStatus = false;
+    for (const held of seen.heldStatus.splice(0)) held(UNTIED);
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    expect(lastFromCall(seen)).toBe(false);
+  });
+
+  test("the main conversation's start is said by a Status at once", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    const asked = seen.statusBodies.length;
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    expect(seen.statusBodies.length).toBeGreaterThan(asked);
+    expect(lastClaim(seen)).toBe("acm-s4");
+  });
+
   test("a claim kept before a reload is read back from its file", async ($, on) => {
     const { clock, seen } = world(on, {
       home: "/home/ann",
@@ -5621,5 +6466,95 @@ describe("the window states the session it runs as (dc-t588)", () => {
     expect(seen.toasts).toEqual([]);
     expect(seen.submitted).toEqual([]);
     expect(seen.waitBodies).toHaveLength(2);
+  });
+});
+
+describe("the window's label: its machine and place, before the session's id (dc-t589)", () => {
+  /** A window on MacBook Air 1, in the repo's project Web, as devcorner labels it. */
+  const LABELLED: Status = {
+    ...WHOLE,
+    thisConversation: { id: "dc-h3", name: null },
+    machine: "MacBook Air 1",
+    label: "MacBook Air 1 (Web)",
+  };
+
+  test("the row says the label, in plain text, then the session's short id, linked to its page", () => {
+    expect(row(LABELLED)).toBe(
+      "devcorner · MacBook Air 1 (Web) · s7 · waiting 2",
+    );
+    expect(rowSegments(LABELLED).filter(({ href }) => href)).toEqual([
+      { text: "devcorner", href: LINKS.project },
+      { text: "s7", href: LINKS.session },
+      { text: "waiting 2", href: LINKS.inbox },
+    ]);
+  });
+
+  test("a /dc name is the label devcorner gives, said before the id as a machine's is", () => {
+    const named: Status = {
+      ...LABELLED,
+      thisConversation: { id: "dc-h3", name: "reviewer" },
+      label: "reviewer",
+    };
+    expect(row(named)).toBe("devcorner · reviewer · s7 · waiting 2");
+  });
+
+  test("with no session the label names the window alone", () => {
+    const alone: Status = {
+      ...base,
+      thisConversation: { id: "dc-h4", name: null },
+      machine: "MacBook Air 1",
+      label: "MacBook Air 1 (devcorner)",
+    };
+    expect(row(alone)).toBe("devcorner · MacBook Air 1 (devcorner)");
+  });
+
+  test("with no label, from a token that names no machine or an older devcorner, the row is as it was", () => {
+    const none: Status = { ...LABELLED, machine: null, label: null };
+    expect(row(none)).toBe("devcorner · s7 · waiting 2");
+    // An older devcorner gives no label: the conversation's name follows the id.
+    const { machine: _machine, label: _label, ...older } = LABELLED;
+    expect(
+      row({ ...older, thisConversation: { id: "dc-h3", name: "reviewer" } }),
+    ).toBe("devcorner · s7 reviewer · waiting 2");
+  });
+
+  test("on a narrow terminal the label is cut at a word, its place first, else left out; the id never", () => {
+    const whole = "devcorner · MacBook Air 1 (Web) · s7 · waiting 2";
+    const fits = cells(BULLET + whole);
+    expect(row(LABELLED, fits)).toBe(whole);
+    expect(row(LABELLED, fits - 1)).toBe(
+      "devcorner · MacBook Air 1… · s7 · waiting 2",
+    );
+    expect(row(LABELLED, 39)).toBe("devcorner · MacBook… · s7 · waiting 2");
+    expect(row(LABELLED, 38)).toBe("devcorner · s7 · waiting 2");
+    expect(row(LABELLED, 10)).toBe("devcorner · s7 · waiting 2");
+    for (let columns = 30; columns <= 80; columns++) {
+      const line = row(LABELLED, columns);
+      expect(cells(BULLET + line)).toBeLessThanOrEqual(columns);
+      expect(line).toContain(" · s7 · waiting 2");
+    }
+  });
+
+  test("in a terminal that draws no links, the same words, none linked", async ($, on) => {
+    const { clock, seen } = world(on, { terminal: APPLE_TERMINAL });
+    seen.answer = LABELLED;
+    await $.session.start(START);
+    await clock.settle();
+    expect(await drawn($)).toEqual({
+      line: "devcorner · MacBook Air 1 (Web) · s7 · waiting 2",
+      links: [],
+      buttons: 0,
+    });
+  });
+
+  test("/dc opens with the session and the label, and /dc sessions says it on its here line", () => {
+    expect(lines(LABELLED)[0]).toBe(
+      "devcorner · dc-s7@acme MacBook Air 1 (Web) · Acme · Shop",
+    );
+    expect(
+      sessionsText({ ...LABELLED, others: { count: 0, items: [] } }).split(
+        "\n",
+      )[0],
+    ).toBe("here    dc-s7@acme MacBook Air 1 (Web)  a/b · on dc-t10@acme");
   });
 });

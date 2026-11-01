@@ -10,6 +10,7 @@ import type {
   StatusPaste,
   StatusOther,
   StatusSession,
+  StatusWindow,
   StatusWait,
   StatusWake,
 } from "../types";
@@ -144,10 +145,13 @@ export function wakeWords(
     return `a message ${from ? `${from} sent` : "sent"} on your user's word`;
   }
   // Another of the person's sessions answering what woke it (dc-t585): on
-  // nobody's word, so it never says "your".
+  // nobody's word, so it never says "your". An answer to the person's own
+  // ask (dc-t611) says whose ask it answers.
   if (w.from === "reply") {
     const from = item && CONVERSATION.test(item) ? item : null;
-    return `${from ?? "another conversation"} replied`;
+    return w.what === "answer"
+      ? `${from ?? "another conversation"} answered ${your} ask`
+      : `${from ?? "another conversation"} replied`;
   }
   // An OA the session gave, with news it must act on: asking its person a
   // question (dc-t576), named by the question; its mind's stop, its end or a
@@ -581,16 +585,31 @@ export function shortSession(id: string): string {
 }
 
 /**
+ * The window's name as /dc and /dc sessions say it (dc-t589): devcorner's
+ * label for it, else, from an older devcorner, which gives none, the
+ * conversation's own name; null for neither.
+ */
+const windowName = (s: Status): string | null =>
+  s.label ?? s.thisConversation?.name ?? null;
+
+/**
  * The row above the prompt (dc-t533): one line of links, and nothing to
- * press, "devcorner · s7 reviewer · waiting 2". "devcorner" opens the
- * project's home (else the workspace's place, or Personal's for a repo in
- * none); the short id of the session the conversation works as opens that
- * session's page, the conversation's name after it as its label; and
- * "waiting N" opens the inbox of the repo's place, said only while something
- * waits there, "2+" or "?" with a part of devcorner unread (dc-t137). With no
- * session there is no id and no label. A part devcorner named no page for is
- * plain. Given the cells Claude Code lays the row out in, the label is cut at
- * a word, else left out, so the line never wraps; nothing else is cut.
+ * press. "devcorner" opens the project's home (else the workspace's place,
+ * or Personal's for a repo in none); the short id of the session the
+ * conversation works as opens that session's page; and "waiting N" opens the
+ * inbox of the repo's place, said only while something waits there, "2+" or
+ * "?" with a part of devcorner unread (dc-t137). A part devcorner named no
+ * page for is plain.
+ *
+ * The window's label (dc-t589), the conversation's `/dc name` else its
+ * machine and place, comes first, in plain text, then the id: "devcorner ·
+ * MacBook Air 1 (Web) · s213 · waiting 2", and with no session the label
+ * alone, since it names the window. With none, as from an older devcorner or
+ * on a token that names no machine, the row is as it was: the id with the
+ * conversation's name after it, "devcorner · s7 reviewer · waiting 2", and
+ * with no session neither. Given the cells Claude Code lays the row out in,
+ * the label or the name is cut at a word, "(Web)" first, else left out, so
+ * the line never wraps; nothing else is cut, the id never.
  */
 export function rowSegments(s: Status, columns?: number): Segment[] {
   const head = piece("devcorner", projectHome(s));
@@ -601,17 +620,27 @@ export function rowSegments(s: Status, columns?: number): Segment[] {
     s.waiting > 0 || unreadOf(s).length > 0
       ? [piece(" · "), piece(`waiting ${waitingCount(s)}`, s.links?.inbox)]
       : [];
+  const room = sizeOf(columns);
+  const fixed = cells(BULLET) + cells(lineText([head, ...id, ...waiting]));
+  /** The words cut to the room left after the rest and `before`, which comes before them. */
+  const fitted = (words: string, before: string) =>
+    room === undefined ? words : cutAtWord(words, room - fixed - cells(before));
+  const label = s.label ? oneLine(s.label) : "";
+  if (label) {
+    const cut = fitted(label, " · ");
+    return [
+      head,
+      ...(cut ? [piece(" · "), piece(cut)] : []),
+      ...id,
+      ...waiting,
+    ];
+  }
   const name =
     s.session && s.thisConversation?.name
       ? oneLine(s.thisConversation.name)
       : "";
-  const room = sizeOf(columns);
-  const fixed = cells(BULLET) + cells(lineText([head, ...id, ...waiting]));
-  const label =
-    name && room !== undefined
-      ? cutAtWord(name, room - fixed - cells(" "))
-      : name;
-  return [head, ...id, ...(label ? [piece(` ${label}`)] : []), ...waiting];
+  const cut = name ? fitted(name, " ") : null;
+  return [head, ...id, ...(cut ? [piece(` ${cut}`)] : []), ...waiting];
 }
 
 /**
@@ -853,13 +882,15 @@ const inFlightIn = (s: Status): StatusInFlight | null =>
 /**
  * Who this conversation is, as /dc and /dc now open with it: "devcorner",
  * the session it works as, else the conversation's own id (dc-t312, part 5),
- * with the conversation's name, then the pause of its relays on the person's
- * word when there is one: "devcorner · dc-s7@acme reviewer".
+ * with the window's label (dc-t589, `windowName`), then the pause of its
+ * relays on the person's word when there is one: "devcorner · dc-s7@acme
+ * MacBook Air 1 (Web)".
  */
 function whoHead(s: Status): string {
   const here = s.thisConversation;
   const id = s.session?.id ?? here?.id ?? null;
-  const name = here?.name ? ` ${oneLine(here.name)}` : "";
+  const label = windowName(s);
+  const name = label ? ` ${oneLine(label)}` : "";
   const paused = pausedLine(s);
   return [
     "devcorner",
@@ -1254,22 +1285,26 @@ export function nowText(s: Status): string {
   return lines.join("\n");
 }
 
-/** What /dc sessions ends with: how to message one of them (dc-t491). */
-export const SESSIONS_SEND = "message one: /dc send <id> <text>";
+/** What /dc sessions ends with: how to message one of them (dc-t491), or have one do something and answer here (dc-t611). */
+export const SESSIONS_SEND =
+  "message one: /dc send <id> <text>; have one do something and answer here: /dc ask <id> <task>";
 
 /**
- * What /dc sessions says (dc-t491): this conversation's session, then every
- * other live session of the person's, in every project, one a line under
- * the labels, each with its conversation's name, its repo, how it stands and
- * its ticket, in devcorner's words; then how to message one. Or why
+ * What /dc sessions says (dc-t491): this conversation's session with the
+ * window's label (dc-t589, `windowName`), then every other live session of
+ * the person's, in every project, one a line under the labels, each with
+ * where it runs (its cloud routine, else its conversation's name, then "this
+ * machine" for one on this machine), its title
+ * (dc-t627), its repo, how it stands, its ticket and whether a
+ * /dc send wakes it (dc-t610), in devcorner's words; then their other
+ * windows that work as no session; then how to message one. Or why
  * devcorner listed none: an older one lists no sessions, and a read that
  * could not list them says so.
  */
 export function sessionsText(s: Status): string {
   const hereId = s.session?.id ?? s.thisConversation?.id ?? null;
-  const hereName = s.thisConversation?.name
-    ? ` ${oneLine(s.thisConversation.name)}`
-    : "";
+  const label = windowName(s);
+  const hereName = label ? ` ${oneLine(label)}` : "";
   const here =
     hereId === null
       ? `${labelled("here")}this conversation, unknown to devcorner yet`
@@ -1287,23 +1322,53 @@ export function sessionsText(s: Status): string {
     return `${here}\ndevcorner did not list your other sessions this time.`;
   }
   const { items, count: total } = s.others;
+  // A devcorner before dc-t610 names no windows.
+  const windows = s.others.windows ?? [];
+  const idle = windowLines(windows);
   if (items.length === 0) {
-    return `${here}\n${labelled("others")}none live, in any project`;
+    const none = `${here}\n${labelled("others")}none live, in any project`;
+    return idle.length === 0 ? none : [none, ...idle, SESSIONS_SEND].join("\n");
   }
   const width = widest(items.map((o) => o.id));
   const lines = items.map((o, i) => {
     const facts = [
       ...otherFacts(o),
       ...(o.ticket ? [`on ${o.ticket.id}`] : []),
+      ...(o.reach ? [oneLine(o.reach)] : []),
     ].join(" · ");
-    const name = o.name ? ` ${oneLine(o.name)}` : "";
-    return `${labelled(i === 0 ? "others" : "")}${o.id.padEnd(width)}${name}  ${facts}`;
+    // Where it runs (dc-t627): its cloud routine, else its conversation's
+    // name; a devcorner before it names the conversation only.
+    const where = o.where === undefined ? o.name : o.where;
+    const name = where ? ` ${oneLine(where)}` : "";
+    // Its title (dc-t627); a devcorner before it names none.
+    const title = o.title ? `"${oneLine(o.title)}" · ` : "";
+    return `${labelled(i === 0 ? "others" : "")}${o.id.padEnd(width)}${name}  ${title}${facts}`;
   });
   const rest =
     total > items.length
       ? [`${labelled("")}and ${total - items.length} more`]
       : [];
-  return [here, ...lines, ...rest, SESSIONS_SEND].join("\n");
+  return [here, ...lines, ...rest, ...idle, SESSIONS_SEND].join("\n");
+}
+
+/**
+ * The person's other windows that work as no session (dc-t610), as /dc
+ * sessions says them under `windows`: each its id, where it runs (its name,
+ * then "this machine" when it runs on this one; from a devcorner
+ * before it, its name), its repo, when it was last heard from and that a
+ * /dc send wakes it, in devcorner's words.
+ */
+function windowLines(windows: StatusWindow[]): string[] {
+  const width = widest(windows.map((w) => w.id));
+  return windows.map((w, i) => {
+    const facts = [w.repo, w.state, w.reach]
+      .filter((fact) => fact)
+      .map((fact) => oneLine(fact!))
+      .join(" · ");
+    const where = w.where === undefined ? w.name : w.where;
+    const name = where ? ` ${oneLine(where)}` : "";
+    return `${labelled(i === 0 ? "windows" : "")}${w.id.padEnd(width)}${name}  ${facts}`;
+  });
 }
 
 export function nudgePrompt(s: Status): string {
@@ -2527,18 +2592,28 @@ interface SentTo {
   session?: unknown;
   state?: unknown;
   /**
-   * False for a conversation devcorner opened for an MCP connection or its
-   * chat (dc-t312, part 2), which has no hooks: it reads its mail at its next
-   * call. Absent for a session, and from an older devcorner.
+   * False for a conversation your word does not wake now: one devcorner
+   * opened for an MCP connection or its chat (dc-t312, part 2), which has no
+   * hooks, and, from a devcorner that sends `reach` (dc-t610), a cloud
+   * session's or a window gone quiet. Absent for a session, and from an
+   * older devcorner.
    */
   wakes?: unknown;
+  /**
+   * Why it does not wake and when it reads the message instead, in
+   * devcorner's words (dc-t610, `wakeWords`), as "no wake: a cloud session,
+   * read at its next devcorner call". Absent from an older devcorner.
+   */
+  reach?: unknown;
 }
 
 /** One target's place in /dc send's answer: "dc-h2 (reviewer): queued, no session yet". */
 function sentToText(to: SentTo): string {
   const id = `${String(to.id ?? "")}${typeof to.name === "string" && to.name ? ` (${to.name})` : ""}`;
   if (to.wakes === false) {
-    return `${id}: read at its next call; it cannot be woken`;
+    return typeof to.reach === "string" && to.reach
+      ? `${id}: ${to.reach}`
+      : `${id}: read at its next call; it cannot be woken`;
   }
   if (to.state === "queued") return `${id}: queued, no session yet`;
   return typeof to.session === "string" && to.session !== id
@@ -2599,6 +2674,80 @@ async function sendAsYou($: Engine, words: string): Promise<string> {
   return typeof posted === "string"
     ? posted
     : sentText(posted.status, posted.body);
+}
+
+/** How long devcorner holds the person's ask for its answer (dc-t611, `ASK_HOLD_MS`), as /dc ask says it. */
+const ASK_HOLD_HOURS = 24;
+
+/** What /dc ask says when it is not given one target and a task (dc-t611). */
+export const ASK_USAGE = `Usage: /dc ask <to> <task>. <to> is one session of yours in any project (me-s4, acme-s4; /dc sessions lists them) or one conversation of yours (me-h3, or its name). Your words go as yours, typed here, and wake it if it is idle; its answer comes back to this window and wakes it, in whatever turn it is sent, within ${ASK_HOLD_HOURS} h. /dc send reaches a list.`;
+
+/** /dc ask's words, read (dc-t611): one target, then the task. Null when either is missing, or the target is a list. */
+function readAsk(words: string): { to: string; text: string } | null {
+  const found = /^([^\s,]+)\s+([\s\S]*\S)\s*$/.exec(words.trim());
+  return found ? { to: found[1]!, text: found[2]! } : null;
+}
+
+/**
+ * What /dc ask answers (dc-t611), from devcorner's answer to Send: what was
+ * asked of whom and where it stands, and that its answer comes back here;
+ * or why nothing was asked. A devcorner that does not say `ask` took it as
+ * a plain /dc send, whose reply wakes this window only in the turn it woke.
+ */
+function askedText(status: number, body: unknown): string {
+  const answer = (body ?? {}) as {
+    ok?: unknown;
+    ask?: unknown;
+    messages?: unknown;
+    to?: unknown;
+    error?: unknown;
+  };
+  if (status === 200 && answer.ok === true) {
+    const messages = Array.isArray(answer.messages)
+      ? answer.messages.map(String)
+      : [];
+    const to = Array.isArray(answer.to) ? (answer.to as SentTo[]) : [];
+    const where = to.map(sentToText).join("; ") || "devcorner";
+    if (answer.ask !== true) {
+      return `Sent ${messages.join(", ") || "it"} to ${where}, as a plain /dc send: this devcorner does not take /dc ask yet, so a reply wakes this window only if it comes in the turn your words woke.`;
+    }
+    const wake =
+      to.length > 0 && to.every((t) => t.wakes === false)
+        ? ""
+        : " An idle one wakes for it now; a busy one is handed it at its next hook event.";
+    return `Asked ${messages.join(", ") || "it"} of ${where}.${wake} Its answer comes back to this window and wakes it, within ${ASK_HOLD_HOURS} h.`;
+  }
+  if (status === 204 || status === 404) {
+    return "This devcorner does not take /dc ask yet, so nothing was asked.";
+  }
+  if (status === 429) {
+    return "devcorner did not ask it: that is more sends than a minute allows. Nothing was asked; try again shortly.";
+  }
+  const why = typeof answer.error === "string" ? answer.error : null;
+  return why
+    ? `devcorner did not ask it: ${why}`
+    : `devcorner did not ask it (HTTP ${status}), so nothing was asked.`;
+}
+
+/**
+ * /dc ask (dc-t611): the person's own words, typed in this conversation,
+ * asking one session or conversation of theirs to do something (test,
+ * verify, …) and answer, posted as the hook route's Send with `ask`, so
+ * devcorner reads them as the person's, wakes it if it is idle, and wakes
+ * this window with its answer when it comes. The model sees none of it: the
+ * command answers itself.
+ */
+async function askAsYou($: Engine, words: string): Promise<string> {
+  const read = readAsk(words);
+  if (!read) return ASK_USAGE;
+  const posted = await postAsYou(
+    $,
+    { hook_event_name: "Send", ...read, ask: true },
+    { command: "/dc ask", nothing: "nothing was asked" },
+  );
+  return typeof posted === "string"
+    ? posted
+    : askedText(posted.status, posted.body);
 }
 
 /**
@@ -2737,6 +2886,82 @@ async function nameHere($: Engine, words: string): Promise<string> {
   if (typeof posted === "string") return posted;
   if (posted.status === 200) await refresh($, true).catch(() => undefined);
   return namedText(posted.status, posted.body);
+}
+
+/**
+ * What /dc machine answers (dc-t590), from devcorner's answer to Machine:
+ * the machine's name now, or why it was not renamed, with devcorner's
+ * warning of another machine of the person's named the same. `renaming` is
+ * whether a name was given. An older devcorner knows no Machine, and
+ * answers 204.
+ */
+export function machineText(
+  status: number,
+  body: unknown,
+  renaming: boolean,
+): string {
+  const answer = (body ?? {}) as {
+    ok?: unknown;
+    renamed?: unknown;
+    name?: unknown;
+    from?: unknown;
+    warning?: unknown;
+    error?: unknown;
+  };
+  if (status === 200 && answer.ok === true) {
+    const name = typeof answer.name === "string" ? answer.name : null;
+    const warning =
+      typeof answer.warning === "string" && answer.warning
+        ? ` ${answer.warning}`
+        : "";
+    if (!renaming) {
+      return name
+        ? `This machine is ${name} to devcorner: the line above the prompt names your windows here by it. /dc machine <name> renames it.`
+        : "This machine has no name in devcorner, so the line above the prompt names no machine. /dc machine <name> names it.";
+    }
+    if (answer.renamed !== true) {
+      return name
+        ? `This machine is ${name} already. Nothing was renamed.${warning}`
+        : "Nothing was renamed: the machine had that name already.";
+    }
+    const from =
+      typeof answer.from === "string" && answer.from
+        ? `, renamed from ${answer.from}`
+        : "";
+    // A name of devcorner's own default names no machine.
+    return name
+      ? `This machine is ${name} now${from}: the line above the prompt names your windows here by it, and your connections page lists it so.${warning}`
+      : `Renamed${from ? ` from ${String(answer.from)}` : ""} to a name devcorner gives a machine with none, so the line above the prompt names no machine now. /dc machine <name> names it.`;
+  }
+  if (status === 204 || status === 404) {
+    return "This devcorner does not take /dc machine yet: rename the machine on your connections page.";
+  }
+  const why = typeof answer.error === "string" ? answer.error : null;
+  return why
+    ? `devcorner did not ${renaming ? "rename it" : "say its name"}: ${why}`
+    : `devcorner did not ${renaming ? "rename it" : "say its name"} (HTTP ${status})${renaming ? ", so nothing was renamed" : ""}.`;
+}
+
+/**
+ * /dc machine (dc-t590): with a name, renames this machine, the person's
+ * word, posted as the hook route's Machine with the machine's own token, as
+ * its connections page would; alone, says its name. The row reads the
+ * status again to show the new name in the window's label.
+ */
+async function machineHere($: Engine, words: string): Promise<string> {
+  const name = words.trim();
+  const posted = await postAsYou(
+    $,
+    { hook_event_name: "Machine", ...(name ? { name } : {}) },
+    name
+      ? { command: "/dc machine", nothing: "nothing was renamed" }
+      : { command: "/dc machine", nothing: "its name could not be read" },
+  );
+  if (typeof posted === "string") return posted;
+  if (posted.status === 200 && name) {
+    await refresh($, true).catch(() => undefined);
+  }
+  return machineText(posted.status, posted.body, name !== "");
 }
 
 /** A paste whole, as the hook route's Paste gives it (dc-t490). */
@@ -3030,6 +3255,33 @@ export function startedSession(text: string | undefined): string | null {
   return CLAIMED.test(id) ? id : null;
 }
 
+/** A conversation's id as devcorner shows it: me-h3. */
+const WINDOW_ID = /^[a-z][a-z0-9]*-h\d{1,12}$/i;
+
+/**
+ * The main conversation's start as this window sends it (dc-t610): naming
+ * this window, as devcorner's fresh status read gives it
+ * (`thisConversation`), as its `harness`, in place of what the model passed
+ * or left out. A window's agent that started with no harness, or another
+ * conversation's, worked as its session in a second conversation devcorner
+ * opened for its MCP connection, which no hook, held request or typed turn
+ * reaches, so its mail and relays went where nothing could wake it. A start
+ * that names a parent is a child's, sent as it is, and so is any start
+ * while devcorner names no conversation for this window.
+ */
+async function inThisWindow<E>($: Engine, e: E): Promise<E> {
+  const parent = (e as { parent?: unknown }).parent;
+  if (typeof parent === "string" && parent.trim()) return e;
+  try {
+    const here = (await refresh($, true))?.status?.thisConversation?.id;
+    return typeof here === "string" && WINDOW_ID.test(here)
+      ? { ...e, harness: here }
+      : e;
+  } catch {
+    return e;
+  }
+}
+
 /** How a child's start line ends: its parent, then its role when it has one. */
 const CHILD_END =
   / · child of [a-z][a-z0-9]*-s\d{1,12}(?:@[a-z0-9-]{1,64})?(?: · [^·]+)?$/i;
@@ -3078,12 +3330,14 @@ async function claimOf($: Engine): Promise<string | null> {
 /**
  * Keeps `session` as the one this conversation states it runs as, or forgets
  * it with null (dc-t588): in the module, and in its file for the hooks and a
- * later load. Silent on any failure: the module still holds it.
+ * later load. Either way the claim is no longer one taken from a call
+ * (`fromCalls.taken`). Silent on any failure: the module still holds it.
  */
 async function keepClaim($: Engine, session: string | null): Promise<void> {
   try {
     const id = await $.session.id();
     claim = { id, session };
+    if (fromCalls?.id === id) fromCalls.taken = null;
     const file = claimFile(id, await stateEnvOf($));
     if (!file) return;
     if (session !== null) await writePrivate($, file, `${session}\n`);
@@ -3113,14 +3367,182 @@ async function finishedHere($: Engine, named: unknown): Promise<void> {
 }
 
 /**
+ * What this conversation learnt from its own calls (`claimFromCall`), in the
+ * module alone, for which conversation: the claim it took from one, while
+ * that is still the claim; the sessions a call need not look at again
+ * (`settled`, in lower case): devcorner refused one as a call's claim for
+ * good, another window works as it, or devcorner ties this window to it
+ * already; and those devcorner refused for now, each with when a call may
+ * take it again (`later`, `CALL_CLAIM_AGAIN_MS`).
+ */
+let fromCalls:
+  | {
+      id: string;
+      taken: string | null;
+      settled: Set<string>;
+      later: Map<string, number>;
+    }
+  | undefined;
+
+/**
+ * How long after devcorner refused a call's claim for now (its store not
+ * read, the session not live) a call may take it again: each try costs two
+ * Status reads, one of them every live session's, so a window whose every
+ * call names that session tries at most once a minute.
+ */
+export const CALL_CLAIM_AGAIN_MS = 60_000;
+
+/** `fromCalls` for conversation `id`, made anew for another. */
+function callsLearnt(id: string): NonNullable<typeof fromCalls> {
+  if (fromCalls?.id !== id) {
+    fromCalls = { id, taken: null, settled: new Set(), later: new Map() };
+  }
+  return fromCalls;
+}
+
+/** Whether `stated`, the claim a Status carries, is one taken from a call (`claimFromCall`), which devcorner holds to more. */
+function takenFromCall(id: string, stated: string): boolean {
+  return fromCalls?.id === id && fromCalls.taken === stated;
+}
+
+/**
  * What a Status said of the claim it carried (dc-t588): one devcorner can
  * never take (the session finished, is a child's or another's, or its
  * connection moved on) is forgotten, unless a newer start kept another
- * meanwhile.
+ * meanwhile. A claim taken from a call (`claimFromCall`) is only this
+ * window's guess, so any refusal of it forgets it; only one that can never
+ * hold (devcorner's `final`: a cloud session, another window's, or gone) is
+ * not taken from a call again, and one refused for now (its store not read,
+ * the session not live) is taken again at a call `CALL_CLAIM_AGAIN_MS` on.
  */
 async function heardClaim($: Engine, sent: string, s: Status): Promise<void> {
-  if (s.claim?.final !== true || s.claim.session !== sent) return;
+  if (s.claim?.session !== sent || s.claim.outcome !== "refused") return;
+  let guessed = false;
+  try {
+    const learnt = callsLearnt(await $.session.id());
+    guessed = learnt.taken === sent;
+    if (guessed) {
+      const key = sent.toLowerCase();
+      if (s.claim.final === true) learnt.settled.add(key);
+      else learnt.later.set(key, (await $.clock.now()) + CALL_CLAIM_AGAIN_MS);
+    }
+  } catch {
+    /* stay silent */
+  }
+  if (s.claim.final !== true && !guessed) return;
   if ((await claimOf($)) === sent) await keepClaim($, null);
+}
+
+/**
+ * Any of devcorner's tools, on a server named for devcorner, as `CARRIER`'s
+ * are: a call of the main conversation's that names the session
+ * it is made as tells the window its session.
+ */
+export const DEVCORNER_TOOL = /^mcp__[\w-]*devcorner[\w-]*__[\w-]+$/i;
+
+/**
+ * The session a devcorner call names as the one it is made as,
+ * its `session` as devcorner shows ids (me-s4, acm-s4, dc-s4@acme); null
+ * for none, or any other value.
+ */
+export function namedSession(call: { session?: unknown }): string | null {
+  const named = typeof call.session === "string" ? call.session.trim() : "";
+  return CLAIMED.test(named) ? named : null;
+}
+
+/** How a Status's `where` says a session runs in the cloud: "cloud", or "cloud · <routine>". */
+const IN_CLOUD = /^cloud(?: · |$)/;
+
+/**
+ * Whether a Status says `session` is not this window's to take from a call
+ * of its own (`session` is also "one to act as"): it runs in the cloud, or
+ * works in another window of the person's that a message wakes now. One
+ * working in its connection's own conversation, in none, or in this window
+ * is not. devcorner holds a call's claim to the same and more
+ * (`ClaimWindowInput.fromCall`): a quiet window's session too, which a
+ * Status does not tell from one in its connection's own conversation.
+ */
+export function inAnotherWindow(s: Status, session: string): boolean {
+  const here = s.thisConversation?.id ?? null;
+  const key = session.toLowerCase();
+  return (s.others?.items ?? []).some(
+    (o) =>
+      o.id.toLowerCase() === key &&
+      (IN_CLOUD.test(o.where ?? "") ||
+        (o.conversation !== null &&
+          o.conversation !== here &&
+          o.wakes === true)),
+  );
+}
+
+/** A `claimFromCall` under way, so calls made side by side take one claim between them. */
+let takingFromCall = false;
+
+/**
+ * The window learns its session from its own calls: a
+ * conversation whose `start` the plugin never saw (one started before
+ * 0.30.0, or in a process that restarted, whose new MCP connection holds no
+ * session) passes the session it works as on each devcorner call. Once such
+ * a call of the main conversation's, never a subagent's, has gone through,
+ * and while the conversation states none and devcorner ties the window to
+ * none, the session it names is kept as the claim, in the module alone, and
+ * a Status says it at once, marked as a call's (`claim_from`), so devcorner
+ * ties the window to it (`claimWindow`, with every check a start's claim
+ * gets and more: never a cloud session, nor another window's) and the row,
+ * /dc and /dc sessions name it with no new start. It is never written to the
+ * claim's file, so a SessionStart never states a guess as a start's claim.
+ * A start's claim, or one kept before, stands, even one a start keeps while
+ * this call's is being taken; a start and a finish are their own
+ * (`STARTER`, `FINISHER`). A session in the cloud or another window a
+ * message wakes is not taken (`inAnotherWindow`), one devcorner refused for
+ * good as the claim is not taken again and one refused for now not for a
+ * while (`heardClaim`), and one devcorner ties the window to already is not
+ * looked at again; a call made side by
+ * side with one being taken is left (`takingFromCall`). Silent on any
+ * failure: the call's answer is the model's as it was.
+ */
+async function claimFromCall(
+  $: Engine,
+  e: { tool: string; agentId?: string; session?: unknown },
+  ran: { deny?: string; isError?: boolean },
+): Promise<void> {
+  if (e.agentId !== undefined || ran.deny !== undefined || ran.isError) {
+    return;
+  }
+  if (STARTER.test(e.tool) || FINISHER.test(e.tool)) return;
+  const named = namedSession(e);
+  if (named === null || takingFromCall) return;
+  takingFromCall = true;
+  try {
+    const id = await $.session.id();
+    const key = named.toLowerCase();
+    if ((await claimOf($)) !== null) return;
+    const learnt = callsLearnt(id);
+    if (learnt.settled.has(key)) return;
+    if ((learnt.later.get(key) ?? 0) > (await $.clock.now())) return;
+    // Where this window works and where the session does, as devcorner
+    // says them now.
+    const s = (await refresh($, true, { others: true }))?.status;
+    if (!s) return;
+    if (s.session) {
+      if (s.session.id.toLowerCase() === key) learnt.settled.add(key);
+      return;
+    }
+    if (inAnotherWindow(s, named)) {
+      learnt.settled.add(key);
+      return;
+    }
+    // Checked and kept with no wait between, so a start's claim kept
+    // meanwhile stands.
+    if (claim?.id === id && claim.session !== null) return;
+    claim = { id, session: named };
+    learnt.taken = named;
+    await refresh($, true);
+  } catch {
+    /* stay silent */
+  } finally {
+    takingFromCall = false;
+  }
 }
 
 /**
@@ -3172,6 +3594,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     // The session this window runs as, as its start said (dc-t588): devcorner
     // checks it and ties the window to it when that had drifted.
     const stated = await claimOf($);
+    const guessed = stated !== null && takenFromCall(sessionId, stated);
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -3185,6 +3608,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
         cwd,
         ...(moved ? { branch } : {}),
         ...(stated !== null ? { claim: stated } : {}),
+        ...(guessed ? { claim_from: "call" } : {}),
         ...(asks.picture ? { expanded: true } : {}),
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
@@ -3899,9 +4323,9 @@ export const register: Register = (on) => {
       await $.command.register({
         name: "dc",
         description:
-          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), name this conversation (/dc name reviewer), send your words to another conversation of yours (/dc send me-h3 text), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
+          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), rename this machine (/dc machine MacBook Air 1), name this conversation (/dc name reviewer), send your words to another conversation of yours (/dc send me-h3 text), have another session of yours do something and answer here (/dc ask me-s4 run the tests), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
         argumentHint:
-          "[now | waits | sessions | login | logout | name [<name>] | send <to> <text> | paste [<id>] | pastes | setup | hide | what to ask]",
+          "[now | waits | sessions | login | logout | machine [<name>] | name [<name>] | send <to> <text> | ask <to> <task> | paste [<id>] | pastes | setup | hide | what to ask]",
       });
     } catch {
       /* stay silent */
@@ -4002,9 +4426,13 @@ export const register: Register = (on) => {
 
   // The main conversation's start says the session this window runs as, and
   // its finish ends that (dc-t588); a subagent's never does. What the
-  // model reads is left as it was.
+  // model reads is left as it was. It names this window as its harness
+  // (dc-t610), so devcorner never opens a second conversation for the
+  // window's connection, whatever the model passed.
   on("tool.call", { tool: STARTER }, async ($, e, next) => {
-    const ran = await next(e);
+    const ran = await next(
+      e.agentId === undefined ? await inThisWindow($, e) : e,
+    );
     if (
       e.agentId === undefined &&
       ran.deny === undefined &&
@@ -4013,8 +4441,17 @@ export const register: Register = (on) => {
       const started = startedSession(ran.text);
       if (started !== null && started !== (await claimOf($))) {
         await keepClaim($, started);
+        // The row names the session at once, not at the next read.
+        void refresh($, true);
       }
     }
+    return ran;
+  }).catch(($, e, next) => next(e));
+  // A call of the main conversation's that names its session says it too,
+  // while the window states none. What the model reads is left as it was.
+  on("tool.call", { tool: DEVCORNER_TOOL }, async ($, e, next) => {
+    const ran = await next(e);
+    void claimFromCall($, e as Parameters<typeof claimFromCall>[1], ran);
     return ran;
   }).catch(($, e, next) => next(e));
   on("tool.call", { tool: FINISHER }, async ($, e, next) => {
@@ -4054,9 +4491,17 @@ export const register: Register = (on) => {
     if (/^send(?:\s|$)/.test(arg)) {
       return { text: await sendAsYou($, arg.slice("send".length)) };
     }
+    // Your own ask of another session of yours, answered here (dc-t611).
+    if (/^ask(?:\s|$)/.test(arg)) {
+      return { text: await askAsYou($, arg.slice("ask".length)) };
+    }
     // This conversation's name, or none (dc-t312, part 5).
     if (/^name(?:\s|$)/.test(arg)) {
       return { text: await nameHere($, arg.slice("name".length)) };
+    }
+    // This machine's name, or a new one (dc-t590).
+    if (/^machine(?:\s|$)/.test(arg)) {
+      return { text: await machineHere($, arg.slice("machine".length)) };
     }
     // What this conversation's session is on and did lately (dc-t489).
     if (arg === "now") {
