@@ -4288,6 +4288,259 @@ async function carriedCapacity(
   }
 }
 
+/**
+ * The research tools devcorner points to earlier work before: a web search,
+ * a page fetch and a subagent's spawn. The hook route's Recall answers the
+ * work of the person's an agent should read before it researches again, or
+ * nothing, and never the same item twice in one context window.
+ */
+export const RECALL_WEB = /^(?:WebSearch|WebFetch)$/;
+
+/** How long a spawn waits for the answer before the subagent starts without it. */
+export const RECALL_WAIT_MS = 2_000;
+/** How long a web tool's result waits for an answer still on its way once the tool is done. */
+export const RECALL_AFTER_MS = 500;
+/** How long no Recall is asked after one failed: devcorner down, refused, or too many. */
+export const RECALL_BACKOFF_MS = 60_000;
+/** The most of any one field of a tool's input sent, in characters. */
+export const RECALL_FIELD_MAX = 2_000;
+
+/**
+ * Agent types spawned with no line: devcorner's own worker, which starts its
+ * run from devcorner itself, a fork, which shares its parent's context, and
+ * Claude Code's status line setup, which edits one settings file from a fixed
+ * brief and researches nothing. Any other Agent call is recalled for.
+ */
+const NO_RECALL_AGENT =
+  /^(?:(?:[\w-]+:)?devcorner:worker|fork|statusline-setup)$/i;
+
+/** No Recall is asked before this time, after one failed. */
+let recallQuietUntil = 0;
+/** The tool calls with a Recall on its way, by tool_use_id: each call asks its own. */
+const recalling = new Set<string>();
+
+/** A line devcorner answered, with the ids of the items it points to. */
+interface Recalled {
+  line: string;
+  items: string[];
+}
+
+const field = (value: unknown): string | null =>
+  typeof value === "string" && value.trim()
+    ? value.slice(0, RECALL_FIELD_MAX)
+    : null;
+
+/**
+ * What a Recall sends of a tool call: the tool and the input devcorner
+ * searches by, each field cut to RECALL_FIELD_MAX. Null for a call it does
+ * not recall for: another tool, an agent type in NO_RECALL_AGENT, or one with
+ * nothing to search by. Nothing of it is stored.
+ */
+export function recallInput(call: {
+  tool: string;
+  [argument: string]: unknown;
+}): { tool: string; input: Record<string, string> } | null {
+  const fields = (names: string[]) => {
+    const input: Record<string, string> = {};
+    for (const name of names) {
+      const value = field(call[name]);
+      if (value !== null) input[name] = value;
+    }
+    return Object.keys(input).length > 0 ? { tool: call.tool, input } : null;
+  };
+  if (call.tool === "WebSearch") return fields(["query"]);
+  if (call.tool === "WebFetch") return fields(["url", "prompt"]);
+  if (call.tool !== "Agent") return null;
+  const type = call.subagent_type;
+  if (typeof type === "string" && NO_RECALL_AGENT.test(type.trim())) {
+    return null;
+  }
+  return fields(["description", "prompt"]);
+}
+
+/**
+ * Asks devcorner for the earlier work a research tool call should be pointed
+ * to: its line and item ids, or null for none. Nothing is marked seen by the
+ * ask: an item counts as seen in a window only once a result of that window
+ * carried it (`deliver`). Fails open: no token, a call already asking, a
+ * minute after a failure, or any error, and the answer is null, so the call
+ * goes on as the agent made it.
+ */
+async function recallFor(
+  $: Engine,
+  call: { tool: string; tool_use_id?: string; agentId?: string },
+): Promise<Recalled | null> {
+  const key = call.tool_use_id ?? "";
+  let mine = false;
+  try {
+    const asked = recallInput(call as Parameters<typeof recallInput>[0]);
+    if (asked === null || (key !== "" && recalling.has(key))) return null;
+    if ((await $.clock.now()) < recallQuietUntil) return null;
+    const held = await tokenOf($);
+    if (!held) return null;
+    if (key !== "") {
+      recalling.add(key);
+      mine = true;
+    }
+    const repo = await repoIn($, await $.session.cwd()).catch(() => undefined);
+    const res = await $.http.fetch(`${await baseOf($)}/mcp/hooks/claude-code`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${held.token}`,
+        "content-type": "application/json",
+        ...(repo ? { "X-Devcorner-Repo": repo } : {}),
+      },
+      body: JSON.stringify({
+        hook_event_name: "Recall",
+        session_id: await $.session.id(),
+        ...(call.agentId ? { agent_id: call.agentId } : {}),
+        ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}),
+        ...asked,
+      }),
+    });
+    if (!res.ok) {
+      // A refused input is this call's alone; anything else waits a minute.
+      if (res.status !== 400) await quietRecalls($);
+      return null;
+    }
+    const answer = JSON.parse(res.text) as {
+      context?: unknown;
+      items?: unknown;
+    };
+    if (typeof answer?.context !== "string" || !answer.context.trim()) {
+      return null;
+    }
+    const items = Array.isArray(answer.items)
+      ? answer.items.filter((item): item is string => typeof item === "string")
+      : [];
+    return { line: answer.context, items };
+  } catch {
+    await quietRecalls($);
+    return null;
+  } finally {
+    if (mine) recalling.delete(key);
+  }
+}
+
+/**
+ * Tells devcorner a window's result carried these items, so that window is
+ * not pointed to them again. Fire and forget, failing open: unsaid, the
+ * window may be pointed to an item twice, never to none.
+ */
+async function delivered(
+  $: Engine,
+  window: string,
+  items: readonly string[],
+): Promise<void> {
+  try {
+    const held = await tokenOf($);
+    if (!held || items.length === 0) return;
+    const repo = await repoIn($, await $.session.cwd()).catch(() => undefined);
+    await $.http.fetch(`${await baseOf($)}/mcp/hooks/claude-code`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${held.token}`,
+        "content-type": "application/json",
+        ...(repo ? { "X-Devcorner-Repo": repo } : {}),
+      },
+      body: JSON.stringify({
+        hook_event_name: "Recall",
+        delivered: true,
+        session_id: await $.session.id(),
+        ...(window ? { agent_id: window } : {}),
+        items,
+      }),
+    });
+  } catch {
+    // Unsaid is safe.
+  }
+}
+
+async function quietRecalls($: Engine): Promise<void> {
+  try {
+    recallQuietUntil = (await $.clock.now()) + RECALL_BACKOFF_MS;
+  } catch {
+    // No clock, no quiet: the next call asks again.
+  }
+}
+
+/**
+ * Lines that came after their web call stopped waiting, by window: nothing
+ * is marked seen for them yet, so the window's next research result carries
+ * them (`deliver`), and only then are they.
+ */
+const lateLines = new Map<string, Recalled[]>();
+
+/**
+ * The answer a call waited for, when `asked` answered within `ms`, else null.
+ * With `keep`, an answer past that is kept for the window's next result
+ * (`lateLines`). The timer is stopped once the answer comes, so nothing
+ * outlives the hook.
+ */
+function answerOf<T>(
+  $: Engine,
+  asked: Promise<T | null>,
+  ms: number,
+  keep?: (late: T) => void,
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    let timer: Timer | null = null;
+    const end = (answer: T | null) => {
+      if (done) return;
+      done = true;
+      timer?.cancel();
+      resolve(answer);
+    };
+    try {
+      timer = $.clock.after(ms, () => end(null));
+    } catch {
+      end(null);
+    }
+    asked.then(
+      (answer) => {
+        if (!done) end(answer);
+        else if (answer !== null) keep?.(answer);
+      },
+      () => end(null),
+    );
+  });
+}
+
+/** Keeps a web call's late answer for its window's next result. */
+const keepLate = (window: string) => (late: Recalled) =>
+  lateLines.set(window, [...(lateLines.get(window) ?? []), late]);
+
+/**
+ * A tool's result with devcorner's lines after it, for the model alone: those
+ * kept from earlier calls of the window's that came late, then this call's.
+ * The items of every line the result carries are then marked seen for this
+ * window, and no other.
+ */
+function deliver<R extends { deny?: unknown; context?: readonly string[] }>(
+  $: Engine,
+  ran: R,
+  window: string,
+  recalled: Recalled | null,
+): R {
+  if (ran.deny !== undefined) return ran;
+  const carried = [
+    ...(lateLines.get(window) ?? []),
+    ...(recalled ? [recalled] : []),
+  ];
+  lateLines.delete(window);
+  if (carried.length === 0) return ran;
+  void delivered(
+    $,
+    window,
+    carried.flatMap((c) => c.items),
+  );
+  return {
+    ...ran,
+    context: [...(ran.context ?? []), ...carried.map((c) => c.line)],
+  };
+}
+
 export const register: Register = (on) => {
   // The engine raises this when a window moves a whole point, after a turn.
   on("session.measure", async ($, e, next) => {
@@ -4481,6 +4734,40 @@ export const register: Register = (on) => {
     // made again: `next` replays what it settled to.
     next(e),
   );
+
+  // Earlier work before research: a web search or fetch runs at once, beside
+  // devcorner's Recall, and its result carries the line when the answer came
+  // by the time the tool was done, or within RECALL_AFTER_MS of it.
+  // Neither handler has a fallback that calls `next` again: the lookups are
+  // total (they fail open to no line), so there is nothing to recover from,
+  // and a tool is never run a second time.
+  on("tool.call", { tool: RECALL_WEB }, async ($, e, next) => {
+    const window = e.agentId ?? "";
+    const asked = recallFor($, e);
+    const ran = await next(e);
+    const recalled = await answerOf(
+      $,
+      asked,
+      RECALL_AFTER_MS,
+      keepLate(window),
+    );
+    return deliver($, ran, window, recalled);
+  });
+  // A subagent's spawn waits up to RECALL_WAIT_MS for the line, which ends
+  // its prompt, so the subagent reads it before it begins. Nothing is marked
+  // seen for the spawning window or the subagent: the subagent may be pointed
+  // to an item once more by its own first search, which costs a repeat, never
+  // a line lost. A line that came after the wait is dropped. A late web line
+  // waiting for the spawning window rides on the spawn's result.
+  on("tool.call", { tool: "Agent" }, async ($, e, next) => {
+    const window = e.agentId ?? "";
+    const recalled = await answerOf($, recallFor($, e), RECALL_WAIT_MS);
+    const ran =
+      recalled === null || typeof e.prompt !== "string"
+        ? await next(e)
+        : await next({ ...e, prompt: `${e.prompt}\n\n${recalled.line}` });
+    return deliver($, ran, window, null);
+  });
 
   on("command.run", { command: "dc" }, async ($, e) => {
     const arg = e.args.trim();

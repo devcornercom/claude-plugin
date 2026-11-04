@@ -13,6 +13,11 @@ import type {
 import {
   PASTE_USAGE,
   PASTER,
+  RECALL_AFTER_MS,
+  RECALL_BACKOFF_MS,
+  RECALL_FIELD_MAX,
+  RECALL_WAIT_MS,
+  recallInput,
   STARTER,
   FINISHER,
   DEVCORNER_TOOL,
@@ -1304,6 +1309,20 @@ function world(
       | { isCopied: false; reason: "no-surface" | "no-clipboard" | "refused" },
     /** The lines said in the transcript ($.ui.log). */
     logs: [] as string[],
+    /** What each Recall carried, with its token and the repo it named, and how devcorner answers it. */
+    recalls: [] as {
+      body: Record<string, unknown>;
+      token: string;
+      repo: string | undefined;
+    }[],
+    recallAnswer: { status: 200, body: { context: null } as unknown } as
+      | { status: number; body: unknown }
+      | "down"
+      | "held",
+    /** What each delivered Recall said a window's result carried. */
+    deliveries: [] as Record<string, unknown>[],
+    /** The Recalls held open while `recallAnswer` is "held", answered by the test. */
+    heldRecalls: [] as ((answer: { status: number; body: unknown }) => void)[],
   };
   const answer401 = {
     value: { status: 401, ok: false, headers: {}, text: "{}" },
@@ -1396,6 +1415,26 @@ function world(
       if (answer.status === 204) {
         return { value: { status: 204, ok: true, headers: {}, text: "" } };
       }
+      return reply(answer.status, answer.body);
+    }
+    if (sent.hook_event_name === "Recall" && sent.delivered === true) {
+      seen.deliveries.push(sent);
+      return reply(200, { held: 1 });
+    }
+    if (sent.hook_event_name === "Recall") {
+      const headers = (e.init?.headers ?? {}) as Record<string, string>;
+      seen.recalls.push({
+        body: sent,
+        token: bearer,
+        repo: headers["X-Devcorner-Repo"],
+      });
+      const answer =
+        seen.recallAnswer === "held"
+          ? await new Promise<{ status: number; body: unknown }>((resolve) =>
+              seen.heldRecalls.push(resolve),
+            )
+          : seen.recallAnswer;
+      if (answer === "down") return { deny: "unreachable" };
       return reply(answer.status, answer.body);
     }
     if (sent.hook_event_name === "Capacity") {
@@ -6556,5 +6595,283 @@ describe("the window's label: its machine and place, before the session's id (dc
         "\n",
       )[0],
     ).toBe("here    dc-s7@acme MacBook Air 1 (Web)  a/b · on dc-t10@acme");
+  });
+});
+
+describe("earlier work before research: a search, a fetch or a spawn asks devcorner's Recall", () => {
+  const LINE =
+    'devcorner: earlier work on this, read it before you go on (show(id) reads it):\n  me-t1 "Rotate the secret" · declined 3 d ago: "no need" · research me-d1';
+  const ITEMS = ["me-t1", "me-d1"];
+  const answers = (seen: { recallAnswer: unknown }) => {
+    seen.recallAnswer = { status: 200, body: { context: LINE, items: ITEMS } };
+  };
+
+  test("sends the input a tool searches by, each field cut, and nothing for another tool or a worker, a fork or the status line's setup", () => {
+    expect(recallInput({ tool: "WebSearch", query: "channels", x: 1 })).toEqual(
+      { tool: "WebSearch", input: { query: "channels" } },
+    );
+    expect(
+      recallInput({
+        tool: "WebFetch",
+        url: "https://a.test/b",
+        prompt: "What is it?",
+      }),
+    ).toEqual({
+      tool: "WebFetch",
+      input: { url: "https://a.test/b", prompt: "What is it?" },
+    });
+    const brief = recallInput({
+      tool: "Agent",
+      description: "Research",
+      prompt: "y".repeat(RECALL_FIELD_MAX + 50),
+      subagent_type: "general-purpose",
+      model: "haiku",
+    })!;
+    expect(brief.input).toEqual({
+      description: "Research",
+      prompt: "y".repeat(RECALL_FIELD_MAX),
+    });
+    for (const type of [
+      "devcorner:worker",
+      "plugin:devcorner:worker",
+      "fork",
+      "statusline-setup",
+    ]) {
+      expect(
+        recallInput({ tool: "Agent", prompt: "x", subagent_type: type }),
+      ).toBe(null);
+    }
+    expect(recallInput({ tool: "Agent", prompt: "x" })).not.toBe(null);
+    expect(recallInput({ tool: "Bash", command: "ls" })).toBe(null);
+    expect(recallInput({ tool: "WebSearch", query: " " })).toBe(null);
+  });
+
+  test("a search runs as it was made, and its result carries the line for the model", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    answers(seen);
+    const ran = await $.tool.call({
+      tool: "WebSearch",
+      query: "channels",
+    } as never);
+    expect(seen.toolCalls).toEqual([
+      { tool: "WebSearch", tool_use_id: expect.any(String), query: "channels" },
+    ]);
+    expect(ran.context).toEqual([LINE]);
+    await clock.settle();
+    expect(seen.deliveries).toEqual([
+      {
+        hook_event_name: "Recall",
+        delivered: true,
+        session_id: "conversation-1",
+        items: ITEMS,
+      },
+    ]);
+    expect(seen.recalls).toEqual([
+      {
+        body: {
+          hook_event_name: "Recall",
+          session_id: "conversation-1",
+          tool_use_id: expect.any(String),
+          tool: "WebSearch",
+          input: { query: "channels" },
+        },
+        token: "dch_test",
+        repo: "git@github.com:acme/shop.git",
+      },
+    ]);
+  });
+
+  test("no line, or none by the tool's end and RECALL_AFTER_MS after it: the result is the tool's alone, and a late line comes with the window's next", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    const plain = await $.tool.call({
+      tool: "WebFetch",
+      url: "https://a.test",
+    } as never);
+    expect(plain.context).toBeUndefined();
+    seen.recallAnswer = "held";
+    const call = $.tool.call({ tool: "WebSearch", query: "channels" } as never);
+    await clock.settle();
+    // The search did not wait for devcorner.
+    expect(seen.toolCalls).toHaveLength(2);
+    await clock.advance(RECALL_AFTER_MS);
+    expect((await call).context).toBeUndefined();
+    // Nothing is marked yet: the window's next research result carries it,
+    // once, and a subagent's search does not.
+    expect(seen.deliveries).toEqual([]);
+    seen.heldRecalls[0]!({
+      status: 200,
+      body: { context: LINE, items: ITEMS },
+    });
+    await clock.settle();
+    seen.recallAnswer = { status: 200, body: { context: null } };
+    const inside = await $.tool.call({
+      tool: "WebSearch",
+      query: "b",
+      agentId: "agent-1",
+    } as never);
+    expect(inside.context).toBeUndefined();
+    const next = await $.tool.call({ tool: "WebSearch", query: "c" } as never);
+    expect(next.context).toEqual([LINE]);
+    await clock.settle();
+    // Marked at delivery, for the window whose result carried it.
+    expect(seen.deliveries).toEqual([
+      {
+        hook_event_name: "Recall",
+        delivered: true,
+        session_id: "conversation-1",
+        items: ITEMS,
+      },
+    ]);
+    const after = await $.tool.call({ tool: "WebSearch", query: "d" } as never);
+    expect(after.context).toBeUndefined();
+  });
+
+  test("a subagent's prompt ends with the line, and nothing is marked for either window", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    answers(seen);
+    const ran = await $.tool.call({
+      tool: "Agent",
+      description: "Research",
+      prompt: "Find out.",
+      subagent_type: "general-purpose",
+    } as never);
+    expect(seen.toolCalls[0]).toMatchObject({
+      prompt: `Find out.\n\n${LINE}`,
+      description: "Research",
+    });
+    expect(ran.context).toBeUndefined();
+    await clock.settle();
+    expect(seen.deliveries).toEqual([]);
+    expect(seen.recalls[0]!.body).toMatchObject({
+      tool: "Agent",
+      input: { description: "Research", prompt: "Find out." },
+      tool_use_id: expect.any(String),
+    });
+  });
+
+  test("parallel spawns and searches each ask their own Recall and each get their own line", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.recallAnswer = "held";
+    const calls = [
+      $.tool.call({ tool: "Agent", prompt: "One." } as never),
+      $.tool.call({ tool: "Agent", prompt: "Two." } as never),
+      $.tool.call({ tool: "WebSearch", query: "a" } as never),
+    ];
+    await clock.settle();
+    expect(seen.recalls).toHaveLength(3);
+    expect(new Set(seen.recalls.map((r) => r.body.tool_use_id)).size).toBe(3);
+    for (const held of seen.heldRecalls) {
+      held({ status: 200, body: { context: LINE, items: ITEMS } });
+    }
+    await clock.settle();
+    await Promise.all(calls);
+    expect(seen.toolCalls.filter((c) => c.tool === "Agent")).toEqual([
+      expect.objectContaining({ prompt: `One.\n\n${LINE}` }),
+      expect.objectContaining({ prompt: `Two.\n\n${LINE}` }),
+    ]);
+  });
+
+  test("devcorner down, or an answer that is not JSON, the tool runs once and gives its own result", async ($, on) => {
+    const { seen } = world(on, { tools: true });
+    seen.recallAnswer = "down";
+    const search = await $.tool.call({
+      tool: "WebSearch",
+      query: "channels",
+    } as never);
+    expect(search.text).toBe(seen.toolText);
+    expect(seen.toolCalls).toHaveLength(1);
+    seen.recallAnswer = { status: 200, body: "not json" };
+    const spawn = await $.tool.call({
+      tool: "Agent",
+      prompt: "Find out.",
+    } as never);
+    expect(spawn.text).toBe(seen.toolText);
+    expect(seen.toolCalls).toHaveLength(2);
+    expect(seen.deliveries).toEqual([]);
+  });
+
+  test("a spawn waits RECALL_WAIT_MS at most, then starts with its own prompt; a line that came after is dropped, as no result carried it", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.recallAnswer = "held";
+    const call = $.tool.call({ tool: "Agent", prompt: "Find out." } as never);
+    await clock.settle();
+    expect(seen.toolCalls).toHaveLength(0);
+    await clock.advance(RECALL_WAIT_MS);
+    const ran = await call;
+    expect(seen.toolCalls[0]).toMatchObject({ prompt: "Find out." });
+    expect(ran.context).toBeUndefined();
+    seen.heldRecalls[0]!({
+      status: 200,
+      body: { context: LINE, items: ITEMS },
+    });
+    await clock.settle();
+    seen.recallAnswer = { status: 200, body: { context: null } };
+    const next = await $.tool.call({
+      tool: "WebFetch",
+      url: "https://a.test",
+    } as never);
+    expect(next.context).toBeUndefined();
+    expect(seen.deliveries).toEqual([]);
+  });
+
+  test("a worker or a fork is spawned at once as it was asked, with nothing sent", async ($, on) => {
+    const { seen } = world(on, { tools: true });
+    answers(seen);
+    await $.tool.call({
+      tool: "Agent",
+      prompt: "Run dc-r3.",
+      subagent_type: "devcorner:worker",
+    } as never);
+    await $.tool.call({
+      tool: "Agent",
+      prompt: "Go.",
+      subagent_type: "fork",
+    } as never);
+    expect(seen.recalls).toEqual([]);
+    expect(seen.toolCalls.map((c) => c.prompt)).toEqual(["Run dc-r3.", "Go."]);
+  });
+
+  test("a subagent's own search names it", async ($, on) => {
+    const { seen } = world(on, { tools: true });
+    answers(seen);
+    await $.tool.call({
+      tool: "WebSearch",
+      query: "channels",
+      agentId: "agent-1",
+    } as never);
+    expect(seen.recalls[0]!.body.agent_id).toBe("agent-1");
+  });
+
+  test("with no token nothing is sent and the tool runs as it was made", async ($, on) => {
+    const { seen } = world(on, { tools: true, token: false });
+    const ran = await $.tool.call({
+      tool: "WebSearch",
+      query: "channels",
+    } as never);
+    expect(seen.recalls).toEqual([]);
+    expect(seen.toolCalls).toHaveLength(1);
+    expect(ran.context).toBeUndefined();
+  });
+
+  test("a Recall that fails quiets them for RECALL_BACKOFF_MS; a refused input does not", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.recallAnswer = { status: 400, body: { error: "no" } };
+    await $.tool.call({ tool: "WebSearch", query: "a" } as never);
+    seen.recallAnswer = "down";
+    await $.tool.call({ tool: "WebSearch", query: "b" } as never);
+    answers(seen);
+    const quiet = await $.tool.call({ tool: "WebSearch", query: "c" } as never);
+    expect(seen.recalls.map((r) => (r.body.input as any).query)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(quiet.context).toBeUndefined();
+    await clock.advance(RECALL_BACKOFF_MS);
+    const back = await $.tool.call({ tool: "WebSearch", query: "d" } as never);
+    expect(back.context).toEqual([LINE]);
+    seen.recallAnswer = { status: 429, body: {} };
+    await $.tool.call({ tool: "WebSearch", query: "e" } as never);
+    await $.tool.call({ tool: "WebSearch", query: "f" } as never);
+    expect(seen.recalls).toHaveLength(4);
   });
 });

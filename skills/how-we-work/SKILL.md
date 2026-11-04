@@ -14,6 +14,7 @@ A session is one conversation's work, from start to finish.
 - check at natural pauses, such as before a commit or a push, to pick up messages.
 - finish when you stop: an outcome and a summary for someone with no context (what was done, what was decided and why, what is left), and lessons for what you learned the hard way.
 - A session needs no ticket. File one only when your person asks or agrees, or when you must ask them something no ticket covers.
+- A small change still belongs to a ticket. A follow-up on an open ticket rides it as a todo: start(ticket, todo). The work your person asked for in this conversation, with no ticket that fits, gets a small ticket that start(file: "<title>") files in the same call, once a session, shown to them to object to; never for something you noticed on the way, which is filed and not started. start(small: true) says the change on your branch is a small one. A small change takes the light path while its pull request stays small, which devcorner reads from its diff (help("batches:small")).
 
 ## Planning
 
@@ -79,6 +80,8 @@ An Orchestrator Agent (OA) carries a list of tickets to their end by fixed rules
 - Propose one with run(action: "oa", mandate), show your person its restatement and refusals, and arm it with run(action: "confirm", id, agreed: true) only on their yes.
 - Give an OA only the tickets that can land before its end. For more, propose the next one with mandate: {after: "<its id>"}, which starts when it ends.
 - A merge train lands pull requests together: each is reviewed alone, the approved ones are stacked, the full checks run once at the train's head, and they land together. Your project's instructions say which checks are the full ones and who runs them.
+- Every change lands in a train, and a train of one is a train: an urgent fix forms its own, with the full checks at its head and one deploy. A train of only small changes forms too, so they never wait for a large one.
+- No change gets a QA run of its own: each member's touched end-to-end specs run in its train's touched run. A member that fails there is left out of the train, its ticket told the failure and brought up to its base, and the train runs its touched specs again at its new head and goes on, so one member never holds the rest and your person's signed check.
 - Bring a pull request up to its base by merging the base into its branch and a plain push, never a rebase and a forced push: a merge rewrites no commit that was reviewed.
 
 ## Waiting
