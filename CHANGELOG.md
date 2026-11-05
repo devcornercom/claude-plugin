@@ -2,6 +2,14 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.38.1 — 2026-11-05
+
+- Earlier-work lines that came late for a web search or fetch are dropped when a session starts or ends, so a new session never carries the last one's.
+
+## 0.38.0 — 2026-11-04
+
+- `/devcorner:how-we-work` is now revision 5. Its Documents part says that work on a ticket goes by its docs in devcorner at every step: its linked docs, its initiative's designs and decisions and the project's official docs, which start lists under Built against or Judge against, read before you plan, build, fix, test, review and close, and kept in check. Its Reviews part says a review names the docs it read in its verdict, and raises a disagreement between the change and a doc as a finding naming the doc and its section.
+
 ## 0.37.0 — 2026-11-04
 
 - Earlier work before research. Before a web search, a page fetch or a subagent's spawn, the plugin asks devcorner whether you or your team worked on this before: a ticket declined with its why, a decision, the research behind it. When devcorner's judge finds work that answers it, one line goes to the model, `devcorner: earlier work on this, read it before you go on`, with up to three entries of ids, titles, outcomes and whys, never their bodies. A search or a fetch runs at once beside the ask, and the line comes after its result when the answer came by the time it ended or half a second after; one that came later comes after the window's next search, fetch or spawn result. A spawn waits up to 2 s, and the line ends the subagent's prompt, so it reads the work before it begins. devcorner never points one context window to the same item twice once a result of that window carried it; a subagent given the line in its prompt may be pointed to the same item once more on its own first search. A compaction or `/clear` starts over. A `devcorner:worker`, a fork and the status line setup are spawned with no line. With no token, a minute after devcorner failed to answer, or while another ask of the window's is on its way, nothing is asked and the tool runs as it was made. The tool's input goes to devcorner to search by and is never stored.

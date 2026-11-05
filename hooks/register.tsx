@@ -3747,6 +3747,9 @@ let wokeAt: number | null = null;
  */
 let wakingFor: string | null = null;
 
+/** Counts the sessions this module has seen begin or end: a late answer belongs to the one it was asked in (`keepLate`). */
+let sessionNo = 0;
+
 /** Whether a prompt the plugin submitted lately still waits for its turn to begin (`wokeAt`). */
 const settling = (now: number) =>
   wokeAt !== null && now - wokeAt < WAKE_SETTLE_MS;
@@ -3759,6 +3762,8 @@ function forgetSession(): void {
   failures = 0;
   wokeAt = null;
   wakingFor = null;
+  lateLines.clear();
+  sessionNo += 1;
 }
 
 /** How long the poll waits: sooner only while the session waits on its person. */
@@ -4507,9 +4512,17 @@ function answerOf<T>(
   });
 }
 
-/** Keeps a web call's late answer for its window's next result. */
-const keepLate = (window: string) => (late: Recalled) =>
-  lateLines.set(window, [...(lateLines.get(window) ?? []), late]);
+/**
+ * Keeps a web call's late answer for its window's next result. `asked` is the
+ * session count as of when the recall was asked.
+ */
+const keepLate = (window: string, asked: number) => {
+  return (late: Recalled) => {
+    // An answer that comes after its session ended is no one's.
+    if (asked !== sessionNo) return;
+    lateLines.set(window, [...(lateLines.get(window) ?? []), late]);
+  };
+};
 
 /**
  * A tool's result with devcorner's lines after it, for the model alone: those
@@ -4743,13 +4756,14 @@ export const register: Register = (on) => {
   // and a tool is never run a second time.
   on("tool.call", { tool: RECALL_WEB }, async ($, e, next) => {
     const window = e.agentId ?? "";
+    const session = sessionNo;
     const asked = recallFor($, e);
     const ran = await next(e);
     const recalled = await answerOf(
       $,
       asked,
       RECALL_AFTER_MS,
-      keepLate(window),
+      keepLate(window, session),
     );
     return deliver($, ran, window, recalled);
   });

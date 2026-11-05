@@ -6726,6 +6726,43 @@ describe("earlier work before research: a search, a fetch or a spawn asks devcor
     expect(after.context).toBeUndefined();
   });
 
+  test("a late line is dropped when the session ends, and not carried to the next", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.recallAnswer = "held";
+    const first = $.tool.call({
+      tool: "WebSearch",
+      query: "channels",
+    } as never);
+    const second = $.tool.call({
+      tool: "WebFetch",
+      url: "https://b.test",
+    } as never);
+    await clock.settle();
+    await clock.advance(RECALL_AFTER_MS);
+    await Promise.all([first, second]);
+    seen.heldRecalls[0]!({
+      status: 200,
+      body: { context: LINE, items: ITEMS },
+    });
+    await clock.settle();
+    await $.session.end({
+      reason: "other",
+      sessionId: "conversation-1",
+      resume: { id: "conversation-1" },
+    });
+    // An answer that comes after the session ended is dropped too.
+    seen.heldRecalls[1]!({
+      status: 200,
+      body: { context: LINE, items: ITEMS },
+    });
+    await clock.settle();
+    seen.recallAnswer = { status: 200, body: { context: null } };
+    const next = await $.tool.call({ tool: "WebSearch", query: "c" } as never);
+    expect(next.context).toBeUndefined();
+    await clock.settle();
+    expect(seen.deliveries).toEqual([]);
+  });
+
   test("a subagent's prompt ends with the line, and nothing is marked for either window", async ($, on) => {
     const { clock, seen } = world(on, { tools: true });
     answers(seen);

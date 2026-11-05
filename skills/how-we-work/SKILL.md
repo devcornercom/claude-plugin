@@ -106,6 +106,7 @@ A review loop has grades, a ledger and a budget, so it ends.
 - Three rounds, five where the change touches security, permissions, sign-in, data loss or concurrency. Past the budget, or with a finding disputed twice, your person decides. Running out is never an approval.
 - A fix takes the smallest change that does it, and prefers deleting or narrowing code to a new guard, option or helper. What is outside the ticket is a follow-up, not a fix.
 - A review is by a session that did not write the change. Passing tests, a green check and the author's own reading are not a review.
+- A review judges the change against the docs its start lists under Judge against, not the code alone, and names the docs it read in its verdict. A disagreement between the change and a doc is a finding like any other, graded as usual, with doc set to the document's id and where to its section, saying which is wrong; a doc the change leaves stale gets a finding to update it, done in devcorner by the fix round or the docs step at finish.
 - A fix round goes to a fresh run with the whole brief: the ticket, every later decision, and the findings still open at the head it starts from.
 
 ## Questions
@@ -124,6 +125,7 @@ Docs come in two layers.
 - Working docs are research, designs, plans and notes. They are live documents: keep them in devcorner with doc, not as files in the repo, give each its project, link it to its initiative or task, and change it in place with section or append.
 - Official docs describe what is built, and live on the project or the workspace. By default a project has an Overview (what it is, its goals, where it stands), an Architecture (as built) and a Runbook (how to run, deploy and test it). A workspace has an Overview of its projects and a Glossary. The workspace or project may add to that set, drop from it or rename it. When a repo keeps its own docs, such as docs/architecture/, devcorner points to them and never copies them.
 - Fold a design when it describes what was built: move what lasts into the official doc, then archive the design.
+- Work on a ticket goes by its docs in devcorner, through every step: its linked docs, its initiative's designs and decisions, and the project's official docs, which start lists under Built against or Judge against. Most of a project's docs live in devcorner, not in the repo, so work that reads only the repo misses the design it was built from. Read them before you plan or propose, build and fix against them, test and review against them, and at the close check them against what shipped. Where the change and a doc disagree, say which is wrong: a build or a fix updates the doc in devcorner with doc(id, section), or reports it; nothing passes unsaid.
 - Reviewing and reorganising docs is a session's work, on demand, under a ticket like any other. There is no scheduled check.
 - A team's own instructions may say otherwise, and the narrower scope wins.
 - A ticket's description stays as filed: progress, findings and answers go on it as comments, follow-ups as sub-tickets.
