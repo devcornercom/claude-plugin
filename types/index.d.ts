@@ -38,6 +38,14 @@ export type Status = {
    */
   paused?: { with: string; wakes: number } | null;
   /**
+   * The messages from another of the person's conversations that the loop
+   * cap holds for this one, oldest first: each message, the conversation it
+   * came from, and the wakes between the two that held it. The row says it
+   * waits and why until the person's next typed turn in either releases it.
+   * Absent from an older devcorner.
+   */
+  held?: { message: string; from: string; wakes: number }[];
+  /**
    * The newest paste a session of this conversation wrote, still kept
    * (dc-t490), which /dc names to copy; null when none is. Absent from an
    * older devcorner.
@@ -327,7 +335,7 @@ export type StatusLinks = {
 export type StatusWake = {
   /** The message, such as acme-m42 or me-m42. */
   id: string;
-  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), another of its person's sessions replying to what woke it or answering their ask ("reply", dc-t585, dc-t611, `item` the conversation it was sent from), or an OA it gave with news it must act on ("oa": asking its person, dc-t576, `item` the question; its mind's stop, its end or a checkpoint, dc-t536, `item` the OA). */
+  /** Its own person's word, another member's, devcorner's GitHub App's notice, a run it asked for or an OA it gave sent or one dispatched to it, another of its person's sessions on their word ("relay", dc-t312, `item` the conversation it was sent from), another of its person's sessions replying to what woke it or answering their ask ("reply", dc-t585, dc-t611, `item` the conversation it was sent from), another of its person's sessions on its own, not on their word ("agent", `item` the conversation it was sent from), or an OA it gave with news it must act on ("oa": asking its person, dc-t576, `item` the question; its mind's stop, its end or a checkpoint, dc-t536, `item` the OA). */
   from:
     | "person"
     | "member"
@@ -335,6 +343,7 @@ export type StatusWake = {
     | "run"
     | "relay"
     | "reply"
+    | "agent"
     | "oa"
     | (string & {});
   /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, from an OA "asked", "mind-stopped", "ended" or "checkpoint", or from a reply "message", or "answer" for an answer to its person's ask (dc-t611). */

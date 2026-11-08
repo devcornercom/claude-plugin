@@ -2,6 +2,11 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.39.0 — 2026-11-08
+
+- A message from another of your own sessions, sent on its own rather than on your word, wakes this window too, and its wake says so: `dc-h3 sent this` to you, and `a message dc-h3 sent on its own, not on your user's word` to the agent, so it weighs it as a teammate's word. devcorner says `wake sent` in a send's reply and in `show` until the woken turn's first hook event hands the message. When two of your windows have woken each other 4 times since you last typed in either, the next message between them is held rather than waking, and the row says so, `me-m9 from me-h4 held after 4 wakes · type to release`, until you type in either window, which releases it.
+- The `devcorner:worker` agent has devcorner keep the model and effort it runs with on its run. The note it already posts after it echoes `$CLAUDE_EFFORT` and names its model passes both as `ran` too, such as `ran: { model: "claude-opus-5-5", effort: "xhigh" }`, leaving effort out when the variable is empty. devcorner keeps them as what the run ran on, beside the model and effort it asked for: `show`, the run's page and the list of runs say "ran claude-opus-5-5 at xhigh, by its worker's word", and `find` reaches the run by that model. The words are devcorner's own, the same its cloud worker's and its dispatched worker's steps give.
+
 ## 0.38.1 — 2026-11-05
 
 - Earlier-work lines that came late for a web search or fetch are dropped when a session starts or ends, so a new session never carries the last one's.

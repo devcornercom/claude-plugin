@@ -153,6 +153,14 @@ export function wakeWords(
       ? `${from ?? "another conversation"} answered ${your} ask`
       : `${from ?? "another conversation"} replied`;
   }
+  // Another of the person's sessions on its own, not on their word: named
+  // by the conversation it was sent from, as a reply is.
+  if (w.from === "agent") {
+    const from = item && CONVERSATION.test(item) ? item : null;
+    return reader === "person"
+      ? `${from ?? "another conversation"} sent this`
+      : `a message ${from ? `${from} sent` : "sent"} on its own, not on ${your} word`;
+  }
   // An OA the session gave, with news it must act on: asking its person a
   // question (dc-t576), named by the question; its mind's stop, its end or a
   // checkpoint that waits on the person's go (dc-t536), named by the OA.
@@ -599,7 +607,8 @@ const windowName = (s: Status): string | null =>
  * conversation works as opens that session's page; and "waiting N" opens the
  * inbox of the repo's place, said only while something waits there, "2+" or
  * "?" with a part of devcorner unread (dc-t137). A part devcorner named no
- * page for is plain.
+ * page for is plain. A message the loop cap holds for this conversation
+ * comes last, in plain text (`heldLine`), until a typed turn releases it.
  *
  * The window's label (dc-t589), the conversation's `/dc name` else its
  * machine and place, comes first, in plain text, then the id: "devcorner ·
@@ -616,10 +625,13 @@ export function rowSegments(s: Status, columns?: number): Segment[] {
   const id = s.session
     ? [piece(" · "), piece(shortSession(s.session.id), s.links?.session)]
     : [];
-  const waiting =
-    s.waiting > 0 || unreadOf(s).length > 0
+  const held = heldLine(s);
+  const waiting = [
+    ...(s.waiting > 0 || unreadOf(s).length > 0
       ? [piece(" · "), piece(`waiting ${waitingCount(s)}`, s.links?.inbox)]
-      : [];
+      : []),
+    ...(held === null ? [] : [piece(" · "), piece(held)]),
+  ];
   const room = sizeOf(columns);
   const fixed = cells(BULLET) + cells(lineText([head, ...id, ...waiting]));
   /** The words cut to the room left after the rest and `before`, which comes before them. */
@@ -915,6 +927,27 @@ export function pausedLine(s: Status): string | null {
   const wakes =
     Number.isInteger(paused.wakes) && paused.wakes > 0 ? paused.wakes : null;
   return `${here} ↔ ${paused.with} paused${wakes === null ? "" : ` after ${wakes} wakes`}, type to continue`;
+}
+
+/**
+ * The newest message the loop cap holds for this conversation, as the row
+ * says it: "me-m9 from me-h4 held after 4 wakes · type to release", with
+ * "(+1)" for each other held. Its person's next typed turn in either
+ * conversation releases it. Ids of a message's and a conversation's shape
+ * alone; null when none is held, or an older devcorner says nothing of it.
+ */
+export function heldLine(s: Status): string | null {
+  const held = (s.held ?? []).filter(
+    (h) => MESSAGE.test(h.message) && CONVERSATION.test(h.from),
+  );
+  const last = held.at(-1);
+  if (last === undefined) return null;
+  const wakes =
+    Number.isInteger(last.wakes) && last.wakes > 0
+      ? ` after ${last.wakes} wakes`
+      : "";
+  const more = held.length > 1 ? ` (+${held.length - 1})` : "";
+  return `${last.message} from ${last.from} held${wakes}${more} · type to release`;
 }
 
 /** A ticket after its label: its id, as wide as `width`, then its title. */

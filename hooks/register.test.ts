@@ -51,6 +51,7 @@ import {
   wakeToast,
   wakeWords,
   pausedLine,
+  heldLine,
   turnBy,
   DUE_EVERY_MS,
   DUE_POINTS,
@@ -1013,6 +1014,16 @@ describe("what a wake names (dc-t204)", () => {
       ],
       [w("person", "answer"), "your answer", "your user's answer"],
       [w("person", "message"), "your message", "your user's message"],
+      [
+        w("agent", "message", "dc-h3"),
+        "dc-h3 sent this",
+        "a message dc-h3 sent on its own, not on your user's word",
+      ],
+      [
+        w("agent", "message"),
+        "another conversation sent this",
+        "a message sent on its own, not on your user's word",
+      ],
       [
         w("member", "github-comment", "acme/shop#9", "bea-k"),
         "GitHub — @bea-k on #9",
@@ -5036,6 +5047,29 @@ describe("a relay on your word, and who started a turn (dc-t312, part 4)", () =>
     );
     // An older devcorner says nothing of it.
     expect(pausedLine(WHOLE)).toBe(null);
+  });
+
+  test("the row names a message the loop cap holds, with why, until a typed turn releases it", () => {
+    const held = (
+      ...list: { message: string; from: string; wakes: number }[]
+    ): Status => ({ ...WHOLE, held: list });
+    const one = { message: "me-m9", from: "me-h4", wakes: 4 };
+    expect(heldLine(held(one))).toBe(
+      "me-m9 from me-h4 held after 4 wakes · type to release",
+    );
+    expect(row(held(one))).toBe(
+      `${row(WHOLE)} · me-m9 from me-h4 held after 4 wakes · type to release`,
+    );
+    // The newest, and how many more.
+    expect(
+      heldLine(held(one, { message: "acme-m3@acme", from: "me-h5", wakes: 4 })),
+    ).toBe("acme-m3@acme from me-h5 held after 4 wakes (+1) · type to release");
+    // Only ids of their shape reach the row.
+    expect(heldLine(held({ ...one, from: "<b>" }))).toBe(null);
+    expect(heldLine(held({ ...one, message: "rm -rf" }))).toBe(null);
+    // None held, or an older devcorner that says nothing of it.
+    expect(heldLine(held())).toBe(null);
+    expect(heldLine(WHOLE)).toBe(null);
   });
 
   test("each turn's start posts Turn: by the person typed or by /dc, by the wake for its message", async ($, on) => {
