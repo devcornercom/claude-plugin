@@ -18,6 +18,8 @@ import {
   RECALL_FIELD_MAX,
   RECALL_WAIT_MS,
   recallInput,
+  autoMemoryLookup,
+  LOCAL_MEMORY_LINE,
   STARTER,
   FINISHER,
   DEVCORNER_TOOL,
@@ -1334,6 +1336,18 @@ function world(
     deliveries: [] as Record<string, unknown>[],
     /** The Recalls held open while `recallAnswer` is "held", answered by the test. */
     heldRecalls: [] as ((answer: { status: number; body: unknown }) => void)[],
+    /** What each Memory carried, with its token and the repo it named, and how devcorner answers it. */
+    memories: [] as {
+      body: Record<string, unknown>;
+      token: string;
+      repo: string | undefined;
+    }[],
+    memoryAnswer: { status: 200, body: { context: null } as unknown } as
+      | { status: number; body: unknown }
+      | "down"
+      | "held",
+    /** The Memory asks held open while `memoryAnswer` is "held", answered by the test. */
+    heldMemories: [] as ((answer: { status: number; body: unknown }) => void)[],
   };
   const answer401 = {
     value: { status: 401, ok: false, headers: {}, text: "{}" },
@@ -1446,6 +1460,25 @@ function world(
             )
           : seen.recallAnswer;
       if (answer === "down") return { deny: "unreachable" };
+      return reply(answer.status, answer.body);
+    }
+    if (sent.hook_event_name === "Memory") {
+      const headers = (e.init?.headers ?? {}) as Record<string, string>;
+      seen.memories.push({
+        body: sent,
+        token: bearer,
+        repo: headers["X-Devcorner-Repo"],
+      });
+      const answer =
+        seen.memoryAnswer === "held"
+          ? await new Promise<{ status: number; body: unknown }>((resolve) =>
+              seen.heldMemories.push(resolve),
+            )
+          : seen.memoryAnswer;
+      if (answer === "down") return { deny: "unreachable" };
+      if (answer.status === 204) {
+        return { value: { status: 204, ok: true, headers: {}, text: "" } };
+      }
       return reply(answer.status, answer.body);
     }
     if (sent.hook_event_name === "Capacity") {
@@ -6944,5 +6977,210 @@ describe("earlier work before research: a search, a fetch or a spawn asks devcor
     await $.tool.call({ tool: "WebSearch", query: "e" } as never);
     await $.tool.call({ tool: "WebSearch", query: "f" } as never);
     expect(seen.recalls).toHaveLength(4);
+  });
+});
+
+describe("a lookup in Claude Code's own memory asks devcorner's Memory", () => {
+  const MEMORIES =
+    'devcorner: you are reading your own memory on this machine. devcorner\'s memory below is the shared one.\nMemory for acme/shop (1), widest scope first. Follow it:\n  me-d1  me · every repo · fact  "Use pnpm"';
+  const NOTE = "/Users/ann/.claude/projects/-work-shop/memory/pnpm.md";
+  const answersMemories = (seen: { memoryAnswer: unknown }) => {
+    seen.memoryAnswer = {
+      status: 200,
+      body: { context: MEMORIES, items: ["me-d1"] },
+    };
+  };
+
+  test("is a read of a file under the auto-memory folder, a grep or glob there, or a write or edit of a file there, and nothing else", () => {
+    for (const call of [
+      { tool: "Read", file_path: NOTE },
+      { tool: "Read", file_path: "/Users/ann/.claude/projects/x/memory" },
+      { tool: "Grep", pattern: "pnpm", path: "~/.claude/projects/x/memory/" },
+      {
+        tool: "Grep",
+        pattern: "pnpm",
+        glob: "~/.claude/projects/*/memory/*.md",
+      },
+      { tool: "Glob", pattern: "~/.claude/projects/*/memory/*.md" },
+      {
+        tool: "Glob",
+        pattern: "*.md",
+        path: "C:\\Users\\ann\\.claude\\projects\\x\\memory",
+      },
+      // The pattern read from the path.
+      {
+        tool: "Glob",
+        pattern: "memory/**/*.md",
+        path: "/Users/ann/.claude/projects/-work-shop",
+      },
+    ]) {
+      expect(autoMemoryLookup(call), JSON.stringify(call)).toBe("read");
+    }
+    expect(autoMemoryLookup({ tool: "Write", file_path: NOTE })).toBe("write");
+    expect(autoMemoryLookup({ tool: "Edit", file_path: NOTE })).toBe("write");
+    for (const call of [
+      { tool: "Read", file_path: "/work/shop/src/memory/cache.ts" },
+      { tool: "Read", file_path: "/Users/ann/.claude/projects/x/notes.md" },
+      {
+        tool: "Read",
+        file_path: "/work/shop/docs/my.claude/projects/x/memory/a.md",
+      },
+      { tool: "Grep", pattern: ".claude/projects/x/memory/" },
+      { tool: "Grep", pattern: "pnpm", glob: "**/*.ts" },
+      { tool: "Read" },
+      { tool: "Bash", command: `cat ${NOTE}` },
+      { tool: "WebFetch", url: `file://${NOTE}` },
+    ]) {
+      expect(autoMemoryLookup(call), JSON.stringify(call)).toBe(null);
+    }
+  });
+
+  test("a read runs as it was made, and its result carries devcorner's memories, marked once it carried them; nothing of the path is sent", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    answersMemories(seen);
+    const ran = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(seen.toolCalls).toEqual([
+      { tool: "Read", tool_use_id: expect.any(String), file_path: NOTE },
+    ]);
+    expect(ran.text).toBe(seen.toolText);
+    expect(ran.context).toEqual([MEMORIES]);
+    expect(seen.memories).toEqual([
+      {
+        body: { hook_event_name: "Memory", session_id: "conversation-1" },
+        token: "dch_test",
+        repo: "git@github.com:acme/shop.git",
+      },
+    ]);
+    await clock.settle();
+    expect(seen.deliveries).toEqual([
+      {
+        hook_event_name: "Recall",
+        delivered: true,
+        session_id: "conversation-1",
+        items: ["me-d1"],
+      },
+    ]);
+  });
+
+  test("two reads in parallel share one ask, and one result carries the list", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.memoryAnswer = "held";
+    const first = $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    const second = $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    await clock.settle();
+    expect(seen.memories).toHaveLength(1);
+    expect(seen.toolCalls).toHaveLength(2);
+    seen.heldMemories[0]!({
+      status: 200,
+      body: { context: MEMORIES, items: ["me-d1"] },
+    });
+    const [a, b] = await Promise.all([first, second]);
+    const carried = [a.context, b.context].filter((c) => c !== undefined);
+    expect(carried).toHaveLength(1);
+    expect(carried[0]).toEqual([MEMORIES]);
+    await clock.settle();
+    expect(seen.deliveries).toHaveLength(1);
+    expect(seen.deliveries[0]!.items).toEqual(["me-d1"]);
+  });
+
+  test("a write or an edit there carries the module's line that it stays on this machine, asking devcorner nothing, with no token too", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, token: false });
+    const wrote = await $.tool.call({
+      tool: "Write",
+      file_path: NOTE,
+      content: "x",
+      agentId: "agent-1",
+    } as never);
+    expect(wrote.context).toEqual([LOCAL_MEMORY_LINE]);
+    const edited = await $.tool.call({
+      tool: "Edit",
+      file_path: NOTE,
+      old_string: "x",
+      new_string: "y",
+    } as never);
+    expect(edited.context).toEqual([LOCAL_MEMORY_LINE]);
+    expect(seen.toolCalls).toHaveLength(2);
+    await clock.settle();
+    expect(seen.memories).toEqual([]);
+    expect(seen.deliveries).toEqual([]);
+  });
+
+  test("a subagent's read names it", async ($, on) => {
+    const { seen } = world(on, { tools: true });
+    answersMemories(seen);
+    await $.tool.call({
+      tool: "Grep",
+      pattern: "pnpm",
+      path: "/Users/ann/.claude/projects/-work-shop/memory",
+      agentId: "agent-1",
+    } as never);
+    expect(seen.memories[0]!.body).toEqual({
+      hook_event_name: "Memory",
+      session_id: "conversation-1",
+      agent_id: "agent-1",
+    });
+  });
+
+  test("any other read, grep, glob, write or edit asks nothing", async ($, on) => {
+    const { seen } = world(on, { tools: true });
+    answersMemories(seen);
+    for (const call of [
+      { tool: "Read", file_path: "/work/shop/README.md" },
+      { tool: "Grep", pattern: "memory" },
+      { tool: "Glob", pattern: "**/*.ts" },
+      { tool: "Edit", file_path: "/work/shop/a.ts" },
+    ]) {
+      const ran = await $.tool.call(call as never);
+      expect(ran.context).toBeUndefined();
+    }
+    expect(seen.memories).toEqual([]);
+    expect(seen.toolCalls).toHaveLength(4);
+  });
+
+  test("an answer past the tool's end and RECALL_AFTER_MS is dropped and marks nothing, so the next read asks again", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.memoryAnswer = "held";
+    const call = $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    await clock.settle();
+    expect(seen.toolCalls).toHaveLength(1);
+    await clock.advance(RECALL_AFTER_MS);
+    expect((await call).context).toBeUndefined();
+    seen.heldMemories[0]!({
+      status: 200,
+      body: { context: MEMORIES, items: ["me-d1"] },
+    });
+    await clock.settle();
+    expect(seen.deliveries).toEqual([]);
+    answersMemories(seen);
+    const next = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(next.context).toEqual([MEMORIES]);
+  });
+
+  test("with no token nothing is sent and the tool runs as it was made", async ($, on) => {
+    const { seen } = world(on, { tools: true, token: false });
+    const ran = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(seen.memories).toEqual([]);
+    expect(seen.toolCalls).toHaveLength(1);
+    expect(ran.context).toBeUndefined();
+  });
+
+  test("devcorner down: the tool runs once with its own result, and every ask is quiet for RECALL_BACKOFF_MS; one from before the event, which answers 204, quiets none", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true });
+    seen.memoryAnswer = { status: 204, body: null };
+    const old = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(old.context).toBeUndefined();
+    seen.memoryAnswer = "down";
+    const down = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(down.text).toBe(seen.toolText);
+    expect(down.context).toBeUndefined();
+    expect(seen.toolCalls).toHaveLength(2);
+    answersMemories(seen);
+    await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    await $.tool.call({ tool: "WebSearch", query: "a" } as never);
+    expect(seen.memories).toHaveLength(2);
+    expect(seen.recalls).toEqual([]);
+    await clock.advance(RECALL_BACKOFF_MS);
+    const back = await $.tool.call({ tool: "Read", file_path: NOTE } as never);
+    expect(back.context).toEqual([MEMORIES]);
   });
 });

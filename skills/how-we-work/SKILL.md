@@ -114,8 +114,9 @@ A review loop has grades, a ledger and a budget, so it ends.
 Only the person a question is put to decides it; an agent proposes.
 
 - Ask on its ticket with question(action: "ask"). Ask only what is theirs to decide (a preference, a risk they carry, a cost they pay), at most 3 at once: each as one plain line of what they decide and what changes for them, then your recommendation, with the technical detail in context. Decide technical details yourself, list them in your document as decided unless they object, and say where in the ask's intro.
-- A subagent's question goes to its coordinator first, and to your person after about ten minutes. A run that cannot go on without the answer asks it and finishes partial, naming the question's id: it continues once they answer.
-- Going ahead without the answer means marking the option you built in the same step: question(action: "implement").
+- A question you put to your person blocks what it decides: never build an option they have not chosen. Do the work that does not depend on it, or finish partial naming the question's id; the run continues once they answer.
+- A subagent's question goes to its coordinator first, and to your person after about ten minutes. A coordinator answers only a question asked for it, with for: "coordinator", about the run's technical details. A question that is the person's it leaves open for them, never answers it for them and never tells the run to go ahead on its recommendation.
+- Only a question asked with blocking: false lets the work go past it, and then on the option that changes nothing they have to decide (no rule, contract, data, cost or risk of theirs), marked in the same step with question(action: "implement").
 - Pass agreed: true (a dispatch, a shared memory, an OA's confirm, an instruction) only once your person said yes.
 
 ## Documents
@@ -130,6 +131,7 @@ Docs come in two layers.
 - A team's own instructions may say otherwise, and the narrower scope wins.
 - A ticket's description stays as filed: progress, findings and answers go on it as comments, follow-ups as sub-tickets.
 - A short fact every later session should be given is a memory. One shared with the workspace needs your person's agreement.
+- devcorner's memory is the one home for what another session, a later run or your team should know: every session is given it, on any machine and in any harness. Your harness's own memory, such as Claude Code's auto memory, stays on one machine, where no other session reads it, so keep only private notes there and save the rest with memory. Nothing copies one into the other.
 
 ## Compaction
 

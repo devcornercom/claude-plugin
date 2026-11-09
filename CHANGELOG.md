@@ -2,6 +2,15 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.41.0 — 2026-11-09
+
+- `/devcorner:how-we-work` is now revision 7. Its Questions part says a question you put to your person blocks what it decides: never build an option they have not chosen; do the work that does not depend on it, or finish partial naming its id. A coordinator answers only a question asked for it, with `for: "coordinator"`, about the run's technical details; a question that is the person's it leaves open for them, never answering it for them nor telling the run to go ahead on its recommendation. Only a question asked with `blocking: false` lets the work go past it, on the option that changes nothing of theirs, marked with `question(action: "implement")`.
+
+## 0.40.0 — 2026-11-09
+
+- devcorner's memories beside Claude Code's own. When an agent reads a file in Claude Code's auto-memory folder (`~/.claude/projects/<project>/memory/`), or greps or globs there, the plugin adds devcorner's memories for the repo after the result, with their ids, scopes, kinds and text, as start lists them, so a lookup in the agent's own notes meets the team's shared memory too. A context window is given the list once, and again only when it holds a memory the window was not given; reads in one turn that run in parallel share one ask and one result carries the list; a compaction or `/clear` starts over. A write or edit of a file there is told, in one line the plugin adds itself, that the note stays on this machine, and to save it in devcorner with `memory` if another session or the team should know it. Nothing of the path or the file is sent. A read runs at once beside the ask; with no token, a minute after devcorner failed to answer, or an answer that comes more than half a second after the tool ends, its result is its own. Claude Code loads `MEMORY.md` itself at a conversation's start, which no hook sees, and a folder moved by `autoMemoryDirectory` or `CLAUDE_CONFIG_DIR` is not recognised.
+- `/devcorner:how-we-work` is now revision 6. Its Documents part says devcorner's memory is the one home for what another session, a later run or your team should know, and your harness's own memory, such as Claude Code's auto memory, holds private notes alone.
+
 ## 0.39.0 — 2026-11-08
 
 - A message from another of your own sessions, sent on its own rather than on your word, wakes this window too, and its wake says so: `dc-h3 sent this` to you, and `a message dc-h3 sent on its own, not on your user's word` to the agent, so it weighs it as a teammate's word. devcorner says `wake sent` in a send's reply and in `show` until the woken turn's first hook event hands the message. When two of your windows have woken each other 4 times since you last typed in either, the next message between them is held rather than waking, and the row says so, `me-m9 from me-h4 held after 4 wakes · type to release`, until you type in either window, which releases it.

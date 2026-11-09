@@ -4338,7 +4338,7 @@ export const RECALL_WEB = /^(?:WebSearch|WebFetch)$/;
 export const RECALL_WAIT_MS = 2_000;
 /** How long a web tool's result waits for an answer still on its way once the tool is done. */
 export const RECALL_AFTER_MS = 500;
-/** How long no Recall is asked after one failed: devcorner down, refused, or too many. */
+/** How long no Recall or Memory is asked after one failed: devcorner down, refused, or too many. */
 export const RECALL_BACKOFF_MS = 60_000;
 /** The most of any one field of a tool's input sent, in characters. */
 export const RECALL_FIELD_MAX = 2_000;
@@ -4352,7 +4352,7 @@ export const RECALL_FIELD_MAX = 2_000;
 const NO_RECALL_AGENT =
   /^(?:(?:[\w-]+:)?devcorner:worker|fork|statusline-setup)$/i;
 
-/** No Recall is asked before this time, after one failed. */
+/** No Recall or Memory is asked before this time, after one failed. */
 let recallQuietUntil = 0;
 /** The tool calls with a Recall on its way, by tool_use_id: each call asks its own. */
 const recalling = new Set<string>();
@@ -4420,44 +4420,185 @@ async function recallFor(
       recalling.add(key);
       mine = true;
     }
-    const repo = await repoIn($, await $.session.cwd()).catch(() => undefined);
-    const res = await $.http.fetch(`${await baseOf($)}/mcp/hooks/claude-code`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${held.token}`,
-        "content-type": "application/json",
-        ...(repo ? { "X-Devcorner-Repo": repo } : {}),
-      },
-      body: JSON.stringify({
-        hook_event_name: "Recall",
-        session_id: await $.session.id(),
-        ...(call.agentId ? { agent_id: call.agentId } : {}),
-        ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}),
-        ...asked,
-      }),
+    return await askLine($, held.token, {
+      hook_event_name: "Recall",
+      session_id: await $.session.id(),
+      ...(call.agentId ? { agent_id: call.agentId } : {}),
+      ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}),
+      ...asked,
     });
-    if (!res.ok) {
-      // A refused input is this call's alone; anything else waits a minute.
-      if (res.status !== 400) await quietRecalls($);
-      return null;
-    }
-    const answer = JSON.parse(res.text) as {
-      context?: unknown;
-      items?: unknown;
-    };
-    if (typeof answer?.context !== "string" || !answer.context.trim()) {
-      return null;
-    }
-    const items = Array.isArray(answer.items)
-      ? answer.items.filter((item): item is string => typeof item === "string")
-      : [];
-    return { line: answer.context, items };
   } catch {
     await quietRecalls($);
     return null;
   } finally {
     if (mine) recalling.delete(key);
   }
+}
+
+/**
+ * Posts one ask of the hook route's that devcorner answers with a line for
+ * the model and the ids it points to (`Recall`, `Memory`), with this
+ * machine's token and the folder's repo: the line and its ids, or null when
+ * devcorner has nothing to add or refused. A refusal other than of a bad
+ * input quiets every ask for RECALL_BACKOFF_MS; a failure throws, for the
+ * caller to quiet them.
+ */
+async function askLine(
+  $: Engine,
+  token: string,
+  body: Record<string, unknown>,
+): Promise<Recalled | null> {
+  const res = await postHook($, token, body);
+  // A devcorner from before the event answers 204, with nothing.
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    // A refused input is this call's alone; anything else waits a minute.
+    if (res.status !== 400) await quietRecalls($);
+    return null;
+  }
+  const answer = JSON.parse(res.text) as {
+    context?: unknown;
+    items?: unknown;
+  };
+  if (typeof answer?.context !== "string" || !answer.context.trim()) {
+    return null;
+  }
+  const items = Array.isArray(answer.items)
+    ? answer.items.filter((item): item is string => typeof item === "string")
+    : [];
+  return { line: answer.context, items };
+}
+
+/** Posts a hook route event with this machine's token and the folder's repo, as `Recall` and `Memory` send them. */
+async function postHook(
+  $: Engine,
+  token: string,
+  body: Record<string, unknown>,
+) {
+  const repo = await repoIn($, await $.session.cwd()).catch(() => undefined);
+  return $.http.fetch(`${await baseOf($)}/mcp/hooks/claude-code`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      ...(repo ? { "X-Devcorner-Repo": repo } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * The tools an agent uses on Claude Code's own memory, its auto memory: a
+ * folder of Markdown files read with Read, Grep and Glob and written with
+ * Write and Edit. Its index, MEMORY.md, is loaded by Claude Code itself as a
+ * conversation starts, which no hook sees.
+ */
+export const AUTO_MEMORY_TOOL = /^(?:Read|Grep|Glob|Write|Edit)$/;
+
+/**
+ * A path in Claude Code's auto-memory folder,
+ * `~/.claude/projects/<project>/memory/`, with `~` expanded or not, a glob's
+ * wildcard for the project, and either separator. A folder moved by
+ * `autoMemoryDirectory` or `CLAUDE_CONFIG_DIR` is not matched.
+ */
+const AUTO_MEMORY_PATH =
+  /(?:^|[\\/])\.claude[\\/]projects[\\/][^\\/]+[\\/]memory(?:[\\/]|$)/;
+
+/**
+ * Whether a tool call looks in Claude Code's own memory ("read": a Read of a
+ * file there, a Grep whose path or glob is there, a Glob under it, its pattern
+ * read from its path) or writes there ("write": a Write or an Edit of a file
+ * there), else null. Only the path decides: nothing of it is sent.
+ */
+export function autoMemoryLookup(call: {
+  tool: string;
+  [argument: string]: unknown;
+}): "read" | "write" | null {
+  const text = (name: string) =>
+    typeof call[name] === "string" ? (call[name] as string) : "";
+  const inMemory = (...paths: string[]) =>
+    paths.some((path) => AUTO_MEMORY_PATH.test(path));
+  if (call.tool === "Read") return inMemory(text("file_path")) ? "read" : null;
+  if (call.tool === "Grep") {
+    return inMemory(text("path"), text("glob")) ? "read" : null;
+  }
+  if (call.tool === "Glob") {
+    const pattern = text("pattern");
+    const path = text("path");
+    return inMemory(path, pattern, path && `${path}/${pattern}`)
+      ? "read"
+      : null;
+  }
+  if (call.tool === "Write" || call.tool === "Edit") {
+    return inMemory(text("file_path")) ? "write" : null;
+  }
+  return null;
+}
+
+/**
+ * The line a write or an edit in Claude Code's own memory is given, from the
+ * module itself: it needs nothing of devcorner's, so it is said with no
+ * token too, as in a cloud session, and never comes too late for its result.
+ */
+export const LOCAL_MEMORY_LINE =
+  "devcorner: this note stays in your own memory on this machine, where no other session, run or teammate reads it. If another session or your team should know it, save it in devcorner too: memory(title, kind, owner, reach).";
+
+/**
+ * Asks the hook route's `Memory` for devcorner's memories at a lookup in
+ * Claude Code's own memory: their line and ids, which the window is not
+ * given again once a result of it carried them (`deliver`). Fails open as
+ * `recallFor` does: no token, quiet after a failure, or any error, and the
+ * answer is null.
+ */
+async function askMemory(
+  $: Engine,
+  call: { agentId?: string },
+): Promise<Recalled | null> {
+  try {
+    if ((await $.clock.now()) < recallQuietUntil) return null;
+    const held = await tokenOf($);
+    if (!held) return null;
+    return await askLine($, held.token, {
+      hook_event_name: "Memory",
+      session_id: await $.session.id(),
+      ...(call.agentId ? { agent_id: call.agentId } : {}),
+    });
+  } catch {
+    await quietRecalls($);
+    return null;
+  }
+}
+
+/** The Memory asks on their way, by window: reads that run in parallel share one. */
+const memoryAsks = new Map<string, Promise<Recalled | null>>();
+/** The Memory answers a result has carried: a shared ask's line goes to one result. */
+const memoryCarried = new WeakSet<Recalled>();
+
+/**
+ * The answer to a lookup in Claude Code's own memory, asked once for a
+ * window: reads that run in parallel share the ask, and only the first result
+ * that gets the answer carries its line, so a window is given devcorner's
+ * memories once.
+ */
+function memoryFor(
+  $: Engine,
+  call: { agentId?: string },
+): Promise<Recalled | null> {
+  const window = call.agentId ?? "";
+  const onWay = memoryAsks.get(window);
+  if (onWay) return onWay;
+  const asked = askMemory($, call).finally(() => {
+    memoryAsks.delete(window);
+  });
+  memoryAsks.set(window, asked);
+  return asked;
+}
+
+/** The answer a result is to carry, or null when another result of its window already did. */
+function carryMemory(answer: Recalled | null): Recalled | null {
+  if (answer === null || memoryCarried.has(answer)) return null;
+  memoryCarried.add(answer);
+  return answer;
 }
 
 /**
@@ -4473,21 +4614,12 @@ async function delivered(
   try {
     const held = await tokenOf($);
     if (!held || items.length === 0) return;
-    const repo = await repoIn($, await $.session.cwd()).catch(() => undefined);
-    await $.http.fetch(`${await baseOf($)}/mcp/hooks/claude-code`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${held.token}`,
-        "content-type": "application/json",
-        ...(repo ? { "X-Devcorner-Repo": repo } : {}),
-      },
-      body: JSON.stringify({
-        hook_event_name: "Recall",
-        delivered: true,
-        session_id: await $.session.id(),
-        ...(window ? { agent_id: window } : {}),
-        items,
-      }),
+    await postHook($, held.token, {
+      hook_event_name: "Recall",
+      delivered: true,
+      session_id: await $.session.id(),
+      ...(window ? { agent_id: window } : {}),
+      items,
     });
   } catch {
     // Unsaid is safe.
@@ -4814,6 +4946,36 @@ export const register: Register = (on) => {
         ? await next(e)
         : await next({ ...e, prompt: `${e.prompt}\n\n${recalled.line}` });
     return deliver($, ran, window, null);
+  });
+
+  // Claude Code's own memory: a read, grep or glob of its auto-memory folder
+  // runs at once beside devcorner's Memory, and its result carries
+  // devcorner's memories when the answer came by the tool's end or within
+  // RECALL_AFTER_MS of it; a write or an edit there carries the module's
+  // line that it stays on this machine, asking nothing. A late answer is
+  // dropped: nothing marked it seen, so the window's next read is given it.
+  // Any other call of these tools, nearly all of them, goes on at once,
+  // asking nothing. As for the web tools, the lookup is total, so there is
+  // no fallback that calls the tool again.
+  on("tool.call", { tool: AUTO_MEMORY_TOOL }, async ($, e, next) => {
+    const lookup = autoMemoryLookup(
+      e as Parameters<typeof autoMemoryLookup>[0],
+    );
+    if (lookup === null) return next(e);
+    const window = e.agentId ?? "";
+    if (lookup === "write") {
+      const ran = await next(e);
+      return deliver($, ran, window, { line: LOCAL_MEMORY_LINE, items: [] });
+    }
+    const asked = memoryFor($, e);
+    const ran = await next(e);
+    const answered = await answerOf($, asked, RECALL_AFTER_MS);
+    return deliver(
+      $,
+      ran,
+      window,
+      ran.deny === undefined ? carryMemory(answered) : null,
+    );
   });
 
   on("command.run", { command: "dc" }, async ($, e) => {
