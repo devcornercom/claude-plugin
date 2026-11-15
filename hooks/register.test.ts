@@ -54,6 +54,10 @@ import {
   wakeWords,
   pausedLine,
   heldLine,
+  turnedDownLine,
+  muteArgs,
+  mutedText,
+  senderId,
   turnBy,
   DUE_EVERY_MS,
   DUE_POINTS,
@@ -1027,6 +1031,11 @@ describe("what a wake names (dc-t204)", () => {
         "a message sent on its own, not on your user's word",
       ],
       [
+        w("chat", "message", "dc-h9"),
+        "dc-h9 (chat) sent this",
+        "a message dc-h9, a project chat, sent on its own, not on your user's word",
+      ],
+      [
         w("member", "github-comment", "acme/shop#9", "bea-k"),
         "GitHub — @bea-k on #9",
         "GitHub — @bea-k on #9",
@@ -1299,6 +1308,11 @@ function world(
     nameAnswer: { status: 200, body: {} as unknown } as
       | { status: number; body: unknown }
       | "down",
+    /** What each Mute carried, and how devcorner answers it. */
+    mutes: [] as { body: Record<string, unknown>; token: string }[],
+    muteAnswer: { status: 200, body: {} as unknown } as
+      | { status: number; body: unknown }
+      | "down",
     /** What each Machine carried (dc-t590), and how devcorner answers it. */
     machines: [] as { body: Record<string, unknown>; token: string }[],
     machineAnswer: { status: 200, body: {} as unknown } as
@@ -1411,6 +1425,14 @@ function world(
         return { value: { status: 204, ok: true, headers: {}, text: "" } };
       }
       return reply(seen.nameAnswer.status, seen.nameAnswer.body);
+    }
+    if (sent.hook_event_name === "Mute") {
+      seen.mutes.push({ body: sent, token: bearer });
+      if (seen.muteAnswer === "down") return { deny: "unreachable" };
+      if (seen.muteAnswer.status === 204) {
+        return { value: { status: 204, ok: true, headers: {}, text: "" } };
+      }
+      return reply(seen.muteAnswer.status, seen.muteAnswer.body);
     }
     if (sent.hook_event_name === "Machine") {
       seen.machines.push({ body: sent, token: bearer });
@@ -4620,6 +4642,112 @@ describe("/dc send: your own words to another conversation of yours (dc-t312)", 
   });
 });
 
+describe("a noisy sender turned down: the row, /dc mute, /dc quiet and /dc unmute", () => {
+  const said = (out: unknown) => (out as { text: string }).text;
+  const turned = (turnedDown: Status["turnedDown"]): Status => ({
+    ...WHOLE,
+    turnedDown,
+  });
+  const on = (from: string, level: "mute" | "quiet", family = false) => ({
+    from,
+    family,
+    level,
+    setAt: 0,
+    until: 60_000,
+  });
+
+  test("the row names what is turned down by short id, muted then quiet, a family's with a +", () => {
+    expect(turnedDownLine(WHOLE)).toBe(null);
+    expect(turnedDownLine(turned([]))).toBe(null);
+    const both = turned([
+      on("acme-s12@acme", "mute", true),
+      on("me-r3", "mute"),
+      on("all", "quiet"),
+    ]);
+    expect(turnedDownLine(both)).toBe("muted s12+, r3 · quiet all");
+    expect(row(both)).toBe(`${row(WHOLE)} · muted s12+, r3 · quiet all`);
+  });
+
+  test("its words: a sender, then a time and family in any order; minutes alone; refused words", () => {
+    // No time typed sends none: devcorner's own default lasts.
+    expect(muteArgs(" acme-s12 ")).toEqual({
+      from: "acme-s12",
+      family: false,
+    });
+    expect(muteArgs("acme-s12 family 1h30m")).toEqual({
+      from: "acme-s12",
+      minutes: 90,
+      family: true,
+    });
+    // The row shows short ids, so what the person types back is one.
+    expect(senderId("s12")).toBe("dc-s12");
+    expect(senderId("r3")).toBe("dc-r3");
+    expect(senderId("all")).toBe("all");
+    expect(senderId("acme-s12")).toBe("acme-s12");
+    expect(muteArgs("me-r3 45")).toMatchObject({ minutes: 45 });
+    expect(muteArgs("me-r3 2h")).toMatchObject({ minutes: 120 });
+    expect(muteArgs("")).toContain("Name who to turn down");
+    expect(muteArgs("me-r3 soon")).toContain('"soon" is neither a time');
+    expect(mutedText(204, null)).toBe(
+      "This devcorner does not take /dc mute yet, so nothing was changed.",
+    );
+    expect(mutedText(400, { error: "No such sender." })).toBe(
+      "devcorner did not change it: No such sender.",
+    );
+    expect(mutedText(200, { ok: true, text: "" })).toContain(
+      "Nothing is turned down",
+    );
+  });
+
+  test("/dc quiet posts Mute with the machine's token and says devcorner's words; /dc unmute lifts every one by default", async ($, on) => {
+    const { clock, seen } = world(on);
+    await $.session.start(START);
+    await clock.settle();
+    seen.muteAnswer = {
+      status: 200,
+      body: { ok: true, text: "Turned down: acme-s12 quiet, 30 min left." },
+    };
+    expect(
+      said(await $.command.run({ command: "dc", args: "quiet acme-s12 30m" })),
+    ).toBe("Turned down: acme-s12 quiet, 30 min left.");
+    expect(seen.mutes.at(-1)).toEqual({
+      body: {
+        hook_event_name: "Mute",
+        session_id: "conversation-1",
+        from: "acme-s12",
+        minutes: 30,
+        family: false,
+        level: "quiet",
+      },
+      token: "dch_test",
+    });
+    // A short id is sent whole, and a mute with no time names none.
+    await $.command.run({ command: "dc", args: "mute s12" });
+    expect(seen.mutes.at(-1)!.body).toEqual({
+      hook_event_name: "Mute",
+      session_id: "conversation-1",
+      from: "dc-s12",
+      family: false,
+      level: "mute",
+    });
+    await $.command.run({ command: "dc", args: "unmute s12" });
+    expect(seen.mutes.at(-1)!.body).toMatchObject({ lift: "dc-s12" });
+    await $.command.run({ command: "dc", args: "unmute" });
+    expect(seen.mutes.at(-1)!.body).toMatchObject({ lift: "all" });
+    await $.command.run({ command: "dc", args: "mutes" });
+    expect(seen.mutes.at(-1)!.body).toEqual({
+      hook_event_name: "Mute",
+      session_id: "conversation-1",
+    });
+    // A word that is no time asks devcorner nothing.
+    const asked = seen.mutes.length;
+    expect(
+      said(await $.command.run({ command: "dc", args: "mute acme-s12 soon" })),
+    ).toContain("is neither a time");
+    expect(seen.mutes.length).toBe(asked);
+  });
+});
+
 describe("this conversation in the row, and /dc name (dc-t312, part 5)", () => {
   const said = (out: unknown) => (out as { text: string }).text;
   const named = (name: string | null) => ({
@@ -5103,6 +5231,34 @@ describe("a relay on your word, and who started a turn (dc-t312, part 4)", () =>
     // None held, or an older devcorner that says nothing of it.
     expect(heldLine(held())).toBe(null);
     expect(heldLine(WHOLE)).toBe(null);
+  });
+
+  test("the row counts what the hour's wakes hold, which a typed turn hands", () => {
+    const over = (count: number): Status => ({
+      ...WHOLE,
+      session: {
+        ...WHOLE.session!,
+        overBudget: { count, newest: count === 0 ? null : "me-m9" },
+      },
+    });
+    expect(heldLine(over(3))).toBe(
+      "3 held · hour's wakes spent · type to release",
+    );
+    expect(row(over(3))).toBe(
+      `${row(WHOLE)} · 3 held · hour's wakes spent · type to release`,
+    );
+    expect(heldLine(over(0))).toBe(null);
+    // A conversation with no session says its own.
+    expect(
+      heldLine({
+        ...WHOLE,
+        session: null,
+        conversation: {
+          id: "me-h3",
+          overBudget: { count: 2, newest: "me-m4" },
+        },
+      }),
+    ).toBe("2 held · hour's wakes spent · type to release");
   });
 
   test("each turn's start posts Turn: by the person typed or by /dc, by the wake for its message", async ($, on) => {

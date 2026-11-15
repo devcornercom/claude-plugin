@@ -2,6 +2,23 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.45.0 — 2026-11-15
+
+- A tool call no longer waits on devcorner. When the hook after a tool call asks devcorner for new messages, it answers Claude Code at once (in about 10 ms, where it waited about 0.3 s for devcorner, 0.8 s at the slow end) and asks in the background. What comes back is given at the next tool call, or with the answer of the next prompt or of the turn's end, which wait for an ask still on its way (a turn the plugin already carried on is carried on again for it, as the tool call would have shown it); a subagent whose last tool call brought a message is held back from stopping once to read it. Tool calls that end together ask once. A Claude Code that does not know a background hook's answer waits as before.
+
+## 0.44.0 — 2026-11-15
+
+- `/dc mute <id> [30m] [family]` turns a noisy sender down for this window for a while: a session (with `family`, the sessions below it too), a run's sessions, a conversation, or `all`. Its messages never wake the window and are not handed; when the mute ends, or `/dc unmute <id>` (or `/dc unmute` for every one) lifts it, one message names how many came and their ids, at the end of a turn. `/dc quiet <id> [1h]` lets them in only at the end of a turn (the Stop hook), never on your typing or between tool calls, and never wakes the window. Your own word, a dispatch, a run's end, a question's news and an answer to something this window asked always come through. The line above the prompt names what is on, `muted s12+, r3 · quiet s9`, and `/dc mutes` says it with the time left; the short id it shows is what `/dc mute` and `/dc unmute` take (`s12` is `dc-s12`), and with no time typed devcorner's own 60 minutes last. An older devcorner answers that it does not take /dc mute yet.
+
+## 0.43.0 — 2026-11-15
+
+- Your standing instructions come in SessionStart hooks of their own, beside the briefing, when a conversation starts and after each compaction. Claude Code keeps 10,000 characters of each hook's context on its own, so the instructions no longer give way to what is in flight, the memories or the overview, and a set longer than one hook goes on in the next, up to three: a session gets the same set at its start and after a compaction. The plugin asks devcorner once for all; the instructions' hooks wait a few seconds at most for the first, and with an older devcorner, which answers one briefing, they add nothing.
+
+## 0.42.0 — 2026-11-15
+
+- A wake from one of your project chats says so: `dc-h9 (chat) sent this` to you, and `a message dc-h9, a project chat, sent on its own, not on your user's word` to the agent, so it weighs the coordinator's words as a teammate's.
+- The row says what waits without waking this window once its hour's wakes are spent: `3 held · hour's wakes spent · type to release`, until your next typed turn hands them. The loop cap's `held after 4 wakes` line stays only for an older devcorner, which still has it.
+
 ## 0.41.0 — 2026-11-09
 
 - `/devcorner:how-we-work` is now revision 7. Its Questions part says a question you put to your person blocks what it decides: never build an option they have not chosen; do the work that does not depend on it, or finish partial naming its id. A coordinator answers only a question asked for it, with `for: "coordinator"`, about the run's technical details; a question that is the person's it leaves open for them, never answering it for them nor telling the run to go ahead on its recommendation. Only a question asked with `blocking: false` lets the work go past it, on the option that changes nothing of theirs, marked with `question(action: "implement")`.

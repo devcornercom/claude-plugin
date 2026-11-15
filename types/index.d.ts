@@ -39,10 +39,10 @@ export type Status = {
   paused?: { with: string; wakes: number } | null;
   /**
    * The messages from another of the person's conversations that the loop
-   * cap holds for this one, oldest first: each message, the conversation it
-   * came from, and the wakes between the two that held it. The row says it
-   * waits and why until the person's next typed turn in either releases it.
-   * Absent from an older devcorner.
+   * cap held for this one, from a devcorner before the cap was removed:
+   * each message, the conversation it came from, and the wakes between the
+   * two that held it. Absent from a newer devcorner, which says what the
+   * hour's wakes hold as `StatusSession.overBudget`.
    */
   held?: { message: string; from: string; wakes: number }[];
   /**
@@ -78,6 +78,12 @@ export type Status = {
   links?: StatusLinks;
   /** The repo's Orchestrator Agent (OA), armed or paused (dc-t213); the field keeps its first name. Absent from an older devcorner. */
   overnight?: StatusOvernight | null;
+  /**
+   * What this conversation turned down that is on now (/dc mute, /dc quiet),
+   * each sender once, the soonest to end first: the row names them, and
+   * /dc unmute lifts one. Absent from an older devcorner.
+   */
+  turnedDown?: StatusMute[];
   /**
    * The repo's picture for /dc and /dc waits (dc-t218), when the plugin
    * asked for it (`expanded: true`); null otherwise. Absent from an older
@@ -141,6 +147,20 @@ export type StatusClaim = {
 
 /** A ticket the picture names, with its page. */
 export type StatusItem = { id: string; title: string; page: string | null };
+
+/**
+ * A sender this conversation turned down for a while: a session, a run, a
+ * conversation or "all"; `family` for the sessions below a session too;
+ * quiet (it never wakes, and comes only at a turn's end) or mute (never
+ * handed, named in one message once it ends); `until` in ms.
+ */
+export type StatusMute = {
+  from: string;
+  family: boolean;
+  level: "quiet" | "mute";
+  setAt: number;
+  until: number;
+};
 
 /**
  * A paste of this conversation's sessions (dc-t490), as Status names it: its
@@ -344,6 +364,7 @@ export type StatusWake = {
     | "relay"
     | "reply"
     | "agent"
+    | "chat"
     | "oa"
     | (string & {});
   /** "message", "answer", "comment", a question's event, "github-comment", "conflict", what a run ended as, "held" for an OA's run that waits for room, "dispatch" for a run dispatched to it, from an OA "asked", "mind-stopped", "ended" or "checkpoint", or from a reply "message", or "answer" for an answer to its person's ask (dc-t611). */
@@ -374,6 +395,8 @@ export type StatusConversation = {
   wakes?: StatusWake[];
   /** How many messages its next prompt's hook would hand it. */
   pending?: number;
+  /** The messages held past the hour's wakes for it: how many, and the newest. Absent from an older devcorner. */
+  overBudget?: { count: number; newest: string | null };
 };
 
 /** The live session the conversation works as. */
@@ -397,6 +420,12 @@ export type StatusSession = {
    * devcorner.
    */
   pending?: number;
+  /**
+   * The messages held past the hour's wakes for it and its conversation,
+   * which wake nothing until its person types: how many, and the newest.
+   * Absent from an older devcorner.
+   */
+  overBudget?: { count: number; newest: string | null };
 };
 
 declare module "claude-code" {

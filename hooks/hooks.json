@@ -7,6 +7,21 @@
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" SessionStart",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" SessionStart instructions 1",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" SessionStart instructions 2",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" SessionStart instructions 3",
+            "timeout": 10
           }
         ]
       }
@@ -38,7 +53,7 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" SubagentStop",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }
@@ -60,7 +75,7 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" UserPromptSubmit",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }
@@ -71,7 +86,7 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/devcorner.sh\" Stop",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }

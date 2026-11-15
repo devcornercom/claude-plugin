@@ -161,6 +161,14 @@ export function wakeWords(
       ? `${from ?? "another conversation"} sent this`
       : `a message ${from ? `${from} sent` : "sent"} on its own, not on ${your} word`;
   }
+  // A project chat of the person's, its coordinator on its own: named by
+  // the chat's conversation, never on the person's word.
+  if (w.from === "chat") {
+    const from = item && CONVERSATION.test(item) ? item : null;
+    return reader === "person"
+      ? `${from ?? "a project chat"} (chat) sent this`
+      : `a message ${from ? `${from}, a project chat,` : "a project chat"} sent on its own, not on ${your} word`;
+  }
   // An OA the session gave, with news it must act on: asking its person a
   // question (dc-t576), named by the question; its mind's stop, its end or a
   // checkpoint that waits on the person's go (dc-t536), named by the OA.
@@ -626,11 +634,13 @@ export function rowSegments(s: Status, columns?: number): Segment[] {
     ? [piece(" · "), piece(shortSession(s.session.id), s.links?.session)]
     : [];
   const held = heldLine(s);
+  const turned = turnedDownLine(s);
   const waiting = [
     ...(s.waiting > 0 || unreadOf(s).length > 0
       ? [piece(" · "), piece(`waiting ${waitingCount(s)}`, s.links?.inbox)]
       : []),
     ...(held === null ? [] : [piece(" · "), piece(held)]),
+    ...(turned === null ? [] : [piece(" · "), piece(turned)]),
   ];
   const room = sizeOf(columns);
   const fixed = cells(BULLET) + cells(lineText([head, ...id, ...waiting]));
@@ -930,13 +940,19 @@ export function pausedLine(s: Status): string | null {
 }
 
 /**
- * The newest message the loop cap holds for this conversation, as the row
- * says it: "me-m9 from me-h4 held after 4 wakes · type to release", with
- * "(+1)" for each other held. Its person's next typed turn in either
- * conversation releases it. Ids of a message's and a conversation's shape
- * alone; null when none is held, or an older devcorner says nothing of it.
+ * What waits without waking this conversation, as the row says it: the
+ * messages held past the hour's wakes, "3 held · hour's wakes spent · type
+ * to release", which its person's next typed turn hands. An older devcorner
+ * said the loop cap's held message instead: "me-m9 from me-h4 held after 4
+ * wakes · type to release", with "(+1)" for each other held. Ids of a
+ * message's and a conversation's shape alone; null when none is held.
  */
 export function heldLine(s: Status): string | null {
+  // A session's count holds its conversation's too; a conversation with no
+  // session says its own.
+  const over = (s.session?.overBudget ?? s.conversation?.overBudget)?.count;
+  if (Number.isInteger(over) && over! > 0)
+    return `${over} held · hour's wakes spent · type to release`;
   const held = (s.held ?? []).filter(
     (h) => MESSAGE.test(h.message) && CONVERSATION.test(h.from),
   );
@@ -948,6 +964,129 @@ export function heldLine(s: Status): string | null {
       : "";
   const more = held.length > 1 ? ` (+${held.length - 1})` : "";
   return `${last.message} from ${last.from} held${wakes}${more} · type to release`;
+}
+
+/**
+ * What this conversation turned down, as the row says it, by short id:
+ * "muted s12, r3 · quiet s9", a family's with a "+" ("muted s12+"), every
+ * sender as "all". Null when nothing is, or from an older devcorner.
+ */
+export function turnedDownLine(s: Status): string | null {
+  const on = (s.turnedDown ?? []).filter(
+    (v) =>
+      typeof v.from === "string" && (v.level === "mute" || v.level === "quiet"),
+  );
+  const named = (level: "mute" | "quiet") =>
+    on
+      .filter((v) => v.level === level)
+      .map((v) =>
+        v.from === "all"
+          ? "all"
+          : `${/-([srh]\d+)(?:@|$)/.exec(v.from)?.[1] ?? v.from}${v.family === true ? "+" : ""}`,
+      );
+  const muted = named("mute");
+  const quiet = named("quiet");
+  const parts = [
+    ...(muted.length > 0 ? [`muted ${muted.join(", ")}`] : []),
+    ...(quiet.length > 0 ? [`quiet ${quiet.join(", ")}`] : []),
+  ];
+  return parts.length === 0 ? null : parts.join(" · ");
+}
+
+/**
+ * A sender as the person types it back: the row shows short ids ("muted
+ * s12+, r3"), so "s12" is dc-s12. A whole id, a run, a conversation or
+ * "all" goes as it is.
+ */
+export function senderId(word: string): string {
+  const typed = word.trim();
+  return /^[srh]\d+$/.test(typed) ? `dc-${typed}` : typed;
+}
+
+/**
+ * What /dc mute and /dc quiet are given: the sender (a session, a run, a
+ * conversation or "all"), then a time ("30m", "2h", "1h30m", or minutes
+ * alone), then "family" for the sessions below a session too, in any order
+ * after the sender. A refusal's words when there is no sender or a word is
+ * neither.
+ */
+export function muteArgs(
+  words: string,
+): { from: string; minutes?: number; family: boolean } | string {
+  const [from, ...rest] = words.trim().split(/\s+/).filter(Boolean);
+  if (from === undefined) {
+    return "Name who to turn down: /dc mute <session, run, conversation or all> [30m] [family].";
+  }
+  // No time typed is no time sent: devcorner's own default lasts (MUTE_MINUTES_DEFAULT).
+  let minutes: number | undefined = undefined;
+  let family = false;
+  for (const word of rest) {
+    if (word === "family") {
+      family = true;
+      continue;
+    }
+    const time = /^(?:(\d+)h)?(?:(\d+)m?)?$/.exec(word);
+    if (time === null || (time[1] === undefined && time[2] === undefined)) {
+      return `"${word}" is neither a time (30m, 2h, 1h30m) nor "family". Nothing was changed.`;
+    }
+    minutes = Number(time[1] ?? 0) * 60 + Number(time[2] ?? 0);
+  }
+  return { from, ...(minutes === undefined ? {} : { minutes }), family };
+}
+
+/**
+ * What /dc mute, /dc quiet, /dc unmute and /dc mutes answer, from devcorner's
+ * answer to Mute: its words, what it did and what is on, or that nothing is.
+ * An older devcorner knows no Mute, and answers 204.
+ */
+export function mutedText(status: number, body: unknown): string {
+  const answer = (body ?? {}) as {
+    ok?: unknown;
+    text?: unknown;
+    error?: unknown;
+  };
+  if (status === 200 && answer.ok === true) {
+    return typeof answer.text === "string" && answer.text
+      ? answer.text
+      : "Nothing is turned down in this conversation. /dc mute <id> [30m] or /dc quiet <id> turns a sender down.";
+  }
+  if (status === 204 || status === 404) {
+    return "This devcorner does not take /dc mute yet, so nothing was changed.";
+  }
+  const why = typeof answer.error === "string" ? answer.error : null;
+  return why
+    ? `devcorner did not change it: ${why}`
+    : `devcorner did not change it (HTTP ${status}), so nothing was changed.`;
+}
+
+/**
+ * /dc mute, /dc quiet, /dc unmute and /dc mutes: turns a sender down for
+ * this conversation and its session, the person's own word, posted as the
+ * hook route's Mute with the machine's token; lifts it ("all" every one);
+ * or says what is on. The row reads the status again to show it.
+ */
+async function muteHere(
+  $: Engine,
+  change: "mute" | "quiet" | "unmute" | "mutes",
+  words: string,
+): Promise<string> {
+  let event: Record<string, unknown> = { hook_event_name: "Mute" };
+  if (change === "mute" || change === "quiet") {
+    const args = muteArgs(words);
+    if (typeof args === "string") return args;
+    event = { ...event, ...args, from: senderId(args.from), level: change };
+  } else if (change === "unmute") {
+    event = { ...event, lift: senderId(words) || "all" };
+  }
+  const posted = await postAsYou($, event, {
+    command: `/dc ${change}`,
+    nothing: "nothing was changed",
+  });
+  if (typeof posted === "string") return posted;
+  if (posted.status === 200 && change !== "mutes") {
+    await refresh($, true).catch(() => undefined);
+  }
+  return mutedText(posted.status, posted.body);
 }
 
 /** A ticket after its label: its id, as wide as `width`, then its title. */
@@ -4991,6 +5130,13 @@ export const register: Register = (on) => {
     if (/^ask(?:\s|$)/.test(arg)) {
       return { text: await askAsYou($, arg.slice("ask".length)) };
     }
+    // A noisy sender turned down for this conversation, or lifted.
+    const turning = /^(mute|quiet|unmute)(?:\s|$)/.exec(arg);
+    if (turning !== null) {
+      const change = turning[1] as "mute" | "quiet" | "unmute";
+      return { text: await muteHere($, change, arg.slice(change.length)) };
+    }
+    if (arg === "mutes") return { text: await muteHere($, "mutes", "") };
     // This conversation's name, or none (dc-t312, part 5).
     if (/^name(?:\s|$)/.test(arg)) {
       return { text: await nameHere($, arg.slice("name".length)) };
