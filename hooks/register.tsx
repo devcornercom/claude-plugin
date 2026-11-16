@@ -2,6 +2,8 @@ import { atom, read, update } from "claude-code";
 import type {
   Register,
   EngineInterface as Engine,
+  PromptMedia,
+  PromptSubmitAttachment,
   Timer,
   TurnStepChunk,
 } from "claude-code";
@@ -1911,6 +1913,69 @@ async function branchIn($: Engine, cwd: string): Promise<string | undefined> {
   });
   const branch = git.exitCode === 0 ? git.stdout.trim() : "";
   return branch && !/\s/.test(branch) ? branch : undefined;
+}
+
+/**
+ * Where a laptop chat's window leaves its folder in git, sent with its
+ * opening and with each turn's end, never as it leaves, since a closed lid
+ * sends nothing: the commit it is on, by its short id and subject, and its
+ * files not committed, how many and the first `MAX_GIT_PATHS` of them.
+ */
+interface WindowGit {
+  head: string;
+  subject: string | null;
+  uncommitted: number;
+  paths: string[];
+}
+
+/** The most uncommitted files' paths a window's git state names; devcorner keeps no more. */
+const MAX_GIT_PATHS = 20;
+
+/** The exit code git ends with when it refuses a folder: no repo there, or no commit yet. */
+const GIT_REFUSED = 128;
+
+/**
+ * Where git stands in a folder (`WindowGit`), read with two quick calls that
+ * take none of git's optional locks, so they never clash with a git command
+ * running beside them: null for a folder that is no repo or has no commit,
+ * undefined when git could not say now (it timed out or failed otherwise),
+ * which says nothing, so devcorner keeps what it was told before.
+ */
+async function gitIn(
+  $: Engine,
+  cwd: string,
+): Promise<WindowGit | null | undefined> {
+  const git = (args: string[]) =>
+    $.process.run(["git", "--no-optional-locks", ...args], {
+      cwd,
+      timeoutMs: 5000,
+    });
+  const [log, status] = await Promise.all([
+    git(["log", "-1", "--format=%h%x00%s"]),
+    git(["status", "--porcelain"]),
+  ]);
+  if (log.exitCode === GIT_REFUSED) return null;
+  if (log.exitCode !== 0 || status.exitCode !== 0) return undefined;
+  const [head = "", subject = ""] = log.stdout.trim().split("\0");
+  if (!/^[0-9a-f]{4,40}$/i.test(head)) return undefined;
+  // Each line is two status letters, a space and the path.
+  const files = status.stdout.split("\n").filter((line) => line.trim() !== "");
+  return {
+    head,
+    subject: subject.trim() || null,
+    uncommitted: files.length,
+    paths: files.slice(0, MAX_GIT_PATHS).map((line) => line.slice(3).trim()),
+  };
+}
+
+/**
+ * Where this window's folder stands in git now, as a laptop chat's opening
+ * and turn's end say it (`gitIn`); undefined when it cannot say now, which
+ * a post leaves out.
+ */
+async function windowGit($: Engine): Promise<WindowGit | null | undefined> {
+  const cwd = await $.session.cwd().catch(() => undefined);
+  return cwd ? gitIn($, cwd).catch(() => undefined) : undefined;
 }
 
 /**
@@ -5124,6 +5189,8 @@ interface Mirror {
     text: string;
     from: "window" | "page" | "wake" | "harness";
     took: string[];
+    /** The images pasted with words typed in the window (`pastedImages`); none for any other beginning. */
+    images: WindowImage[];
   } | null;
   /** Parts gathered since the last post. */
   parts: MirrorPart[];
@@ -5266,6 +5333,167 @@ export interface PromptSeen {
   command: { name: string; args: string } | null;
   meta: boolean;
   at: number;
+  /** The images pasted with it, read while this window mirrors a laptop chat (`pastedImages`); none otherwise. */
+  images: WindowImage[];
+}
+
+/** An image pasted with a prompt, as a laptop chat's turn sends it (`begin.images`): its name, type and bytes in base64. */
+export interface WindowImage {
+  name: string;
+  type: string;
+  base64: string;
+}
+
+/** The most images one turn's beginning sends, and the most bytes of one, as devcorner keeps no more with one message (`MAX_CHAT_FILES`, `MAX_ATTACHMENT_BYTES`). */
+export const MAX_PASTED_IMAGES = 4;
+export const MAX_PASTED_BYTES = 10 * 1024 * 1024;
+
+/**
+ * The images pasted with a prompt, read whole by their engine handles while
+ * the prompt is submitted (`$.prompt.media`, which answers only then, in
+ * slices joined in order): at most `MAX_PASTED_IMAGES`, each within
+ * `MAX_PASTED_BYTES`. An item that is no image, has no handle, or that the
+ * engine could not read or refused is left out, as one too large is; the
+ * prompt goes on all the same.
+ */
+export async function pastedImages(
+  attachments: readonly PromptSubmitAttachment[] | undefined,
+  read: (id: string, offset: number | undefined) => Promise<PromptMedia>,
+): Promise<WindowImage[]> {
+  const images: WindowImage[] = [];
+  for (const item of attachments ?? []) {
+    if (images.length >= MAX_PASTED_IMAGES) break;
+    if (item.type !== "image" || !item.id) continue;
+    const slices: string[] = [];
+    let type = "";
+    let offset: number | undefined;
+    let whole = true;
+    do {
+      const slice = await read(item.id, offset).catch(() => null);
+      if (
+        slice === null ||
+        slice.base64 === undefined ||
+        slice.size > MAX_PASTED_BYTES
+      ) {
+        whole = false;
+        break;
+      }
+      slices.push(slice.base64);
+      type = slice.mediaType;
+      offset = slice.next;
+    } while (offset !== undefined);
+    if (whole && slices.length > 0)
+      images.push({
+        name: item.filename || `pasted image ${images.length + 1}`,
+        type,
+        base64: slices.join(""),
+      });
+  }
+  return images;
+}
+
+/**
+ * Whether a prompt is the person's own words typed in this window, the one
+ * kind whose images a laptop chat's turn sends: not a slash command, not a
+ * prompt the person did not see typed, and not one Claude Code or a plugin
+ * made, the page's words this module types in among them (`originLine`).
+ */
+function typedHere(seen: {
+  origin: NonNullable<PromptSeen["origin"]>;
+  command?: unknown;
+  isMeta?: true;
+}): boolean {
+  return (
+    seen.origin.kind !== "plugin" &&
+    originLine(seen.origin) === null &&
+    seen.command === undefined &&
+    seen.isMeta !== true
+  );
+}
+
+/** The image types a file named in a prompt is sent as, by its extension. */
+const IMAGE_TYPES: Readonly<Record<string, string>> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+/** An image file's extension at the end of a path, for the patterns below. */
+const IMAGE_END = `\\.(?:${Object.keys(IMAGE_TYPES).join("|")})`;
+
+/**
+ * The image files dragged into the window with a prompt, by the path the
+ * drop wrote into its words. `prompt.submit` marks no drag (a dropped file
+ * that Claude Code does not attach comes as words alone), so a path counts
+ * only in the form a drop writes it: an absolute path that is a whole
+ * whitespace-separated token of its own, either in quotes or with at least
+ * one character escaped by a backslash. A path written in a sentence does
+ * not count: one inside other characters (`open("/tmp/a.png")`,
+ * `src='/a.png'`, `"/a.png",`), or a bare one with nothing escaped
+ * (`look at /tmp/a.png please`), which a drop with nothing to escape writes
+ * the same as typing does, so such a drop is not sent either. A path typed
+ * exactly as a drop writes it, quoted or escaped and standing alone, cannot
+ * be told from one and counts. Each once, in the order the words name them.
+ */
+export function droppedImagePaths(text: string): string[] {
+  const found: string[] = [];
+  // Whole tokens: nothing but whitespace or the text's ends around them.
+  const dropped = new RegExp(
+    `(?<![^ \\t\\r\\n])(?:(['"])(/[^'"\\n]*?${IMAGE_END})\\1|(/(?:\\\\.|[^ \\t\\r\\n'"\\\\])+?${IMAGE_END}))(?![^ \\t\\r\\n])`,
+    "gi",
+  );
+  for (const match of text.matchAll(dropped)) {
+    const escaped = match[3];
+    if (escaped !== undefined && !escaped.includes("\\")) continue;
+    const path = match[2] ?? escaped!.replace(/\\(.)/g, "$1");
+    if (!found.includes(path)) found.push(path);
+  }
+  return found;
+}
+
+/**
+ * The image files dragged into the window (`droppedImagePaths`), read whole
+ * from the disk (`$.fs.read`, which reads at most 4 MiB): each by its
+ * file's name and the type its extension says, at most `MAX_PASTED_IMAGES`.
+ * One that cannot be read is left out, and the prompt goes on all the same.
+ */
+export async function droppedImages(
+  paths: readonly string[],
+  read: (path: string) => Promise<{ base64: string }>,
+): Promise<WindowImage[]> {
+  const images: WindowImage[] = [];
+  for (const path of paths) {
+    if (images.length >= MAX_PASTED_IMAGES) break;
+    const type = IMAGE_TYPES[path.split(".").pop()!.toLowerCase()];
+    const file = await read(path).catch(() => null);
+    if (type === undefined || file === null || file.base64 === "") continue;
+    images.push({ name: path.split("/").pop()!, type, base64: file.base64 });
+  }
+  return images;
+}
+
+/** The most base64 one beginning's images take together: `MAX_PASTED_BYTES` of bytes, padded, so a turn's post (and its resend) stays small. */
+const MAX_POST_BASE64 = Math.ceil(MAX_PASTED_BYTES / 3) * 4;
+/** The most base64 the prompts waiting for their turn keep together (`noteSubmitted`): two beginnings' worth. */
+export const MAX_KEPT_BASE64 = 2 * MAX_POST_BASE64;
+
+/**
+ * The images one beginning sends, in order: at most `MAX_PASTED_IMAGES`,
+ * and together within `MAX_POST_BASE64`; one that would pass it is left out,
+ * and a smaller one after it may still go.
+ */
+export function withinPost(images: readonly WindowImage[]): WindowImage[] {
+  const kept: WindowImage[] = [];
+  let total = 0;
+  for (const image of images) {
+    if (kept.length >= MAX_PASTED_IMAGES) break;
+    if (total + image.base64.length > MAX_POST_BASE64) continue;
+    total += image.base64.length;
+    kept.push(image);
+  }
+  return kept;
 }
 
 /** What a turn of the window began with, as its laptop chat keeps it: the person's words, or a short line for a prompt the harness made. */
@@ -5442,11 +5670,22 @@ export function turnWords(text: string, seen: PromptSeen | null): TurnWords {
   return { from: "harness", text: tagLine(text) };
 }
 
-/** Keeps what `prompt.submit` saw of a prompt, for the turn it begins (`seenFor`). */
-function noteSubmitted(seen: PromptSeen): void {
-  submitted.push(seen);
-  if (submitted.length > SEEN_MAX)
-    submitted.splice(0, submitted.length - SEEN_MAX);
+/**
+ * Keeps what `prompt.submit` saw of a prompt, for the turn it begins
+ * (`seenFor`), in `kept`. A prompt whose words went to the turn under way
+ * begins no turn and is never taken, so the images kept stay within
+ * `MAX_KEPT_BASE64` together: the oldest prompts let go of theirs first,
+ * and the newest always keeps its own.
+ */
+export function noteSubmitted(kept: PromptSeen[], seen: PromptSeen): void {
+  kept.push(seen);
+  if (kept.length > SEEN_MAX) kept.splice(0, kept.length - SEEN_MAX);
+  let total = 0;
+  for (let at = kept.length - 1; at >= 0; at--) {
+    const one = kept[at]!;
+    total += one.images.reduce((sum, image) => sum + image.base64.length, 0);
+    if (total > MAX_KEPT_BASE64 && one !== seen) one.images = [];
+  }
 }
 
 /**
@@ -5735,6 +5974,25 @@ async function mirrorReached($: Engine, reached: boolean): Promise<void> {
   ).catch(() => undefined);
 }
 
+/**
+ * What a post of the mirror says of the window besides the turn: a turn's
+ * beginning and end say what it runs on (`/model` and `/effort` change it
+ * between turns, and each reply fills the context), and its end where it
+ * left the folder in git, which the page shows once the window leaves, since
+ * a closed lid sends nothing as it goes. Both are read at once.
+ */
+async function saysOfWindow(
+  $: Engine,
+  payload: MirrorPayload,
+): Promise<{ runsOn?: WindowModel; git?: WindowGit | null }> {
+  if (!payload.begin && !payload.end) return {};
+  const [runsOn, git] = await Promise.all([
+    windowModel($),
+    payload.end ? windowGit($) : undefined,
+  ]);
+  return { runsOn, ...(git === undefined ? {} : { git }) };
+}
+
 /** Posts one of the mirror's posts (`sendMirror`) and acts on its answer. */
 async function postMirror(
   $: Engine,
@@ -5752,9 +6010,7 @@ async function postMirror(
       parts: payload.parts,
       post: payload.post,
       ...(payload.end ? { end: payload.end } : {}),
-      // A turn's beginning and end say what the window runs on: `/model` and
-      // `/effort` change it between turns, and each reply fills the context.
-      ...(payload.begin || payload.end ? { runsOn: await windowModel($) } : {}),
+      ...(await saysOfWindow($, payload)),
     });
     const body = JSON.parse(res.text) as {
       stop?: unknown;
@@ -6602,6 +6858,7 @@ async function chatHere($: Engine, words: string): Promise<string> {
       branch: cwd
         ? ((await branchIn($, cwd).catch(() => undefined)) ?? null)
         : null,
+      git: await windowGit($),
     },
     { command: "/dc chat", nothing: "no laptop chat was opened" },
   );
@@ -6632,12 +6889,50 @@ async function continueHere($: Engine, words: string): Promise<string> {
       branch: cwd
         ? ((await branchIn($, cwd).catch(() => undefined)) ?? null)
         : null,
+      git: await windowGit($),
     },
     { command: "/dc continue", nothing: "nothing was continued" },
   );
-  return typeof posted === "string"
-    ? posted
-    : mirrorOpened($, posted, "nothing was continued");
+  if (typeof posted === "string") return posted;
+  const said = mirrorOpened($, posted, "nothing was continued");
+  await briefWindow($, posted.body);
+  return said;
+}
+
+/**
+ * Hands the model the briefing devcorner answered a `/dc continue` with,
+ * once the chat moved here from another window, as a row of its
+ * conversation (`$.session.append`), and toasts it: the chat's summary,
+ * where that window left its folder, and its last exchanges, so this
+ * window's next turn knows what the chat was doing. None for a chat that
+ * did not move. Where the row cannot be added, the person is told, since
+ * the model goes on without it.
+ */
+async function briefWindow($: Engine, body: unknown): Promise<void> {
+  const answer = (body ?? {}) as {
+    briefing?: unknown;
+    chat?: { thread?: unknown };
+  };
+  if (typeof answer.briefing !== "string" || answer.briefing === "") return;
+  const id =
+    typeof answer.chat?.thread === "string" ? answer.chat.thread : "the chat";
+  try {
+    const kept = await $.session.append({
+      message: {
+        type: "user",
+        content: [{ type: "text", text: answer.briefing }],
+      },
+    });
+    if (kept.deny === undefined) {
+      $.ui.toast(`dc: this window was briefed on ${id} from its summary`);
+      return;
+    }
+    $.ui.toast(`dc: ${id}'s briefing did not reach this window: ${kept.deny}`);
+  } catch (error) {
+    $.ui.toast(
+      `dc: ${id}'s briefing did not reach this window: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /**
@@ -6661,6 +6956,7 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
       thread,
       rejoin: true,
       runsOn: await windowModel($),
+      git: await windowGit($),
     },
     { command: "the laptop chat's rejoin", nothing: "it was not rejoined" },
   );
@@ -6859,12 +7155,37 @@ export const register: Register = (on) => {
   // harness made as a short line, never as the person's words. Only seen,
   // never changed.
   on("prompt.submit", async ($, e, next) => {
-    noteSubmitted({
+    // The images pasted with it are read now, since the engine gives their
+    // bytes only while the prompt is submitted, with the image files dragged
+    // into the window, which come as their paths in the words; only for the
+    // person's own words, typed here (`typedHere`), and only while this
+    // window mirrors a laptop chat, the one place they go: its turn sends
+    // them with those words (`begin.images`).
+    const images: WindowImage[] = [];
+    if (mirror !== null && typedHere(e)) {
+      images.push(
+        ...(await pastedImages(e.attachments, (id, offset) =>
+          $.prompt.media(offset === undefined ? { id } : { id, offset }),
+        )),
+      );
+      // A file the engine attached already, and still named, goes once; no
+      // more are read than are left to send.
+      const paths = droppedImagePaths(e.text)
+        .filter((path) => !images.some((one) => path.endsWith(`/${one.name}`)))
+        .slice(0, Math.max(0, MAX_PASTED_IMAGES - images.length));
+      images.push(
+        ...(await droppedImages(paths, (path) =>
+          $.fs.read(path, { as: "bytes" }),
+        )),
+      );
+    }
+    noteSubmitted(submitted, {
       text: e.text,
       origin: e.origin ?? null,
       command: e.command ?? null,
       meta: e.isMeta === true,
       at: await $.clock.now(),
+      images: withinPost(images),
     });
     return next(e);
   });
@@ -6892,10 +7213,9 @@ export const register: Register = (on) => {
     // session's message) is left out too, and the chat keeps its short line.
     const page = typedFromPage;
     typedFromPage = null;
-    const words =
-      page !== null || woke !== null
-        ? null
-        : turnWords(e.text, seenFor(submitted, e.text, await $.clock.now()));
+    const typed = page === null && woke === null;
+    const seen = typed ? seenFor(submitted, e.text, await $.clock.now()) : null;
+    const words = typed ? turnWords(e.text, seen) : null;
     const from = page !== null ? "page" : woke !== null ? "wake" : words!.from;
     // Who started it, for devcorner's count of a chain of wakes (dc-t312):
     // words typed on the page are the person's too.
@@ -6914,7 +7234,13 @@ export const register: Register = (on) => {
     }
     if (mirror !== null) {
       mirror.turn = e.turnId;
-      mirror.begin = { text: said, from, took: page?.keys ?? [] };
+      mirror.begin = {
+        text: said,
+        from,
+        took: page?.keys ?? [],
+        // Only the person's own words typed here carry what they pasted.
+        images: from === "window" ? (seen?.images ?? []) : [],
+      };
       mirror.parts = [];
       mirror.posted = 0;
       mirror.tools = [];

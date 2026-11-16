@@ -78,6 +78,14 @@ import {
   keepTasks,
   seenFor,
   turnWords,
+  pastedImages,
+  droppedImagePaths,
+  droppedImages,
+  withinPost,
+  noteSubmitted,
+  MAX_KEPT_BASE64,
+  MAX_PASTED_BYTES,
+  MAX_PASTED_IMAGES,
   type PromptSeen,
   type WindowTask,
   MAX_EXCHANGES,
@@ -1270,6 +1278,11 @@ function world(
     statusBodies: [] as Record<string, unknown>[],
     /** The branch `git branch --show-current` prints in the folder (dc-t334); empty on a detached head. */
     branch: "main",
+    /** What `git log -1` and `git status --porcelain` print in the folder; null for a folder that is no repo. */
+    git: {
+      log: "4f2a9c1\u0000Add the pending store test\n",
+      status: " M src/a.ts\n?? notes.md\n",
+    } as { log: string; status: string } | null,
     /**
      * What `git remote get-url origin` prints, by the folders its -C args
      * name, joined by a space ("" for the conversation's own); null for none.
@@ -1413,7 +1426,8 @@ function world(
   }));
   on("fs.read", async (_$, e) => {
     const text = seen.files.get(e.path);
-    return text === undefined ? { deny: "missing" } : { value: text };
+    if (text === undefined) return { deny: "missing" };
+    return { value: e.as === "bytes" ? { base64: btoa(text) } : text };
   });
   on("http.fetch", async (_$, e) => {
     const sent = JSON.parse(e.init?.body ?? "{}");
@@ -1613,6 +1627,24 @@ function world(
         },
       };
     }
+    if (
+      e.argv[0] === "git" &&
+      (e.argv.includes("log") || e.argv.includes("status"))
+    )
+      return {
+        value: {
+          exitCode: seen.git === null ? 128 : 0,
+          stdout:
+            seen.git === null
+              ? ""
+              : e.argv.includes("log")
+                ? seen.git.log
+                : seen.git.status,
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
     const stdout =
       e.argv[0] === "uname"
         ? "Darwin\n"
@@ -7699,6 +7731,7 @@ describe("a laptop chat's mirror", () => {
     command: null,
     meta: false,
     at: 0,
+    images: [],
     ...over,
   });
 
@@ -7817,6 +7850,229 @@ describe("a laptop chat's mirror", () => {
       origin: { kind: "peer" },
     });
     expect(kept.map((one) => one.text)).toEqual(["/dc chat"]);
+  });
+
+  test("the prompts waiting for their turn keep two beginnings' images at most, the oldest letting go first", () => {
+    const shot = (name: string) => ({
+      name,
+      type: "image/png",
+      base64: "A".repeat(MAX_KEPT_BASE64 / 2),
+    });
+    const kept: PromptSeen[] = [];
+    noteSubmitted(kept, seenAs({ text: "a", images: [shot("a")] }));
+    noteSubmitted(kept, seenAs({ text: "b", images: [shot("b")] }));
+    expect(kept.map((one) => one.images.length)).toEqual([1, 1]);
+    // Words handed to a running turn never begin one: a third prompt's
+    // images push out the oldest's, and a prompt with none keeps all.
+    noteSubmitted(kept, seenAs({ text: "c", images: [shot("c")] }));
+    noteSubmitted(kept, seenAs({ text: "d" }));
+    expect(kept.map((one) => [one.text, one.images.length])).toEqual([
+      ["a", 0],
+      ["b", 1],
+      ["c", 1],
+      ["d", 0],
+    ]);
+  });
+
+  test("the images pasted with a prompt are read whole, in slices, and only images the engine could read", async () => {
+    const asked: string[] = [];
+    const read = async (id: string, offset: number | undefined) => {
+      asked.push(`${id}@${offset ?? 0}`);
+      if (id === "big")
+        return {
+          size: MAX_PASTED_BYTES + 1,
+          base64: "x",
+          mediaType: "image/png",
+          type: "image" as const,
+        };
+      if (id === "blurry") return { unreadable: "could not process it" };
+      if (id === "gone") return { deny: "settled" };
+      // "shot" comes in two slices, joined in order.
+      return offset === undefined
+        ? {
+            size: 6,
+            base64: "iVBO",
+            mediaType: "image/png",
+            type: "image" as const,
+            next: 3,
+          }
+        : {
+            size: 6,
+            base64: "Rw0K",
+            mediaType: "image/png",
+            type: "image" as const,
+          };
+    };
+    const images = await pastedImages(
+      [
+        {
+          type: "image",
+          id: "shot",
+          filename: "shot.png",
+          mediaType: "image/png",
+        },
+        { type: "document", id: "doc", mediaType: "application/pdf" },
+        { type: "image" },
+        { type: "image", id: "big" },
+        { type: "image", id: "blurry" },
+        { type: "image", id: "gone" },
+        { type: "image", id: "second", mediaType: "image/png" },
+      ],
+      read,
+    );
+    expect(images).toEqual([
+      { name: "shot.png", type: "image/png", base64: "iVBORw0K" },
+      { name: "pasted image 2", type: "image/png", base64: "iVBORw0K" },
+    ]);
+    // A document is never read; an image with no handle cannot be.
+    expect(asked).not.toContain("doc@0");
+    // No more than devcorner keeps with one message.
+    const many = await pastedImages(
+      Array.from({ length: MAX_PASTED_IMAGES + 2 }, (_, i) => ({
+        type: "image" as const,
+        id: `shot${i}`,
+      })),
+      async () => ({
+        size: 3,
+        base64: "abc",
+        mediaType: "image/png",
+        type: "image" as const,
+      }),
+    );
+    expect(many).toHaveLength(MAX_PASTED_IMAGES);
+  });
+
+  test("an image file dragged into the window counts by the path the drop wrote, never by a path written in a sentence", async () => {
+    const dropped =
+      "'/var/folders/l3/T/TemporaryItems/Screenshot 2026-11-16 at 8.21.53.png' dont see models";
+    expect(droppedImagePaths(dropped)).toEqual([
+      "/var/folders/l3/T/TemporaryItems/Screenshot 2026-11-16 at 8.21.53.png",
+    ]);
+    // Escaped spaces, double quotes, several, each once; never a file that
+    // is no image, a relative path or one inside a word.
+    expect(
+      droppedImagePaths(
+        '/Users/ann/Desktop/my\\ shot.PNG and "/tmp/a b.jpeg" /tmp/notes.txt ./rel.png x/y.png /Users/ann/Desktop/my\\ shot.PNG',
+      ),
+    ).toEqual(["/Users/ann/Desktop/my shot.PNG", "/tmp/a b.jpeg"]);
+    // Every character a terminal escapes, and macOS's narrow space before
+    // AM in a screenshot's name, which is no space between words.
+    expect(
+      droppedImagePaths(
+        "look /Users/ann/Desktop/Screenshot\\ 2026-11-16\\ at\\ 8.21.53 AM\\ \\(2\\).png",
+      ),
+    ).toEqual([
+      "/Users/ann/Desktop/Screenshot 2026-11-16 at 8.21.53 AM (2).png",
+    ]);
+    // A path written in a sentence: inside other characters, or bare with
+    // nothing escaped, as typing writes it.
+    for (const typed of [
+      'open("/tmp/a.png")',
+      "src='/img/logo.png'",
+      'see "/Users/me/shot.png", then fix it',
+      "look at /tmp/a.png please",
+      "/tmp/a.png",
+      "the file at '/tmp/a.png'.",
+      "no paths here",
+    ])
+      expect(droppedImagePaths(typed)).toEqual([]);
+    const read = async (path: string) => {
+      if (path.includes("gone")) throw new Error("ENOENT");
+      return { base64: "iVBORw0K" };
+    };
+    expect(
+      await droppedImages(
+        ["/tmp/gone.png", "/tmp/Shot 1.PNG", "/tmp/b.jpg"],
+        read,
+      ),
+    ).toEqual([
+      { name: "Shot 1.PNG", type: "image/png", base64: "iVBORw0K" },
+      { name: "b.jpg", type: "image/jpeg", base64: "iVBORw0K" },
+    ]);
+    expect(
+      await droppedImages(
+        Array.from(
+          { length: MAX_PASTED_IMAGES + 1 },
+          (_, i) => `/tmp/${i}.png`,
+        ),
+        read,
+      ),
+    ).toHaveLength(MAX_PASTED_IMAGES);
+  });
+
+  test("one beginning's images stay within one image's bytes together, so its post stays small", () => {
+    const image = (name: string, bytes: number) => ({
+      name,
+      type: "image/png",
+      base64: "A".repeat(Math.ceil(bytes / 3) * 4),
+    });
+    const half = MAX_PASTED_BYTES / 2;
+    // One that would pass the bound is left out; a smaller one after it
+    // still goes.
+    expect(
+      withinPost([
+        image("a", half),
+        image("b", half + 3),
+        image("c", half),
+        image("d", 3),
+      ]).map((one) => one.name),
+    ).toEqual(["a", "c"]);
+    expect(
+      withinPost(
+        Array.from({ length: MAX_PASTED_IMAGES + 1 }, (_, i) =>
+          image(`${i}`, 3),
+        ),
+      ),
+    ).toHaveLength(MAX_PASTED_IMAGES);
+  });
+
+  test("a turn's beginning carries the images dragged in with words typed in its mirrored window, and no other's", async ($, on) => {
+    const shot = "/Users/ann/Desktop/my shot.png";
+    const typed = (text: string, origin: object = { kind: "composer" }) =>
+      $.prompt.submit({ text, origin, wait: false } as never);
+    const { clock, seen } = world(on, { files: [[shot, "PNGDATA"]] });
+    await $.session.start(START);
+    await flush(clock);
+    // Typed before the window mirrors a chat: its turn, begun once it
+    // does, carries none.
+    const before = "/Users/ann/Desktop/my\\ shot.png first";
+    await typed(before);
+    seen.chatAnswers.push(OPENED);
+    await $.command.run({ command: "dc", args: "chat" } as never);
+    await flush(clock);
+    await $.turn.start({ text: before, turnId: "t0" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t0",
+      begin: { from: "window", images: [] },
+    });
+    await $.turn.complete({ ...done("t0"), answer: "Seen." });
+    await flush(clock);
+    const words = "/Users/ann/Desktop/my\\ shot.png why is it red";
+    await typed(words);
+    await $.turn.start({ text: words, turnId: "t1" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      begin: {
+        text: words,
+        from: "window",
+        images: [
+          { name: "my shot.png", type: "image/png", base64: btoa("PNGDATA") },
+        ],
+      },
+    });
+    await $.turn.complete({ ...done("t1"), answer: "A stale cache." });
+    await flush(clock);
+    // Another session's message naming the same file begins as the
+    // harness's line, with no images.
+    await typed(words, { kind: "peer" });
+    await $.turn.start({ text: words, turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { from: "harness", images: [] },
+    });
   });
 
   test("a background task's end begins as the harness's line, and an opening leaves it out", async ($, on) => {
@@ -8675,6 +8931,86 @@ describe("a laptop chat's mirror", () => {
       rejoin: true,
       runsOn: { model: "claude-sonnet-5-5", effort: null },
     });
+  });
+
+  test("an opening and a turn's end say where the window's folder stands in git; a folder that is no repo says none", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    expect(seen.chats[0]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      git: {
+        head: "4f2a9c1",
+        subject: "Add the pending store test",
+        uncommitted: 2,
+        paths: ["src/a.ts", "notes.md"],
+      },
+    });
+    await $.turn.start({ text: "commit it", turnId: "t1" });
+    await flush(clock);
+    // A beginning says nothing of it: only the end, where the turn left it.
+    expect(parts(seen)[0]).not.toHaveProperty("git");
+    seen.git = { log: "9b1d2e3\u0000Commit the store test\n", status: "" };
+    await $.turn.complete({ ...done("t1"), answer: "Committed." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      end: { text: "Committed." },
+      git: {
+        head: "9b1d2e3",
+        subject: "Commit the store test",
+        uncommitted: 0,
+        paths: [],
+      },
+    });
+    seen.git = null;
+    await $.turn.start({ text: "and now?", turnId: "t2" });
+    await $.turn.complete({ ...done("t2"), answer: "No repo here." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      end: { text: "No repo here." },
+      git: null,
+    });
+  });
+
+  test("/dc continue of a chat that moved here hands the model its briefing as a row, with a toast; one that did not move hands none", async ($, on) => {
+    const { clock, seen } = world(on);
+    const rows: string[] = [];
+    on("session.append", async (_$, e, next) => {
+      rows.push((e.message.content[0] as { text: string }).text);
+      return next(e);
+    });
+    await $.session.start(START);
+    await flush(clock);
+    const briefing =
+      'devcorner: this window now continues laptop chat me-k3 "Fix the cart", which moved here from a window on MacBook.';
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ...OPENED.body,
+        started: false,
+        movedFrom: "me-h1",
+        briefing,
+      },
+    });
+    const out = await $.command.run({
+      command: "dc",
+      args: "continue me-k3",
+    } as never);
+    expect(out.text).toContain("It moved here from me-h1");
+    expect(seen.chats[0]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      thread: "me-k3",
+      git: { head: "4f2a9c1" },
+    });
+    expect(rows).toEqual([briefing]);
+    expect(seen.toasts).toContain(
+      "dc: this window was briefed on me-k3 from its summary",
+    );
+    // The chat this window holds already moved nowhere: nothing to brief.
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ...OPENED.body, started: false, briefing: null },
+    });
+    await $.command.run({ command: "dc", args: "continue me-k3" } as never);
+    expect(rows).toHaveLength(1);
   });
 
   /** Every state of an ask the turn's posts told the page, in order. */
