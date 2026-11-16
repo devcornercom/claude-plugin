@@ -457,8 +457,24 @@ declare module "claude-code" {
        * and never the secret a sign-in polls with.
        */
       signIn: SignIn | null;
+      /**
+       * The laptop chat this window mirrors, which the row names, and whether
+       * its last post or held request reached devcorner; null while
+       * mirroring is off.
+       */
+      laptop: LaptopLine | null;
     };
   }
+}
+
+/** The laptop chat a window mirrors, as the row says it. */
+export interface LaptopLine {
+  /** The chat, as its person is shown it (me-k3). */
+  thread: string;
+  /** Its page on devcorner, which the row links; null when devcorner gave none. */
+  url: string | null;
+  /** Whether the window's last post or held request failed: it tries again, and says reconnecting until one goes. */
+  reconnecting: boolean;
 }
 
 /** Where signing this machine in stands (dc-t224). */

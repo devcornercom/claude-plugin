@@ -60,7 +60,11 @@
 # before their own answer, in their own event's name, once an ask still on
 # its way has ended; and a subagent's SubagentStop, which has nothing else
 # to give, as a block of its stop, so the subagent reads them and stops
-# again after. Only one ask of a caller is on its way at a time (`asking`):
+# again after. At a stop, the plugin's module puts each hand-over in a row
+# of the conversation of its own, which the person does not see, and leaves
+# one line in this hook's answer (`handedAtStop` in register.tsx), since
+# Claude Code shows a stop hook's answer to the person whole. Only one ask of
+# a caller is on its way at a time (`asking`):
 # parallel tool calls end together, and each would ask. Where nothing can be
 # kept, PostToolUse asks and waits as before. A Claude Code that does not
 # know the async answer waits for the script to end, which then gives what

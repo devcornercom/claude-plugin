@@ -75,10 +75,9 @@ The main conversation coordinates and talks to your person; the work is done els
 
 ## OAs and merge trains
 
-An Orchestrator Agent (OA) carries a list of tickets to their end by fixed rules while nobody watches: it sends builds, reviews and fixes, stacks merge trains and lands them.
+An Orchestrator Agent (OA) carried a list of tickets to their end by fixed rules while nobody watched: it sent builds, reviews and fixes, stacked merge trains and landed them. New OAs are frozen: none is proposed, confirmed or armed, and an OA already under way runs on to its end, read and steered as before.
 
-- Propose one with run(action: "oa", mandate), show your person its restatement and refusals, and arm it with run(action: "confirm", id, agreed: true) only on their yes.
-- Give an OA only the tickets that can land before its end. For more, propose the next one with mandate: {after: "<its id>"}, which starts when it ends.
+- For work to go on while nobody watches, draft a duty for a project chat: run(action: "duty", id: "<its thread>", goal, hours, cap). A draft starts nothing: only your person starts it, from the chat's page, and the chat then works toward its goal until its end or its cap.
 - A merge train lands pull requests together: each is reviewed alone, the approved ones are stacked, the full checks run once at the train's head, and they land together. Your project's instructions say which checks are the full ones and who runs them.
 - Every change lands in a train, and a train of one is a train: an urgent fix forms its own, with the full checks at its head and one deploy. A train of only small changes forms too, so they never wait for a large one.
 - No change gets a QA run of its own: each member's touched end-to-end specs run in its train's touched run. A member that fails there is left out of the train, its ticket told the failure and brought up to its base, and the train runs its touched specs again at its new head and goes on, so one member never holds the rest and your person's signed check.
@@ -117,7 +116,7 @@ Only the person a question is put to decides it; an agent proposes.
 - A question you put to your person blocks what it decides: never build an option they have not chosen. Do the work that does not depend on it, or finish partial naming the question's id; the run continues once they answer.
 - A subagent's question goes to its coordinator first, and to your person after about ten minutes. A coordinator answers only a question asked for it, with for: "coordinator", about the run's technical details. A question that is the person's it leaves open for them, never answers it for them and never tells the run to go ahead on its recommendation.
 - Only a question asked with blocking: false lets the work go past it, and then on the option that changes nothing they have to decide (no rule, contract, data, cost or risk of theirs), marked in the same step with question(action: "implement").
-- Pass agreed: true (a dispatch, a shared memory, an OA's confirm, an instruction) only once your person said yes.
+- Pass agreed: true (a dispatch, a shared memory, an instruction) only once your person said yes.
 
 ## Documents
 
