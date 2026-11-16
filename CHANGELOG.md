@@ -2,6 +2,11 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.49.0 — 2026-11-16
+
+- A laptop chat draws each tool call on one short line, as a project chat does. devcorner's own tools go by their name and what they act on, such as `workspace: coordinator web` or `show: dc-t12`, never the MCP prefix or the session they are made as; any other tool goes by its short name and one short argument, a file by its name and a command by its first words, such as `Read: register.tsx` or `Bash: pnpm test`. Of a devcorner call, its short arguments go to devcorner, which names what it acts on by the project chat's own rule; of any other, only the short label leaves the machine. It needs the devcorner that takes them, which comes before it.
+- A window that mirrors a laptop chat is told that its replies are read in a devcorner chat, on a page or a phone, and how to write for it there: plain chat prose, work through devcorner's tools, and what is yours to decide asked as a question. It is told once as the mirroring begins, whether by `/dc chat`, by `/dc continue`, or by the window's rejoin being taken, and again after each compaction while it mirrors. A window that mirrors no chat is told nothing.
+
 ## 0.48.0 — 2026-11-16
 
 - An image you paste or drag into the window with your words, while it mirrors a laptop chat, shows on the chat's page in that message's bubble, as one you attach on the page does: the plugin reads the pasted images as the prompt is submitted, and the image files you drag in, by the path the drop writes, quoted or escaped (up to 4 MiB each), and sends them with the turn's words (at most 4, up to 10 MB together). A path you write in a sentence is never read or sent. Images pasted before the chat went live, with a prompt Claude Code or another plugin made, or with words Claude Code hands to a turn already running rather than beginning one, are not sent.

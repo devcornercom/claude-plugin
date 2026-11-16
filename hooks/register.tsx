@@ -5112,8 +5112,21 @@ function deliver<R extends { deny?: unknown; context?: readonly string[] }>(
 // (ChatParts), and the person's own words typed on devcorner's page come back
 // in the answer to a post, or on the held request (`{chat}`), to be typed in
 // here as theirs, never over a draft and never mid-turn. Stop on the page
-// aborts the turn. Tool output is never sent: a tool call goes by its name and
-// a short label. Nothing is mirrored until `/dc chat` in this window.
+// aborts the turn. Tool output is never sent: a tool call goes by its short
+// name and a short label, or, for one of devcorner's own tools, with its
+// short arguments, which devcorner reads what the call acts on from by the
+// project chat's rule. Nothing is mirrored until `/dc chat` in this window.
+
+/**
+ * What a window that mirrors a laptop chat is told of where its replies are
+ * read: as a row of its conversation wherever its mirroring begins from none
+ * (`/dc chat`, `/dc continue`, a rejoin after a restart or a resume), and
+ * after each compaction while it mirrors, as the SessionStart hook's context.
+ * Only what a laptop window needs on top of the chat rules devcorner gives
+ * every chat.
+ */
+export const LAPTOP_CHAT_INSTRUCTION =
+  "Your replies are read in a devcorner chat, on a page or a phone, and the person may write to you from there. Write plain chat prose: short paragraphs and simple lists, no headings, no tables. Do work through devcorner's tools so it shows in the chat's tracking, and ask what is the person's to decide as a question rather than a paragraph.";
 
 /** How long a mirrored turn's parts gather before they go: the page runs about this far behind the window, plus the post. */
 export const MIRROR_BATCH_MS = 250;
@@ -5123,6 +5136,26 @@ export const MIRROR_BEAT_MS = 30_000;
 export const MAX_EXCHANGES = 100;
 /** The most a tool's label holds: the tool's own first argument, cut. */
 const MAX_LABEL = 120;
+/** The most cells a tool call's line in a laptop chat gives its argument, cut at a word. */
+const LINE_LABEL = 60;
+/** The longest argument of a devcorner call sent for its line: longer ones (a body, a summary) name nothing it acts on. */
+const LINE_ARG = 200;
+
+/**
+ * What a tool call carries for its line in a laptop chat: a short label of
+ * its argument, or, for one of devcorner's own tools, its short arguments,
+ * which go to devcorner anyway as the call itself, so devcorner names what
+ * it acts on by the project chat's rule (`namedIn`, src/mcp/chat-calls.ts).
+ */
+export type MirrorToolInput =
+  | { label: string }
+  | { args: Record<string, string | number> };
+
+/** A tool call as a turn's end keeps it for the reply's line: its short name and what its line carries. */
+export interface MirrorTool {
+  name: string;
+  input: MirrorToolInput;
+}
 
 /** A live part as devcorner's page draws a reply: text, summarised reasoning, a tool by its name. */
 export type MirrorPart =
@@ -5135,7 +5168,7 @@ export type MirrorPart =
       type: "tool-input-available";
       toolCallId: string;
       toolName: string;
-      input: { label: string };
+      input: MirrorToolInput;
     }
   | { type: "data-ask"; data: AskState }
   | { type: "data-tasks"; data: { tasks: WindowTask[] } };
@@ -5194,8 +5227,8 @@ interface Mirror {
   } | null;
   /** Parts gathered since the last post. */
   parts: MirrorPart[];
-  /** The turn's tool lines, for its kept reply. */
-  tools: string[];
+  /** The turn's tool calls, for its kept reply's lines. */
+  tools: MirrorTool[];
   /** The turn's steps that made tool calls, each its words and how many calls, as the page drew them live (`keepStep`). */
   steps: MirrorStep[];
   /** The text blocks written since the turn's last tool call: the next step's words, or the answer's. */
@@ -5707,17 +5740,75 @@ export function seenFor(
 
 /** A tool call's label: the first line of its first string argument, cut; "" when its arguments hold none or do not parse. */
 function toolLabel(json: string): string {
-  let input: unknown;
-  try {
-    input = JSON.parse(json);
-  } catch {
-    return "";
-  }
-  if (input === null || typeof input !== "object") return "";
-  const first = Object.values(input).find((v) => typeof v === "string");
+  const first = Object.values(toolArgs(json) ?? {}).find(
+    (v) => typeof v === "string",
+  );
   return typeof first === "string"
     ? first.split("\n")[0]!.slice(0, MAX_LABEL)
     : "";
+}
+
+/** The arguments of a tool call's JSON, or null when they do not parse to an object. */
+function toolArgs(json: string): Record<string, unknown> | null {
+  try {
+    const input: unknown = JSON.parse(json);
+    return input !== null && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A tool call as its line in a laptop chat goes: its short name, with no
+ * MCP prefix (`mcp__github__get_me` is `get_me`), and, for one of
+ * devcorner's own tools, its short arguments, from which devcorner names
+ * what it acts on by the project chat's rule; for any other, whose
+ * arguments never leave the machine, one short label (`lineLabel`).
+ */
+export function toolCall(
+  name: string,
+  json: string,
+): { toolName: string; input: MirrorToolInput } {
+  const toolName = name.replace(/^mcp__.*__/, "");
+  if (!DEVCORNER_TOOL.test(name))
+    return { toolName, input: { label: lineLabel(json) } };
+  const args: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(toolArgs(json) ?? {}))
+    if (
+      (typeof value === "string" && value.length <= LINE_ARG) ||
+      typeof value === "number"
+    )
+      args[key] = value;
+  return { toolName, input: { args } };
+}
+
+/**
+ * A tool call's label as its line in a laptop chat says it, cut at a word
+ * to one short line: the first line of its first string argument, a path
+ * (an argument named `path` or `..._path`, as `file_path`) by its file's
+ * name alone, and a command by its first words, a leading `cd <dir> &&`
+ * left out; "" for none.
+ */
+export function lineLabel(json: string): string {
+  const [key, value] =
+    Object.entries(toolArgs(json) ?? {}).find(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ) ?? [];
+  const first = value?.split("\n")[0]!.trim() ?? "";
+  const words = /(?:^|_)path$/.test(key ?? "")
+    ? (first
+        .split(/[\\/]/)
+        .filter((piece) => piece !== "")
+        .at(-1) ?? first)
+    : first.replace(/^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*&&\s*/, "");
+  return (
+    cutAtWord(words, LINE_LABEL) ??
+    `${Array.from(words)
+      .slice(0, LINE_LABEL - 1)
+      .join("")}…`
+  );
 }
 
 /**
@@ -5755,8 +5846,7 @@ export function stepParts(
     parts.push({
       type: "tool-input-available",
       toolCallId: tool.id,
-      toolName: tool.name,
-      input: { label: toolLabel(tool.json) },
+      ...toolCall(tool.name, tool.json),
     });
   }
   switch (chunk.kind) {
@@ -5812,7 +5902,7 @@ interface MirrorPayload {
   post: number;
   end: {
     text: string;
-    tools: string[];
+    tools: MirrorTool[];
     steps: MirrorStep[];
     outcome: "done" | "stopped";
   } | null;
@@ -5871,7 +5961,7 @@ async function mirrorPost(
         what.end && turn !== null && m.parts.length === 0
           ? {
               text: what.end.text,
-              tools: [...m.tools],
+              tools: m.tools.map((tool) => ({ ...tool })),
               steps: m.steps.map((step) => ({ ...step })),
               outcome: what.end.outcome,
             }
@@ -6106,11 +6196,7 @@ function mirrorChunk($: Engine, m: Mirror, chunk: TurnStepChunk): void {
   for (const part of parts) {
     keepStep(m, part);
     if (part.type === "tool-input-available")
-      m.tools.push(
-        part.input.label
-          ? `${part.toolName}: ${part.input.label}`
-          : part.toolName,
-      );
+      m.tools.push({ name: part.toolName, input: part.input });
   }
   m.parts.push(...parts);
   mirrorSoon($);
@@ -6764,12 +6850,17 @@ async function typePageWords($: Engine): Promise<void> {
   });
 }
 
-/** What an opening's answer gives: the chat, its page and how to resume it. */
-function mirrorOpened(
+/**
+ * What an opening's answer gives: the chat, its page and how to resume it.
+ * A window that mirrored no chat before (`/dc chat`, `/dc continue`, a
+ * rejoin after a restart, a resume or a reload) is told where its replies
+ * are read (`instructWindow`) as its mirroring begins.
+ */
+async function mirrorOpened(
   $: Engine,
   posted: { status: number; body: unknown },
   nothing: string,
-): string {
+): Promise<string> {
   const body = (posted.body ?? {}) as {
     chat?: { thread?: unknown; machineName?: unknown };
     url?: unknown;
@@ -6781,6 +6872,7 @@ function mirrorOpened(
   if (posted.status !== 200 || typeof body.chat?.thread !== "string") {
     return `dc: ${typeof body.error === "string" ? body.error : `devcorner did not answer, so ${nothing}.`}`;
   }
+  const began = mirror === null;
   // Nothing of a chat the window mirrored before goes into this one.
   leaveMirror();
   mirror = {
@@ -6810,6 +6902,7 @@ function mirrorOpened(
     url: typeof body.url === "string" ? body.url : null,
     reconnecting: false,
   })).catch(() => undefined);
+  if (began) await instructWindow($, id);
   return [
     `dc: ${body.started === true ? "This window is now" : "This window mirrors"} laptop chat ${id}${typeof body.url === "string" ? `: ${body.url}` : "."}`,
     typeof body.movedFrom === "string"
@@ -6894,9 +6987,44 @@ async function continueHere($: Engine, words: string): Promise<string> {
     { command: "/dc continue", nothing: "nothing was continued" },
   );
   if (typeof posted === "string") return posted;
-  const said = mirrorOpened($, posted, "nothing was continued");
+  const said = await mirrorOpened($, posted, "nothing was continued");
   await briefWindow($, posted.body);
   return said;
+}
+
+/**
+ * Adds a row the model reads, and the person does not see, to this window's
+ * conversation, or to subagent `agentId`'s (`$.session.append`): null once
+ * it is kept, else why not.
+ */
+async function addRow(
+  $: Engine,
+  text: string,
+  agentId?: string,
+): Promise<string | null> {
+  try {
+    const kept = await $.session.append({
+      message: { type: "user", content: [{ type: "text", text }] },
+      ...(agentId === undefined ? {} : { agentId }),
+    });
+    return kept.deny ?? null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * Tells the model where its replies are read (`LAPTOP_CHAT_INSTRUCTION`) as
+ * its mirroring of laptop chat `thread` begins, as a row of its conversation.
+ * Where the row cannot be added, the person is told, since the model goes on
+ * without it.
+ */
+async function instructWindow($: Engine, thread: string): Promise<void> {
+  const why = await addRow($, LAPTOP_CHAT_INSTRUCTION);
+  if (why !== null)
+    $.ui.toast(
+      `dc: how to write for ${thread} did not reach this window: ${why}`,
+    );
 }
 
 /**
@@ -6916,23 +7044,12 @@ async function briefWindow($: Engine, body: unknown): Promise<void> {
   if (typeof answer.briefing !== "string" || answer.briefing === "") return;
   const id =
     typeof answer.chat?.thread === "string" ? answer.chat.thread : "the chat";
-  try {
-    const kept = await $.session.append({
-      message: {
-        type: "user",
-        content: [{ type: "text", text: answer.briefing }],
-      },
-    });
-    if (kept.deny === undefined) {
-      $.ui.toast(`dc: this window was briefed on ${id} from its summary`);
-      return;
-    }
-    $.ui.toast(`dc: ${id}'s briefing did not reach this window: ${kept.deny}`);
-  } catch (error) {
-    $.ui.toast(
-      `dc: ${id}'s briefing did not reach this window: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+  const why = await addRow($, answer.briefing);
+  $.ui.toast(
+    why === null
+      ? `dc: this window was briefed on ${id} from its summary`
+      : `dc: ${id}'s briefing did not reach this window: ${why}`,
+  );
 }
 
 /**
@@ -6963,7 +7080,7 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
   if (life !== sessionLife) return;
   if (typeof posted !== "string") {
     if (posted.status === 200) {
-      if (mirror === null) mirrorOpened($, posted, "it was not rejoined");
+      if (mirror === null) await mirrorOpened($, posted, "it was not rejoined");
       return;
     }
     const code = (posted.body as { code?: unknown } | null)?.code;
@@ -6994,17 +7111,8 @@ async function asideAtStop(
   agentId: string | undefined,
 ): Promise<string> {
   $.ui.toast(handOverToast(text));
-  let why: string;
-  try {
-    const kept = await $.session.append({
-      message: { type: "user", content: [{ type: "text", text }] },
-      ...(agentId === undefined ? {} : { agentId }),
-    });
-    if (kept.deny === undefined) return handOverLine(text);
-    why = kept.deny;
-  } catch (error) {
-    why = error instanceof Error ? error.message : String(error);
-  }
+  const why = await addRow($, text, agentId);
+  if (why === null) return handOverLine(text);
   $.ui.log(`devcorner: a hand-over stays in the stop hook's text: ${why}`, {
     to: "debug",
   });
@@ -7065,6 +7173,22 @@ export const register: Register = (on) => {
   on("classic.UserPromptSubmit", async ($, e, next) =>
     toastHandOvers($, await next(e)),
   );
+  // A window that mirrors a laptop chat is told again where its replies are
+  // read after each compaction, which Claude Code follows with a
+  // SessionStart of source `compact`, after what the hook script gives. A
+  // start or a resume mirrors nothing until its rejoin is answered, which
+  // tells it then (`mirrorOpened`).
+  on("classic.SessionStart", async ($, e, next) => {
+    const ran = await next(e);
+    if (e.source !== "compact" || mirror === null) return ran;
+    return {
+      ...ran,
+      additionalContext: [
+        ...(ran.additionalContext ?? []),
+        LAPTOP_CHAT_INSTRUCTION,
+      ],
+    };
+  });
 
   // The engine raises this when a window moves a whole point, after a turn.
   on("session.measure", async ($, e, next) => {

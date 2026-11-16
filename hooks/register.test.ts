@@ -74,6 +74,8 @@ import {
   pendingOf,
   readHeld,
   stepParts,
+  toolCall,
+  lineLabel,
   keepExchange,
   keepTasks,
   seenFor,
@@ -91,6 +93,7 @@ import {
   MAX_EXCHANGES,
   MIRROR_BATCH_MS,
   MIRROR_RETRY_MS,
+  LAPTOP_CHAT_INSTRUCTION,
   ASK_LOOK_MS,
   MIRROR_BEAT_MS,
   askQuestions,
@@ -7527,6 +7530,58 @@ describe("a laptop chat's mirror", () => {
     expect(state).toMatchObject({ open: null, tool: null });
   });
 
+  test("a tool call's line is short: devcorner's tools with their short arguments, any other by one short label", () => {
+    // devcorner's own tool by its name, its short arguments for devcorner to
+    // name what it acts on; a long one (a body) is not sent.
+    expect(
+      toolCall(
+        "mcp__plugin_devcorner_devcorner__workspace",
+        JSON.stringify({
+          session: "dc-s3688@devcorner-app",
+          action: "coordinator",
+          project: "web",
+          number: 4,
+          body: "x".repeat(201),
+          rules: { on: true },
+        }),
+      ),
+    ).toEqual({
+      toolName: "workspace",
+      input: {
+        args: {
+          session: "dc-s3688@devcorner-app",
+          action: "coordinator",
+          project: "web",
+          number: 4,
+        },
+      },
+    });
+    // Another server's tool by its own name, with no MCP prefix.
+    expect(
+      toolCall("mcp__github__get_file_contents", '{"owner":"acme"}'),
+    ).toEqual({ toolName: "get_file_contents", input: { label: "acme" } });
+    // A file by its name, however long or spaced its path; a pattern as it
+    // is; a command by its first words, past a `cd`.
+    expect(
+      lineLabel(
+        JSON.stringify({
+          file_path: `/Users/ann/My Projects/${"deep/".repeat(30)}cart.ts`,
+        }),
+      ),
+    ).toBe("cart.ts");
+    expect(lineLabel('{"pattern":"/api/v1/"}')).toBe("/api/v1/");
+    expect(
+      lineLabel(
+        JSON.stringify({
+          command:
+            "cd /home/ann/shop && pnpm vitest run test/cart.test.ts test/checkout.test.ts --reporter dot",
+        }),
+      ),
+    ).toBe("pnpm vitest run test/cart.test.ts test/checkout.test.ts…");
+    expect(lineLabel('{"command":"pnpm test"}')).toBe("pnpm test");
+    expect(lineLabel("{")).toBe("");
+  });
+
   const OPENED = {
     status: 200,
     body: {
@@ -7632,7 +7687,11 @@ describe("a laptop chat's mirror", () => {
     await flush(clock);
     expect(parts(seen)[2]).toMatchObject({
       turn: "t1",
-      end: { text: "All pass.", tools: ["Bash: pnpm test"], outcome: "done" },
+      end: {
+        text: "All pass.",
+        tools: [{ name: "Bash", input: { label: "pnpm test" } }],
+        outcome: "done",
+      },
     });
   });
 
@@ -8133,7 +8192,12 @@ describe("a laptop chat's mirror", () => {
     expect(parts(seen).at(-1)).toMatchObject({
       end: {
         text: "Fixed.",
-        tools: ["Read: a.ts", "Grep: x", "Edit: a.ts", "Bash: pnpm test"],
+        tools: [
+          { name: "Read", input: { label: "a.ts" } },
+          { name: "Grep", input: { label: "x" } },
+          { name: "Edit", input: { label: "a.ts" } },
+          { name: "Bash", input: { label: "pnpm test" } },
+        ],
         steps: [
           { text: "Let me look.", calls: 3 },
           { text: "Now the test.", calls: 1 },
@@ -9000,7 +9064,7 @@ describe("a laptop chat's mirror", () => {
       thread: "me-k3",
       git: { head: "4f2a9c1" },
     });
-    expect(rows).toEqual([briefing]);
+    expect(rows).toEqual([LAPTOP_CHAT_INSTRUCTION, briefing]);
     expect(seen.toasts).toContain(
       "dc: this window was briefed on me-k3 from its summary",
     );
@@ -9010,7 +9074,89 @@ describe("a laptop chat's mirror", () => {
       body: { ...OPENED.body, started: false, briefing: null },
     });
     await $.command.run({ command: "dc", args: "continue me-k3" } as never);
+    expect(rows).toHaveLength(2);
+  });
+
+  test("a window is told where its replies are read as its mirroring begins and after each compaction while it mirrors, and never otherwise", async ($, on) => {
+    const { clock, seen } = world(on);
+    const rows: string[] = [];
+    on("session.append", async (_$, e, next) => {
+      rows.push((e.message.content[0] as { text: string }).text);
+      return next(e);
+    });
+    on("classic.SessionStart", async () => ({ additionalContext: ["brief"] }));
+    await $.session.start(START);
+    await flush(clock);
+    // Not mirroring: nothing at a start, nor at a compaction.
+    expect(await $.classic.SessionStart({ source: "startup" })).toEqual({
+      additionalContext: ["brief"],
+    });
+    expect(
+      (await $.classic.SessionStart({ source: "compact" })).additionalContext,
+    ).toEqual(["brief"]);
+    expect(rows).toEqual([]);
+
+    // /dc chat: once, in the transcript, where the mirroring begins.
+    seen.chatAnswers.push(OPENED);
+    await $.command.run({ command: "dc", args: "chat" } as never);
+    expect(rows).toEqual([LAPTOP_CHAT_INSTRUCTION]);
+    // A compaction while it mirrors gives it again, after the hook script's.
+    expect(
+      (await $.classic.SessionStart({ source: "compact" })).additionalContext,
+    ).toEqual(["brief", LAPTOP_CHAT_INSTRUCTION]);
+    // A start or a resume is told by its rejoin, never at its SessionStart.
+    expect(
+      (await $.classic.SessionStart({ source: "resume" })).additionalContext,
+    ).toEqual(["brief"]);
+    // A chat the window already mirrors begins nothing anew.
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ...OPENED.body, started: false },
+    });
+    await $.command.run({ command: "dc", args: "continue me-k3" } as never);
     expect(rows).toHaveLength(1);
+
+    // Off: nothing more.
+    await $.command.run({ command: "dc", args: "chat off" } as never);
+    await flush(clock);
+    expect(
+      (await $.classic.SessionStart({ source: "compact" })).additionalContext,
+    ).toEqual(["brief"]);
+
+    // /dc continue in a window that mirrors none: once more, as it begins.
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ...OPENED.body, started: false },
+    });
+    await $.command.run({ command: "dc", args: "continue me-k3" } as never);
+    expect(rows).toEqual([LAPTOP_CHAT_INSTRUCTION, LAPTOP_CHAT_INSTRUCTION]);
+  });
+
+  test("a restarted or resumed window is told once its rejoin is taken, and never when it is refused", async ($, on) => {
+    const { clock, seen, stored } = world(on, {
+      store: { "laptopChat:conversation-1": "me-k3" },
+    });
+    const rows: string[] = [];
+    on("session.append", async (_$, e, next) => {
+      rows.push((e.message.content[0] as { text: string }).text);
+      return next(e);
+    });
+    // A chat that moved to another window meanwhile: refused, and not told.
+    seen.chatAnswers.push({
+      status: 409,
+      body: { error: "me-k3 moved.", code: "laptop-detached" },
+    });
+    await $.session.start(START);
+    await flush(clock);
+    expect(rows).toEqual([]);
+
+    // One still its own: told as the rejoin is taken.
+    stored.set("laptopChat:conversation-1", "me-k3");
+    await $.session.end({ sessionId: "conversation-1" } as never);
+    seen.chatAnswers.push(OPENED);
+    await $.session.start(START);
+    await flush(clock);
+    expect(rows).toEqual([LAPTOP_CHAT_INSTRUCTION]);
   });
 
   /** Every state of an ask the turn's posts told the page, in order. */
