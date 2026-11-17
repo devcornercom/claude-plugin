@@ -3,7 +3,7 @@
 // begun and ended on devcorner's hook route, the launcher spawned with its
 // spec on standard input, and the result the model reads.
 
-import { describe, expect, test } from "claude-code/testing";
+import { describe, expect, mock, test } from "claude-code/testing";
 import type { On } from "claude-code";
 import {
   LOCAL_AGENT,
@@ -18,6 +18,8 @@ import {
   childResultText,
   installedLauncher,
   launcherSpec,
+  LOCAL_DISMISSED_ASK,
+  LOCAL_DISMISSED_FIRST,
   localFirstUse,
   localNobodyText,
   nodeRunsLocalAgent,
@@ -28,6 +30,11 @@ import {
 
 const TOOL = "mcp__Devcorner__subagent";
 const NODE = "/home/ann/.nvm/versions/node/v24.7.0/bin/node";
+/** A version nvm installed, as its folder names it. */
+const nvmNode = (version: string) =>
+  `/home/ann/.nvm/versions/node/${version}/bin/node`;
+/** nvm's default on a laptop with a newer Node installed beside it. */
+const OLD_NODE = nvmNode("v22.18.0");
 const STATE = "/home/ann/.cache/devcorner";
 const STUB = "/home/ann/stub-launcher.js";
 const CALL = {
@@ -90,6 +97,9 @@ function laptop(
     store?: Record<string, unknown>;
     /** What `node --version` prints. */
     nodeVersion?: string;
+    /** The node the login shell finds, and what other nodes print for `--version`, by path; each is a file too. */
+    shellNode?: string;
+    versions?: Record<string, string>;
     /** What origin's HEAD names; null for a clone that has none. */
     originHead?: string | null;
     claim?: string | null;
@@ -103,8 +113,20 @@ function laptop(
     begin?: { status: number; body: unknown }[];
     files?: string[];
     processRefused?: boolean;
+    /** Whether something draws the window: a dismissed question is then not "nobody can be asked". */
+    surface?: boolean;
+    /** The children's folder sweep runs and ends with a removal refused. */
+    sweepFails?: boolean;
+    /**
+     * devcorner ties the window to its session only once a Status carries the
+     * claim, and until then refuses a subagent token as the hook route does.
+     */
+    tiedByStatus?: boolean;
+    /** How many Status reads devcorner answers that it is updating, first. */
+    updating?: number;
   } = {},
 ) {
+  const clock = mock.clock(on, { now: 1_000_000 });
   const stored = new Map<string, unknown>(
     Object.entries(options.store ?? { [LOCAL_AGENT_ANSWER]: "yes" }),
   );
@@ -130,9 +152,29 @@ function laptop(
   on("session.id", async () => ({ value: "conversation-1" }));
   on("session.cwd", async () => ({ value: "/work/shop/src" }));
   const claim = options.claim === undefined ? "dc-s5@acme" : options.claim;
-  const files = new Set(options.files ?? [NODE]);
+  const versions = options.versions ?? {};
+  const files = new Set([
+    ...(options.files ?? [NODE]),
+    ...Object.keys(versions),
+  ]);
   on("fs.exists", async (_$, e) => ({
     value: files.has(e.path) || (e.path.endsWith(".claim") && claim !== null),
+  }));
+  // A folder holds the first part of each file's path under it.
+  on("fs.list", async (_$, e) => ({
+    value: [
+      ...new Set(
+        [...files]
+          .filter((path) => path.startsWith(`${e.path}/`))
+          .map((path) => path.slice(e.path.length + 1).split("/")[0]!),
+      ),
+    ].map((name) => ({
+      name,
+      kind: "dir" as const,
+      size: 0,
+      mtimeMs: 0,
+      isLink: false,
+    })),
   }));
   on("fs.read", async (_$, e) => {
     if (e.path.endsWith(".claim") && claim !== null)
@@ -140,6 +182,7 @@ function laptop(
     return { deny: "missing" };
   });
   const seen = {
+    clock,
     store: stored,
     events: [] as {
       name: string;
@@ -158,6 +201,8 @@ function laptop(
     logs: [] as string[],
   };
   const begins = [...(options.begin ?? [])];
+  let updating = options.updating ?? 0;
+  let tied = !options.tiedByStatus;
   on("http.fetch", async (_$, e) => {
     const body = JSON.parse(String(e.init?.body ?? "{}")) as Record<
       string,
@@ -177,6 +222,37 @@ function laptop(
         text: JSON.stringify(answer),
       },
     });
+    if (name === "Status" && updating > 0) {
+      updating--;
+      return {
+        value: {
+          status: 503,
+          ok: false,
+          headers: { "retry-after": "5" },
+          text: JSON.stringify({ error: "updating", retryAfter: 5 }),
+        },
+      };
+    }
+    if (name === "Status") {
+      if (body.claim === claim) tied = true;
+      return reply(200, {
+        known: true,
+        claim:
+          body.claim === undefined
+            ? null
+            : {
+                session: body.claim,
+                outcome: "repaired",
+                was: null,
+                why: null,
+                final: false,
+              },
+      });
+    }
+    if (name === "SubagentToken" && !tied)
+      return reply(403, {
+        error: `No window of this machine works as ${body.claim}: a subagent token is made for a session a window on the machine that asks works as, which its plugin claimed.`,
+      });
     if (name === "SubagentToken")
       return reply(200, {
         token: `dcs_${seen.events.filter((s) => s.name === name).length}`,
@@ -189,25 +265,35 @@ function laptop(
     if (name === "ChildEnd") return reply(200, { ok: true, ended: 1 });
     return reply(404, {});
   });
-  const ran = (stdout: string, exitCode = 0) => ({
+  const ran = (stdout: string, exitCode = 0, stderr = "") => ({
     value: {
       exitCode,
       stdout,
-      stderr: "",
+      stderr,
       isStdoutTruncated: false,
       isStderrTruncated: false,
     },
   });
+  on("session.surfaces", async () => ({
+    value: options.surface ? (["terminal"] as const) : [],
+  }));
   on("process.run", async (_$, e) => {
     seen.runs.push([...e.argv]);
     const [first] = e.argv;
+    if (options.sweepFails && e.argv[2]?.includes("-mmin +1440"))
+      return ran("", 1, "rm: cannot remove 'dc-s3@acme': Permission denied\n");
     if (first === "true") {
       if (options.processRefused) throw new Error("$.process is CLI only");
       return ran("");
     }
-    if (first === "/bin/zsh") return ran(`Welcome\n${NODE}\n`);
+    if (first === "/bin/zsh")
+      return ran(`Welcome\n${options.shellNode ?? NODE}\n`);
     if (first === NODE && e.argv[1] === "--version")
       return ran(`${options.nodeVersion ?? "v24.7.0"}\n`);
+    if (first !== undefined && first in versions && e.argv[1] === "--version")
+      return ran(`${versions[first]}\n`);
+    if (first === "git" && e.argv.includes("get-url"))
+      return ran("git@github.com:acme/shop.git\n");
     if (first === "git" && e.argv.includes("--show-toplevel"))
       return ran("/work/shop\n");
     if (first === "git" && e.argv.includes("--show-current"))
@@ -293,20 +379,22 @@ describe("a subagent call answered on this laptop", () => {
       `git apply --check ${STATE}/local-agent/children/dc-s7@acme/1.patch`,
     );
     // The token is made with the machine's hook token for the window's
-    // session; the round is begun and ended with the subagent token alone.
+    // session, once a Status said the claim; the round is begun and ended
+    // with the subagent token alone.
     expect(seen.events.map((e) => [e.name, e.token])).toEqual([
+      ["Status", "dch_machine"],
       ["SubagentToken", "dch_machine"],
       ["ChildBegin", "dcs_1"],
       ["ChildEnd", "dcs_1"],
     ]);
-    expect(seen.events[0]!.body.claim).toBe("dc-s5@acme");
-    expect(seen.events[1]!.body).toMatchObject({
+    expect(seen.events[1]!.body.claim).toBe("dc-s5@acme");
+    expect(seen.events[2]!.body).toMatchObject({
       subagent_type: "edit",
       description: "rename the cart",
       branch: "feature",
     });
-    expect(seen.events[1]!.body).not.toHaveProperty("prompt");
-    expect(seen.events[2]!.body).toMatchObject({
+    expect(seen.events[2]!.body).not.toHaveProperty("prompt");
+    expect(seen.events[3]!.body).toMatchObject({
       child: "dc-s7@acme",
       round: 1,
       outcome: "done",
@@ -367,8 +455,10 @@ describe("a subagent call answered on this laptop", () => {
     });
     expect(said(await $.tool.call(CALL as never))).toContain("ended done");
     expect(seen.events.map((e) => [e.name, e.token])).toEqual([
+      ["Status", "dch_machine"],
       ["SubagentToken", "dch_machine"],
       ["ChildBegin", "dcs_1"],
+      ["Status", "dch_machine"],
       ["SubagentToken", "dch_machine"],
       ["ChildBegin", "dcs_2"],
       ["ChildEnd", "dcs_2"],
@@ -410,7 +500,7 @@ describe("a subagent call answered on this laptop", () => {
       resume: "dc-s7@acme",
       prompt: "Also rename it in the tests.",
     } as never);
-    expect(seen.events[1]).toMatchObject({
+    expect(seen.events[2]).toMatchObject({
       name: "ChildResume",
       body: { child: "dc-s7@acme" },
     });
@@ -470,6 +560,35 @@ describe("a subagent call answered on this laptop", () => {
     expect(said(await $.tool.call(CALL as never))).toBe(LOCAL_NO_SESSION);
   });
 
+  test("a call just after the window's start says its claim before it asks for the token, so it runs", async ($, on) => {
+    const seen = laptop(on, { tiedByStatus: true });
+    expect(said(await $.tool.call(CALL as never))).toContain("ended done");
+    expect(seen.events.map((e) => [e.name, e.body.claim])).toEqual([
+      ["Status", "dc-s5@acme"],
+      ["SubagentToken", "dc-s5@acme"],
+      ["ChildBegin", undefined],
+      ["ChildEnd", undefined],
+    ]);
+  });
+
+  test("while devcorner is updating, the claim is said again when it asked, and the call then runs", async ($, on) => {
+    const seen = laptop(on, { tiedByStatus: true, updating: 2 });
+    const call = $.tool.call(CALL as never);
+    for (let i = 0; i < 2; i++) {
+      await seen.clock.settle();
+      await seen.clock.advance(5_000);
+    }
+    expect(said(await call)).toContain("ended done");
+    expect(seen.events.map((e) => e.name)).toEqual([
+      "Status",
+      "Status",
+      "Status",
+      "SubagentToken",
+      "ChildBegin",
+      "ChildEnd",
+    ]);
+  });
+
   test("where $.process is refused, the desktop app's or an IDE's, the call says the command line runs it", async ($, on) => {
     laptop(on, { processRefused: true });
     expect(said(await $.tool.call(CALL as never))).toContain(
@@ -477,18 +596,51 @@ describe("a subagent call answered on this laptop", () => {
     );
   });
 
-  test("a Node older than 22.19 is refused, naming it, its version read at each call", async ($, on) => {
-    laptop(on, {
-      store: { [LOCAL_AGENT_ANSWER]: "yes", localAgentNode: NODE },
-      nodeVersion: "v22.18.0",
+  test("a Node older than 22.19, kept or the login shell's, with none newer beside it, is refused, naming it and how to install one", async ($, on) => {
+    const seen = laptop(on, {
+      store: { [LOCAL_AGENT_ANSWER]: "yes", localAgentNode: OLD_NODE },
+      shellNode: OLD_NODE,
+      files: [],
+      versions: {
+        [OLD_NODE]: "v22.18.0",
+        [nvmNode("v20.11.0")]: "v20.11.0",
+      },
     });
     expect(said(await $.tool.call(CALL as never))).toBe(
-      `Local subagents need Node 22.19 or later; ${NODE} is v22.18.0. /dc local-agent install looks for Node again.`,
+      `Local subagents need Node 22.19 or later; your login shell's node, ${OLD_NODE}, is v22.18.0. No newer version is installed beside it: install one with its version manager, as \`nvm install --lts\` does with nvm, and try again.`,
     );
+    // The kept one, too old, sent it to look again.
+    expect(seen.runs.some(([first]) => first === "/bin/zsh")).toBe(true);
+    expect(seen.spawns).toHaveLength(0);
     expect(nodeRunsLocalAgent("v22.19.0")).toBe(true);
     expect(nodeRunsLocalAgent("v23.0.1")).toBe(true);
     expect(nodeRunsLocalAgent("v20.11.0")).toBe(false);
     expect(nodeRunsLocalAgent("node")).toBe(false);
+  });
+
+  test("a login shell whose node is too old runs the newest that runs it installed beside it, and keeps it", async ($, on) => {
+    const newest = nvmNode("v24.22.0");
+    const seen = laptop(on, {
+      store: { [LOCAL_AGENT_ANSWER]: "yes", localAgentNode: OLD_NODE },
+      shellNode: OLD_NODE,
+      // v25.0.0's folder holds no node: an install that did not finish.
+      files: ["/home/ann/.nvm/versions/node/v25.0.0/.cache"],
+      versions: {
+        [OLD_NODE]: "v22.18.0",
+        [nvmNode("v20.11.0")]: "v20.11.0",
+        [nvmNode("v24.3.0")]: "v24.3.0",
+        [newest]: "v24.22.0",
+        // A nightly is never taken, though it sorts first.
+        [nvmNode("v26.0.0-nightly20261101")]: "v26.0.0-nightly20261101",
+      },
+    });
+    expect(said(await $.tool.call(CALL as never))).toContain("ended done");
+    expect(seen.spawns.map((s) => s.argv[0])).toEqual([newest]);
+    expect(seen.store.get("localAgentNode")).toBe(newest);
+    // The kept node, also the shell's, is asked its version once.
+    expect(
+      seen.runs.filter(([, flag]) => flag === "--version").map(([p]) => p),
+    ).toEqual([OLD_NODE, newest]);
   });
 
   test("the first use asks once, trust before size, and its yes stands for the call's own", async ($, on) => {
@@ -535,6 +687,22 @@ describe("a subagent call answered on this laptop", () => {
     expect(said(await $.tool.call(CALL as never))).toBe(LOCAL_NOBODY_FIRST);
   });
 
+  test("a first-use question closed in a window with a surface reads as not now and keeps nothing", async ($, on) => {
+    const seen = laptop(on, { store: {}, answers: [null], surface: true });
+    expect(said(await $.tool.call(CALL as never))).toBe(LOCAL_DISMISSED_FIRST);
+    expect(seen.store.has(LOCAL_AGENT_ANSWER)).toBe(false);
+  });
+
+  test("a call's own question closed in a window with a surface reads as not now", async ($, on) => {
+    const seen = laptop(on, {
+      decision: "ask",
+      answers: [null],
+      surface: true,
+    });
+    expect(said(await $.tool.call(CALL as never))).toBe(LOCAL_DISMISSED_ASK);
+    expect(seen.spawns).toEqual([]);
+  });
+
   test("with the package unpublished and no launcher named, nothing is asked or installed and the call says so", async ($, on) => {
     const seen = laptop(on, {
       store: {},
@@ -546,6 +714,76 @@ describe("a subagent call answered on this laptop", () => {
     );
     expect(seen.asks).toEqual([]);
     expect(seen.runs.some((argv) => argv.includes("install"))).toBe(false);
+  });
+
+  test("/dc local-agent install with the package unpublished keeps no yes", async ($, on) => {
+    const seen = laptop(on, {
+      store: {},
+      env: { [LOCAL_AGENT_ENV]: undefined },
+    });
+    const out = await $.command.run({
+      command: "dc",
+      args: "local-agent install",
+    });
+    expect(JSON.stringify(out)).toContain("is not on npm yet");
+    expect(seen.asks).toEqual([]);
+    expect(seen.store.has(LOCAL_AGENT_ANSWER)).toBe(false);
+  });
+
+  test("/dc local-agent install with a launcher named asks the first-use question, and keeps a yes only on Run them", async ($, on) => {
+    const seen = laptop(on, { store: {}, answers: ["Not now", "Run them"] });
+    const install = () =>
+      $.command.run({ command: "dc", args: "local-agent install" });
+    expect(JSON.stringify(await install())).toContain(LOCAL_DECLINED);
+    expect(seen.store.get(LOCAL_AGENT_ANSWER)).toBe("no");
+    expect(JSON.stringify(await install())).toContain(
+      `Local subagents run the launcher ${LOCAL_AGENT_ENV} names`,
+    );
+    expect(seen.asks).toEqual([localFirstUse(false), localFirstUse(false)]);
+    expect(seen.store.get(LOCAL_AGENT_ANSWER)).toBe("yes");
+  });
+
+  // Not covered: an interrupted turn. The round's end is posted once from
+  // the abort listener on the call's signal (`answerSubagent`'s `stopped`),
+  // but `$.tool.call` in this kit takes the call alone and passes the hook a
+  // signal that never aborts (a second argument with a signal is ignored,
+  // and the round runs to its end), so no test can raise one. The path is
+  // left to a person's interrupt of a real round.
+
+  test("a cleanup of the children's folder that fails is logged, and the round's result stands", async ($, on) => {
+    const seen = laptop(on, { sweepFails: true });
+    expect(said(await $.tool.call(CALL as never))).toContain("ended done");
+    expect(
+      seen.logs.filter((l) => l.includes("cleaning the children's folder")),
+    ).toEqual([
+      "cleaning the children's folder after dc-s7@acme's round failed: the sweep ended with 1: rm: cannot remove 'dc-s3@acme': Permission denied",
+    ]);
+  });
+
+  test("a resume marks the folder of the child devcorner names in use, and a refused resume touches nothing", async ($, on) => {
+    const seen = laptop(on, {
+      begin: [
+        { status: 200, body: BEGUN },
+        { status: 403, body: { error: "dc-s9 is not a child of yours." } },
+      ],
+    });
+    // Named without its workspace, the child's folder is still its full id's.
+    await $.tool.call({
+      tool: TOOL,
+      resume: "dc-s7",
+      prompt: "Go on.",
+    } as never);
+    const touches = () =>
+      seen.runs.filter((argv) => argv[2]?.includes("touch"));
+    expect(touches().map((argv) => argv.at(-1))).toEqual([
+      `${STATE}/local-agent/children/dc-s7@acme`,
+    ]);
+    await $.tool.call({
+      tool: TOOL,
+      resume: "dc-s9@acme",
+      prompt: "Go on.",
+    } as never);
+    expect(touches()).toHaveLength(1);
   });
 
   test("an installed launcher runs with the person's earlier yes and no question", async ($, on) => {

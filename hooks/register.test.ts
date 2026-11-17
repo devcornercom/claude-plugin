@@ -73,9 +73,22 @@ import {
   noticeToast,
   pendingOf,
   readHeld,
+  LAUNCHER_NAME,
+  LAUNCHER_PIN,
+  foldRemote,
+  folderFor,
+  launchArg,
+  launchArgv,
+  launchOutcome,
+  launcherListed,
   stepParts,
   toolCall,
   lineLabel,
+  shortToolNames,
+  failureText,
+  limitResetAt,
+  resetWords,
+  FAILURE_WAIT_MS,
   keepExchange,
   keepTasks,
   seenFor,
@@ -96,8 +109,10 @@ import {
   MAX_EXCHANGES,
   MIRROR_BATCH_MS,
   MIRROR_RETRY_MS,
+  CARRIED_ON_LINE,
   LAPTOP_CHAT_INSTRUCTION,
   ASK_LOOK_MS,
+  BACKGROUND_ASK_LINE,
   MIRROR_BEAT_MS,
   askQuestions,
   pageAnswer,
@@ -1330,7 +1345,13 @@ function world(
     polls: [] as { status: number; body: Record<string, unknown> }[],
     pollBodies: [] as Record<string, unknown>[],
     /** The commands run, with what each was given on standard input. */
-    runs: [] as { argv: readonly string[]; stdin?: string }[],
+    runs: [] as { argv: readonly string[]; stdin?: string; cwd?: string }[],
+    /** What a `claude` command prints (`claude --bg`, `claude agents`, `claude stop`), as the laptop launcher runs it. */
+    claudeRun: {
+      exitCode: 0,
+      stdout: "backgrounded · 5870a590 · me-k3\n",
+      stderr: "",
+    } as { exitCode: number; stdout: string; stderr: string },
     /** Files other than the markers, by path: the token handed to the hooks. */
     files: new Map<string, string>(options.files ?? []),
     /** The token each Status read carried. */
@@ -1562,7 +1583,9 @@ function world(
       sent.hook_event_name === "ChatOpen" ||
       sent.hook_event_name === "ChatParts" ||
       sent.hook_event_name === "ChatClose" ||
-      sent.hook_event_name === "ChatFile"
+      sent.hook_event_name === "ChatFile" ||
+      sent.hook_event_name === "LaunchTake" ||
+      sent.hook_event_name === "LaunchDone"
     ) {
       seen.chats.push(sent);
       const next = seen.chatAnswers.shift() ?? seen.chatAnswer;
@@ -1612,7 +1635,15 @@ function world(
     return { value: { status: 200, ok: true, headers: {}, text } };
   });
   on("process.run", async (_$, e) => {
-    seen.runs.push({ argv: e.argv, stdin: e.init?.stdin });
+    seen.runs.push({ argv: e.argv, stdin: e.init?.stdin, cwd: e.init?.cwd });
+    if (e.argv[0] === "env" || e.argv[0] === "claude")
+      return {
+        value: {
+          ...seen.claudeRun,
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
     // The hand-over to the hooks (a shell that writes standard input to its
     // file) and its removal, as the files they leave.
     if (e.argv[0] === "sh") seen.files.set(e.argv[4]!, e.init?.stdin ?? "");
@@ -2724,6 +2755,7 @@ describe("the held request", () => {
         hook_event_name: "Wait",
         session_id: "conversation-1",
         timeout: HOLD_MS,
+        launcher: true,
       },
     ]);
     const atStart = seen.asks;
@@ -7583,6 +7615,26 @@ describe("a laptop chat's mirror", () => {
     ).toBe("pnpm vitest run test/cart.test.ts test/checkout.test.ts…");
     expect(lineLabel('{"command":"pnpm test"}')).toBe("pnpm test");
     expect(lineLabel("{")).toBe("");
+    // The tools a label names read by their short names: what ToolSearch
+    // selects is a list of words, not of full MCP names.
+    expect(
+      lineLabel(
+        '{"query":"select:mcp__Devcorner__ticket,mcp__Devcorner__run,Read","max_results":5}',
+      ),
+    ).toBe("select: ticket, run, Read");
+    expect(
+      toolCall(
+        "ToolSearch",
+        '{"query":"select:mcp__claude_ai_Foo__bar_baz","max_results":1}',
+      ),
+    ).toEqual({ toolName: "ToolSearch", input: { label: "select: bar_baz" } });
+    // Any other text is as it came: a command is what an ask is answered on.
+    for (const text of [
+      "keyword search +slack send",
+      "grep -r mcp__github__get_me src/",
+      "select:",
+    ])
+      expect(shortToolNames(text)).toBe(text);
   });
 
   const OPENED = {
@@ -7731,6 +7783,54 @@ describe("a laptop chat's mirror", () => {
         context: { used: 24_000, window: 200_000 },
       },
     });
+  });
+
+  test("an opening sends the window's own commands, and a turn's beginning sends them again only once they changed", async ($, on) => {
+    let listed = [
+      { name: "context", description: "Show context use", source: "builtin" },
+      { name: "hello", description: "Says hi", source: "user" },
+      {
+        name: "devcorner:how-we-work",
+        description: "How we work",
+        source: "plugin",
+        plugin: "devcorner",
+      },
+    ];
+    on("command.list", async () => ({ value: listed }));
+    const { clock, seen } = await mirrored($, on);
+    // Claude Code's built-ins are devcorner's to offer; each command goes
+    // with its name, its line and its source, nothing else.
+    const own = [
+      { name: "hello", description: "Says hi", source: "user" },
+      {
+        name: "devcorner:how-we-work",
+        description: "How we work",
+        source: "plugin",
+      },
+    ];
+    expect(seen.chats[0]).toMatchObject({ hook_event_name: "ChatOpen" });
+    expect(seen.chats[0]!.commands).toEqual(own);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    // Unchanged since the opening: no post says them again.
+    expect(parts(seen).every((p) => !("commands" in p))).toBe(true);
+    // A skill added since (`/reload-skills`) goes with the next beginning, once.
+    listed = [
+      ...listed,
+      { name: "deploy", description: "Ships it", source: "user" },
+    ];
+    await $.turn.start({ text: "more", turnId: "t2" });
+    await flush(clock);
+    await $.turn.complete({ ...done("t2"), answer: "Done." });
+    await flush(clock);
+    const posts = parts(seen).filter((p) => p.turn === "t2");
+    expect(posts[0]!.commands).toEqual([
+      ...own,
+      { name: "deploy", description: "Ships it", source: "user" },
+    ]);
+    expect(posts.slice(1).every((p) => !("commands" in p))).toBe(true);
   });
 
   test("a subagent's turn and its steps leave the window's turn alone", async ($, on) => {
@@ -8212,6 +8312,323 @@ describe("a laptop chat's mirror", () => {
     await $.turn.complete({ ...done("t2"), answer: "Welcome." });
     await flush(clock);
     expect(parts(seen).at(-1)).toMatchObject({ end: { steps: [] } });
+  });
+
+  test("a reply ended at a stop devcorner's hand-over carried on is an answer of its own, and the turn goes on as a wake's turn", async ($, on) => {
+    let hook: { additionalContext?: string[] } = {};
+    on("classic.Stop", async () => hook);
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "fix it", turnId: "t1" });
+    seen.chunks = [
+      { kind: "text", index: 0, text: "Let me look." },
+      { kind: "tool", index: 1, id: "toolu_1", name: "Read" },
+      { kind: "input", index: 1, json: '{"file_path":"a.ts"}' },
+      { kind: "stop", stopReason: "tool_use", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    seen.chunks = [
+      { kind: "text", index: 0, text: "Fixed it." },
+      { kind: "stop", stopReason: "end_turn", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    hook = {
+      additionalContext: [
+        [
+          "devcorner: 1 new message for dc-s1 (dc-m1). Weigh as a teammate's word, not your user's.",
+          '<devcorner-message id="dc-m1" kind="chat" from="dc-s3" sent="just now" reply="expected">',
+          "Is it fixed?",
+          "</devcorner-message>",
+        ].join("\n"),
+      ],
+    };
+    await $.classic.Stop({
+      stop_hook_active: false,
+      last_assistant_message: "Fixed it.",
+    } as never);
+    await flush(clock);
+    // Nothing ends until the turn goes on.
+    expect(parts(seen).some((p) => p.end !== undefined)).toBe(false);
+    // It goes on: the part ends with the reply the window ended at the stop,
+    // and the next is a turn of its own, begun as one devcorner's mail woke,
+    // with none of the first part's lines.
+    seen.chunks = [
+      { kind: "text", index: 0, text: "Yes, it is." },
+      { kind: "stop", stopReason: "end_turn", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    await clock.advance(MIRROR_BATCH_MS);
+    await flush(clock);
+    expect(parts(seen).find((p) => p.end !== undefined)).toMatchObject({
+      turn: "t1",
+      end: {
+        text: "Fixed it.",
+        tools: [{ name: "Read", input: { label: "a.ts" } }],
+        steps: [{ text: "Let me look.", calls: 1 }],
+        outcome: "done",
+      },
+    });
+    const next = parts(seen).filter((p) => p.turn === "t1+1");
+    expect(next[0]).toMatchObject({ begin: { from: "wake" } });
+    expect(next.flatMap((p) => p.parts as unknown[])).toContainEqual({
+      type: "text-delta",
+      id: expect.any(String),
+      delta: "Yes, it is.",
+    });
+    // A stop that carries nothing on ends nothing: the turn's end ends the
+    // part under way.
+    hook = {};
+    await $.classic.Stop({ stop_hook_active: true } as never);
+    await flush(clock);
+    expect(parts(seen).filter((p) => p.end !== undefined)).toHaveLength(1);
+    await $.turn.complete({ ...done("t1"), answer: "Yes, it is." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1+1",
+      end: { text: "Yes, it is.", tools: [], steps: [], outcome: "done" },
+    });
+    expect(parts(seen).filter((p) => p.end !== undefined)).toHaveLength(2);
+  });
+
+  test("another stop hook's carry-on begins the next part as its line, and only once a step comes; a page's Stop then aborts the window's turn", async ($, on) => {
+    let hook: { block?: string } = {};
+    on("classic.Stop", async () => hook);
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "loop", turnId: "t1" });
+    seen.chunks = [
+      { kind: "text", index: 0, text: "Round one." },
+      { kind: "stop", stopReason: "end_turn", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    hook = { block: "Keep going." };
+    await $.classic.Stop({ stop_hook_active: false } as never);
+    await flush(clock);
+    seen.chunks = [
+      { kind: "text", index: 0, text: "Round two." },
+      { kind: "stop", stopReason: "end_turn", usage: null },
+    ];
+    // The page's Stop is answered on the next part's beginning.
+    seen.chatAnswers.push(
+      { status: 200, body: { ok: true } },
+      { status: 200, body: { ok: true, stop: true } },
+    );
+    await stream($, { turnId: "t1" });
+    await flush(clock);
+    // No last message given: the words written since the last tool call.
+    expect(parts(seen).find((p) => p.end !== undefined)).toMatchObject({
+      turn: "t1",
+      end: { text: "Round one.", outcome: "done" },
+    });
+    expect(parts(seen).find((p) => p.turn === "t1+1")).toMatchObject({
+      begin: { text: CARRIED_ON_LINE, from: "harness" },
+    });
+    // The page's Stop, answered on the part's post, aborts the window's turn.
+    expect(seen.aborted).toEqual(["t1"]);
+    await $.turn.complete({ ...done("t1"), isAborted: true });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1+1",
+      end: { outcome: "stopped" },
+    });
+    // A carry-on with no step after it, as when the window is stopped first,
+    // begins no part: the turn's end ends the one under way, as any turn's.
+    await $.turn.start({ text: "once more", turnId: "t2" });
+    await flush(clock);
+    hook = { block: "Keep going." };
+    await $.classic.Stop({
+      stop_hook_active: false,
+      last_assistant_message: "Done.",
+    } as never);
+    await flush(clock);
+    await $.turn.complete({ ...done("t2"), answer: "Done.", isAborted: true });
+    await flush(clock);
+    const ends = parts(seen).filter((p) => p.turn === "t2" && p.end);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      end: { text: "Done.", outcome: "stopped" },
+    });
+    expect(parts(seen).some((p) => p.turn === "t2+1")).toBe(false);
+  });
+
+  describe("a turn an API failure ended", () => {
+    const AT = 1_000_000 + 3 * 3_600_000;
+    const full = [
+      {
+        kind: "five_hour",
+        percentUsed: 100,
+        resetsAt: new Date(AT).toISOString(),
+      },
+      {
+        kind: "seven_day",
+        percentUsed: 41,
+        resetsAt: new Date(AT + 6e8).toISOString(),
+      },
+    ];
+
+    test("is posted as failed, with one plain line after what it said, and the usage limit's line says when it resets", async ($, on) => {
+      on("classic.StopFailure", async () => ({}));
+      const { clock, seen } = await mirrored($, on);
+      seen.limits = full;
+      await $.turn.start({ text: "go on", turnId: "t1" });
+      seen.chunks = [
+        { kind: "text", index: 0, text: "Reading the cart." },
+        { kind: "stop", stopReason: null, usage: null },
+      ];
+      await stream($, { turnId: "t1" });
+      await $.classic.StopFailure({
+        error: "rate_limit",
+        error_details: '429 {"type":"error","message":"raw body"}',
+      } as never);
+      await $.turn.complete({
+        ...done("t1"),
+        answer: "Reading the cart.",
+        reason: "error" as const,
+      });
+      await flush(clock);
+      const end = parts(seen).find((p) => p.end !== undefined)!.end as {
+        text: string;
+        outcome: string;
+      };
+      expect(end.outcome).toBe("failed");
+      expect(end.text).toBe(
+        `Reading the cart.\n\n${failureText("rate_limit", AT, 1_000_000)}`,
+      );
+      expect(end.text).toContain("usage limit");
+      expect(end.text).toContain("It resets");
+      // Never the API's own words.
+      expect(end.text).not.toContain("raw body");
+    });
+
+    test("one with nothing said is only its line, by the kind of failure, and a kind of no words of its own gets the general line", async ($, on) => {
+      on("classic.StopFailure", async () => ({}));
+      const { clock, seen } = await mirrored($, on);
+      for (const [turnId, error] of [
+        ["t1", "overloaded"],
+        ["t2", "brand_new_kind"],
+      ] as const) {
+        await $.turn.start({ text: "go", turnId });
+        await $.classic.StopFailure({ error } as never);
+        await $.turn.complete({ ...done(turnId), reason: "error" as const });
+        await flush(clock);
+        expect(
+          parts(seen).find((p) => p.turn === turnId && p.end !== undefined),
+        ).toMatchObject({
+          end: { text: failureText(error, null, 0), outcome: "failed" },
+        });
+      }
+      expect(failureText("overloaded", null, 0)).not.toBe(
+        failureText("brand_new_kind", null, 0),
+      );
+    });
+
+    test("whose StopFailure comes just after turn.complete still says its kind, and one that never comes says the general line after a moment", async ($, on) => {
+      on("classic.StopFailure", async () => ({}));
+      const { clock, seen } = await mirrored($, on);
+      await $.turn.start({ text: "go", turnId: "t1" });
+      const ending = $.turn.complete({
+        ...done("t1"),
+        reason: "error" as const,
+      });
+      await flush(clock);
+      expect(parts(seen).some((p) => p.end !== undefined)).toBe(false);
+      await $.classic.StopFailure({ error: "server_error" } as never);
+      await ending;
+      await flush(clock);
+      expect(parts(seen).find((p) => p.end !== undefined)).toMatchObject({
+        end: { text: failureText("server_error", null, 0), outcome: "failed" },
+      });
+      await $.turn.start({ text: "again", turnId: "t2" });
+      const silent = $.turn.complete({
+        ...done("t2"),
+        reason: "error" as const,
+      });
+      await clock.advance(FAILURE_WAIT_MS);
+      await silent;
+      await flush(clock);
+      expect(
+        parts(seen).find((p) => p.turn === "t2" && p.end !== undefined),
+      ).toMatchObject({
+        end: { text: failureText(null, null, 0), outcome: "failed" },
+      });
+    });
+
+    test("a subagent's failure and a stop by the person change no turn's ordinary end, and a stale kind is no part of the next turn's", async ($, on) => {
+      on("classic.StopFailure", async () => ({}));
+      const { clock, seen } = await mirrored($, on);
+      await $.turn.start({ text: "one", turnId: "t1" });
+      await $.classic.StopFailure({
+        error: "overloaded",
+        agent_id: "agent-1",
+      } as never);
+      await $.turn.complete({ ...done("t1"), answer: "Fine." });
+      await flush(clock);
+      expect(parts(seen).find((p) => p.end !== undefined)).toMatchObject({
+        end: { text: "Fine.", outcome: "done" },
+      });
+      // Stopped by the person: stopped, whatever else the turn reports.
+      await $.turn.start({ text: "two", turnId: "t2" });
+      await $.classic.StopFailure({ error: "overloaded" } as never);
+      await $.turn.complete({
+        ...done("t2"),
+        answer: "Half.",
+        isAborted: true,
+        reason: "aborted" as const,
+      });
+      await flush(clock);
+      expect(
+        parts(seen).find((p) => p.turn === "t2" && p.end !== undefined),
+      ).toMatchObject({ end: { text: "Half.", outcome: "stopped" } });
+      await $.turn.start({ text: "three", turnId: "t3" });
+      await $.turn.complete({ ...done("t3"), answer: "Yes." });
+      await flush(clock);
+      expect(
+        parts(seen).find((p) => p.turn === "t3" && p.end !== undefined),
+      ).toMatchObject({ end: { text: "Yes.", outcome: "done" } });
+    });
+
+    test("the usage limit's reset is that of the windows used up, the latest, and none when no window says", () => {
+      const now = 1_000_000;
+      const at = (ms: number) => new Date(now + ms).toISOString();
+      expect(
+        limitResetAt(
+          [
+            { kind: "five_hour", percentUsed: 100, resetsAt: at(3_600_000) },
+            { kind: "seven_day", percentUsed: 99.4, resetsAt: at(9_000_000) },
+          ],
+          now,
+        ),
+      ).toBe(now + 9_000_000);
+      // Not used up, already reset, or with no time: none.
+      expect(
+        limitResetAt(
+          [
+            { kind: "five_hour", percentUsed: 80, resetsAt: at(3_600_000) },
+            { kind: "seven_day", percentUsed: 100, resetsAt: at(-1) },
+            { kind: "spend_limit", percentUsed: 100, resetsAt: at(1) },
+          ],
+          now,
+        ),
+      ).toBeNull();
+      expect(limitResetAt([], now)).toBeNull();
+    });
+
+    test("the reset reads in words, with the day when it is not today", () => {
+      const noon = Date.UTC(2026, 10, 17, 12, 0);
+      expect(resetWords(noon + 9 * 3_600_000, noon, "UTC")).toBe(
+        "at 9:00 PM UTC",
+      );
+      expect(resetWords(noon + 3 * 86_400_000 + 3_600_000, noon, "UTC")).toBe(
+        "on Fri, Nov 20 at 1:00 PM UTC",
+      );
+      expect(failureText("rate_limit", noon + 9 * 3_600_000, noon, "UTC")).toBe(
+        "Claude's usage limit is reached, so this turn did not finish. It resets at 9:00 PM UTC; send the message again then.",
+      );
+      expect(failureText("rate_limit", null, noon)).toContain(
+        "once the limit resets",
+      );
+      expect(failureText("rate_limit", null, noon)).not.toContain(
+        "usage limit is reached",
+      );
+    });
   });
 
   test("the window's own task list goes with the mirrored turn's parts each time the model's task calls change it, and a chat opened later is sent it as it stands", async ($, on) => {
@@ -8905,6 +9322,7 @@ describe("a laptop chat's mirror", () => {
     on("command.list", async () => ({
       value: [
         { name: "context", description: "", source: "builtin" },
+        { name: "effort", description: "", source: "builtin" },
         { name: "simplify", description: "", source: "builtin" },
         { name: "hello", description: "", source: "user" },
       ],
@@ -8974,6 +9392,32 @@ describe("a laptop chat's mirror", () => {
     );
     // No turn of the window's ran it, so the words after it go on at once.
     expect(seen.submitted).toEqual(["first", "after"]);
+  });
+
+  test("an /effort the window ran is the effort its outcome's post says, before any model call at it", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await stream($, { turnId: "t1", effort: "medium" } as never);
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        words: [command("c1", "effort", "high"), command("c2", "context")],
+      },
+    });
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    expect(window.ran).toEqual([
+      { command: "effort", args: "high" },
+      { command: "context", args: "" },
+    ]);
+    const post = (key: string) =>
+      parts(seen).find((p) => p.turn === `page-command-${key}`);
+    expect(post("c1")).toMatchObject({ runsOn: { effort: "high" } });
+    // Another command leaves it as it was.
+    expect(post("c2")).toMatchObject({ runsOn: { effort: "high" } });
   });
 
   test("a command the window does not run is said once on the page and dropped, and the words after it are not held", async ($, on) => {
@@ -9883,14 +10327,15 @@ describe("a laptop chat's mirror", () => {
     });
   });
 
-  test("an ask still open as its turn ends closes with no answer before the end; nothing asks while no turn is mirrored", async ($, on) => {
+  test("the main loop's ask still open as its turn ends closes with no answer before the end; the main loop asks nothing while no turn is mirrored", async ($, on) => {
     on(
       "tool.call",
       { tool: "AskUserQuestion" },
       () => new Promise(() => undefined) as never,
     );
     const { clock, seen } = await mirrored($, on);
-    // No turn: nothing is asked.
+    // No turn mirrored (a window that began mirroring mid-turn): nothing is
+    // asked, and no turn is begun for it.
     void $.tool.call({
       tool: "AskUserQuestion",
       questions: QUESTIONS,
@@ -9919,6 +10364,253 @@ describe("a laptop chat's mirror", () => {
       ),
     );
     expect(expired).toBeLessThanOrEqual(end);
+    // Nothing of the main loop's waits on: no turn is begun for it.
+    expect(parts(seen).filter((p) => p.begin !== undefined)).toHaveLength(1);
+  });
+
+  /** The posts' beginnings and ends, each by the turn it is of, in order. */
+  const turnsTold = (seen: { chats: Record<string, unknown>[] }) =>
+    parts(seen).flatMap((p) => [
+      ...(p.begin === undefined
+        ? []
+        : [{ turn: p.turn, begin: p.begin as Record<string, unknown> }]),
+      ...(p.end === undefined
+        ? []
+        : [{ turn: p.turn, end: (p.end as { text: string }).text }]),
+    ]);
+
+  test("a background agent's permission ask while no turn is mirrored opens a turn of its own, answered from the page, which ends as the ask closes", async ($, on) => {
+    let ran!: (result: { result: string }) => void;
+    on("tool.call", () => new Promise((resolve) => (ran = resolve)) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    // The main loop's turn ended; its background agent goes on.
+    await $.turn.start({ text: "test it in the background", turnId: "t1" });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const call = $.tool.call({
+      tool: "Bash",
+      command: "rm -rf dist && pnpm build",
+      agentId: "a1",
+    });
+    await flush(clock);
+    const hook = $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "rm -rf dist && pnpm build" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    // A turn of its own, begun as the harness's line, holds the ask.
+    const begun = turnsTold(seen).at(-1)!;
+    expect(begun.begin).toMatchObject({
+      from: "harness",
+      text: BACKGROUND_ASK_LINE,
+    });
+    const [opened] = asksTold(seen);
+    expect(opened).toMatchObject({
+      state: "open",
+      ask: {
+        kind: "permission",
+        tool: "Bash",
+        label: "rm -rf dist && pnpm build",
+      },
+    });
+    const asked = parts(seen).find((p) =>
+      ((p.parts ?? []) as { type: string }[]).some(
+        (x) => x.type === "data-ask",
+      ),
+    )!;
+    expect(asked.turn).toBe(begun.turn);
+    // The page's answer is the hook's.
+    seen.chatAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        answers: [{ id: opened!.id, answer: { allow: true } }],
+      },
+    };
+    await clock.advance(ASK_LOOK_MS);
+    await flush(clock);
+    expect(await hook).toMatchObject({ decision: { behavior: "allow" } });
+    // The call's end closes the ask, and the turn with it, saying how.
+    seen.chatAnswer = { status: 200, body: { ok: true } };
+    ran({ result: "ok" });
+    await call;
+    await flush(clock);
+    expect(asksTold(seen).at(-1)).toEqual({
+      id: opened!.id,
+      state: "answered",
+      by: "page",
+      said: "Allowed",
+    });
+    expect(turnsTold(seen).at(-1)).toEqual({
+      turn: begun.turn,
+      end: expect.stringContaining("Allowed from the page"),
+    });
+    // Nothing more is posted for it.
+    const posts = parts(seen).length;
+    await clock.advance(ASK_LOOK_MS * 3);
+    await flush(clock);
+    expect(parts(seen).length).toBe(posts);
+  });
+
+  test("two background agents asking at once share one turn of asks, which ends as the last ask closes", async ($, on) => {
+    const running: ((result: { result: string }) => void)[] = [];
+    on(
+      "tool.call",
+      () => new Promise((resolve) => running.push(resolve)) as never,
+    );
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    const calls = ["a1", "a2"].map((agentId) =>
+      $.tool.call({ tool: "Bash", command: `pnpm ${agentId}`, agentId }),
+    );
+    await flush(clock);
+    for (const agent of ["a1", "a2"])
+      void $.classic.PermissionRequest({
+        tool_name: "Bash",
+        tool_input: { command: `pnpm ${agent}` },
+        agent_id: agent,
+      } as never);
+    await flush(clock);
+    expect(turnsTold(seen).filter((t) => "begin" in t)).toHaveLength(1);
+    const asking = turnsTold(seen).at(-1)!.turn;
+    running[0]!({ result: "ok" });
+    await calls[0];
+    await flush(clock);
+    expect(turnsTold(seen).at(-1)).toMatchObject({ turn: asking });
+    expect("end" in turnsTold(seen).at(-1)!).toBe(false);
+    running[1]!({ result: "ok" });
+    await calls[1];
+    await flush(clock);
+    expect(turnsTold(seen).at(-1)).toEqual({
+      turn: asking,
+      end: "- Bash (pnpm a1): Allowed in the window\n- Bash (pnpm a2): Allowed in the window",
+    });
+  });
+
+  test("a subagent's ask still open as the main loop's turn ends is asked again in a turn of its own, which its subagent's end closes", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "deploy it", turnId: "t1" });
+    await flush(clock);
+    void $.tool.call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" });
+    await flush(clock);
+    void $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm deploy" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    const [opened] = asksTold(seen);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    // Not closed with the turn: asked again, under a turn of its own.
+    expect(asksTold(seen).map((a) => a.state)).toEqual(["open", "open"]);
+    const told = turnsTold(seen);
+    expect(told.slice(-3)).toEqual([
+      { turn: "t1", begin: expect.anything() },
+      { turn: "t1", end: "" },
+      {
+        turn: expect.stringMatching(/^asks-/),
+        begin: expect.objectContaining({ text: BACKGROUND_ASK_LINE }),
+      },
+    ]);
+    // Its subagent's end closes it, and the turn begun for it.
+    await $.turn.complete(done("a1-turn", "a1"));
+    await flush(clock);
+    expect(asksTold(seen).at(-1)).toEqual({ id: opened!.id, state: "expired" });
+    expect(turnsTold(seen).at(-1)).toEqual({
+      turn: told.at(-1)!.turn,
+      end: "- Bash (pnpm deploy): closed with no answer",
+    });
+  });
+
+  test("an aborted turn closes a subagent's ask with it, since a foreground subagent ends with it, and begins no turn for it", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "deploy it", turnId: "t1" });
+    await flush(clock);
+    void $.tool.call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" });
+    await flush(clock);
+    const hook = $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm deploy" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    const [opened] = asksTold(seen);
+    await $.turn.complete({
+      ...done("t1"),
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    expect(asksTold(seen).at(-1)).toEqual({ id: opened!.id, state: "expired" });
+    expect((await hook).decision).toBeUndefined();
+    expect(turnsTold(seen).at(-1)).toEqual({ turn: "t1", end: "" });
+  });
+
+  test("the page's Stop on a turn of asks closes its asks with no answer and aborts no turn of the window's", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    await flush(clock);
+    const hook = $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm build" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    const asking = turnsTold(seen).at(-1)!.turn;
+    const [opened] = asksTold(seen);
+    seen.chatAnswer = { status: 200, body: { ok: true, stop: true } };
+    await clock.advance(ASK_LOOK_MS);
+    await flush(clock);
+    // The window's dialog still waits: the hook decides nothing.
+    expect((await hook).decision).toBeUndefined();
+    expect(asksTold(seen).at(-1)).toEqual({ id: opened!.id, state: "expired" });
+    expect(turnsTold(seen).at(-1)).toEqual({
+      turn: asking,
+      end: "- Bash (pnpm build): closed with no answer",
+    });
+    expect(seen.aborted).toEqual([]);
+  });
+
+  test("a turn the window begins while a turn of asks is under way ends it, and the ask still waiting is asked again in the window's turn", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    await flush(clock);
+    void $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm build" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    const asking = turnsTold(seen).at(-1)!.turn;
+    const [opened] = asksTold(seen);
+    await $.turn.start({ text: "how is it going?", turnId: "t2" });
+    await flush(clock);
+    expect(turnsTold(seen).slice(-2)).toEqual([
+      {
+        turn: asking,
+        end: "- Bash (pnpm build): still waiting, asked again below",
+      },
+      { turn: "t2", begin: expect.objectContaining({ from: "window" }) },
+    ]);
+    const again = parts(seen).filter((p) => p.turn === "t2");
+    expect(
+      again.flatMap((p) =>
+        ((p.parts ?? []) as { type: string; data?: unknown }[])
+          .filter((x) => x.type === "data-ask")
+          .map((x) => x.data),
+      ),
+    ).toEqual([opened]);
   });
 
   test("a question the page cannot answer, free text or a number, is not shown", () => {
@@ -10109,5 +10801,266 @@ describe("a hand-over of messages: a toast for the person, the whole text for th
     const seen = stops(on, {});
     expect(await $.classic.Stop({ stop_hook_active: false })).toEqual({});
     expect(seen.toasts).toEqual([]);
+  });
+});
+
+describe("a laptop launch: devcorner's page starts a session on this machine", () => {
+  test("the held request's launch frame names the launch alone", () => {
+    expect(readHeld('{"launch":"7"}')).toEqual({ kind: "launch", launch: "7" });
+    expect(readHeld('{"launch":7}')).toEqual({ kind: "empty" });
+  });
+
+  test("claude --bg runs with no shell, the window's own session variables cleared", () => {
+    expect(launchArgv("me-k3", "/dc continue me-k3 --launch 7")).toEqual([
+      "env",
+      "-u",
+      "CLAUDECODE",
+      "-u",
+      "CLAUDE_CODE_SESSION_ID",
+      "claude",
+      "--bg",
+      "-n",
+      "me-k3",
+      "/dc continue me-k3 --launch 7",
+    ]);
+  });
+
+  test("its answer reads as started, untrusted or failed in its own words", () => {
+    expect(
+      launchOutcome({
+        exitCode: 0,
+        stdout: "backgrounded · 5870a590 · me-k3\n",
+        stderr: "",
+      }),
+    ).toEqual({ problem: null, words: null, bg: "5870a590" });
+    const untrusted = launchOutcome({
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "Workspace not trusted. Run `claude` in /x once and accept the trust prompt, then retry.",
+    });
+    expect(untrusted.problem).toBe("untrusted");
+    expect(untrusted.words).toMatch(/^Workspace not trusted/);
+    expect(launchOutcome({ exitCode: 2, stdout: "", stderr: "" })).toEqual({
+      problem: "failed",
+      words: "claude --bg exited 2",
+      bg: null,
+    });
+  });
+
+  test("a repo devcorner names finds the newest folder this machine kept of it", () => {
+    expect(foldRemote("git@github.com:Acme/Shop.git")).toBe(
+      "github.com/acme/shop",
+    );
+    expect(foldRemote("https://ann@github.com/acme/shop/")).toBe(
+      "github.com/acme/shop",
+    );
+    const folders = {
+      "github.com/acme/shop": { folder: "/old/shop", at: 1 },
+      "gitlab.com/acme/shop": { folder: "/new/shop", at: 2 },
+      "github.com/acme/web": { folder: "/web", at: 3 },
+    };
+    expect(folderFor(folders, "acme/shop")).toBe("/new/shop");
+    expect(folderFor(folders, "github.com/acme/shop")).toBe("/old/shop");
+    expect(folderFor(folders, "acme/none")).toBeUndefined();
+  });
+
+  test("a launch's number comes out of /dc chat and /dc continue's words", () => {
+    expect(launchArg("--launch 7")).toEqual({ launch: "7", rest: "" });
+    expect(launchArg("me-k3 --launch 12 --takeover")).toEqual({
+      launch: "12",
+      rest: "me-k3 --takeover",
+    });
+    expect(launchArg("A title")).toEqual({ launch: null, rest: "A title" });
+  });
+
+  test("the background launcher is found by its name among claude agents", () => {
+    expect(
+      launcherListed(
+        JSON.stringify([
+          { name: "me-k3", status: "idle" },
+          { name: LAUNCHER_NAME, status: "idle", state: "done" },
+        ]),
+      ),
+    ).toBe("idle, done");
+    expect(launcherListed("[]")).toBeNull();
+    expect(launcherListed("not json")).toBeNull();
+  });
+
+  /** An idle window, signed in, holding devcorner's request. */
+  const holding = async ($: Parameters<TestBody>[0], on: On) => {
+    const w = world(on, { hold: true });
+    w.seen.answer = {
+      ...base,
+      session: null,
+      conversation: {
+        id: "dc-h2",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 0,
+      },
+    };
+    await $.session.start(START);
+    await flush(w.clock);
+    await w.clock.advance(IDLE_MS);
+    await flush(w.clock);
+    return w;
+  };
+  const launches = (seen: { chats: Record<string, unknown>[] }) =>
+    seen.chats.filter((c) => String(c.hook_event_name).startsWith("Launch"));
+
+  test("every hold says it can launch, and a frame is taken, started in the repo's folder and said back", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    expect(seen.waitBodies.length).toBeGreaterThan(0);
+    expect(seen.waitBodies.at(-1)).toMatchObject({ launcher: true });
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: null,
+        name: "me-k3",
+        prompt: "/dc continue me-k3 --launch 7",
+      },
+    });
+    seen.held.at(-1)!(JSON.stringify({ launch: "7" }));
+    await flush(clock);
+    expect(launches(seen)).toEqual([
+      expect.objectContaining({ hook_event_name: "LaunchTake", launch: "7" }),
+      expect.objectContaining({
+        hook_event_name: "LaunchDone",
+        launch: "7",
+        problem: null,
+        bg: "5870a590",
+        // The folder this window's start kept for its repo.
+        folder: "/work/shop",
+      }),
+    ]);
+    const ran = seen.runs.find((r) => r.argv[0] === "env");
+    expect(ran?.argv).toEqual(
+      launchArgv("me-k3", "/dc continue me-k3 --launch 7"),
+    );
+    expect(ran?.cwd).toBe("/work/shop");
+    expect(seen.toasts.at(-1)).toMatch(/started me-k3 in the background/);
+    // It holds again.
+    expect(seen.held.length).toBeGreaterThan(0);
+  });
+
+  test("a launch another window took starts nothing here", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    seen.chatAnswers.push({
+      status: 409,
+      body: { error: "taken", code: "launch-taken" },
+    });
+    seen.held.at(-1)!(JSON.stringify({ launch: "8" }));
+    await flush(clock);
+    expect(launches(seen).map((c) => c.hook_event_name)).toEqual([
+      "LaunchTake",
+    ]);
+    expect(seen.runs.some((r) => r.argv[0] === "env")).toBe(false);
+  });
+
+  test("an untrusted folder is said back in Claude Code's words, never waited on", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    seen.claudeRun = {
+      exitCode: 1,
+      stdout: "",
+      stderr: "Workspace not trusted. Run `claude` in /x once.",
+    };
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: "/x",
+        name: "devcorner-9",
+        prompt: "/dc chat --launch 9",
+      },
+    });
+    seen.held.at(-1)!(JSON.stringify({ launch: "9" }));
+    await flush(clock);
+    expect(launches(seen).at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      problem: "untrusted",
+      words: "Workspace not trusted. Run `claude` in /x once.",
+      folder: "/x",
+    });
+  });
+
+  test("a repo with no folder on this machine is said back as such", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/elsewhere",
+        folder: null,
+        name: "devcorner-10",
+        prompt: "/dc chat --launch 10",
+      },
+    });
+    seen.held.at(-1)!(JSON.stringify({ launch: "10" }));
+    await flush(clock);
+    expect(launches(seen).at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      problem: "no-folder",
+    });
+    expect(seen.runs.some((r) => r.argv[0] === "env")).toBe(false);
+  });
+
+  test("/dc chat --launch N opens the launch's chat", async ($, on) => {
+    const w = world(on);
+    await $.session.start(START);
+    await flush(w.clock);
+    w.seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        chat: { thread: "me-k3" },
+        started: true,
+        url: "http://dc.test/k/me-k3",
+        resume: "claude --resume conversation-1",
+      },
+    });
+    await $.command.run({ command: "dc", args: "chat --launch 7" } as never);
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "ChatOpen",
+      launch: "7",
+      title: "",
+    });
+  });
+
+  test("/dc launcher on starts the background launcher in this project's folder; off stops it", async ($, on) => {
+    const w = world(on);
+    await $.session.start(START);
+    await flush(w.clock);
+    w.seen.claudeRun = { exitCode: 0, stdout: "[]", stderr: "" };
+    const started = await $.command.run({
+      command: "dc",
+      args: "launcher on",
+    } as never);
+    expect(started.text).toMatch(
+      /the launcher is on, in the background in \/work\/shop/,
+    );
+    expect(started.text).toContain(LAUNCHER_PIN);
+    const ran = w.seen.runs.find((r) => r.argv[0] === "env");
+    expect(ran?.argv).toEqual(launchArgv(LAUNCHER_NAME, "/dc launcher serve"));
+    expect(ran?.cwd).toBe("/work/shop");
+    const serve = await $.command.run({
+      command: "dc",
+      args: "launcher serve",
+    } as never);
+    expect(serve.text).toMatch(/devcorner's launcher on this machine/);
+    // Its first words ask the person to pin it, since an idle background
+    // session is parked after about an hour and no flag pins one.
+    expect(serve.text).toContain("select devcorner-launcher and press Ctrl+T");
+    const stopped = await $.command.run({
+      command: "dc",
+      args: "launcher off",
+    } as never);
+    expect(stopped.text).toMatch(/the launcher is off/);
+    expect(w.seen.runs.at(-1)?.argv).toEqual(["claude", "stop", LAUNCHER_NAME]);
   });
 });

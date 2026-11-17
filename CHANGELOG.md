@@ -2,6 +2,43 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.60.0 — 2026-11-17
+
+- An `/effort <level>` sent from a laptop chat's page, typed or picked from its model control, shows on the page at once as the window's effort. The window's effort was known only from its next model call, so the chat's head and model control kept the old level until the next turn began.
+
+## 0.59.0 — 2026-11-17
+
+- In a laptop chat, a background agent that stops on a permission prompt or a question after the window's own turn ended now asks on the chat's page too, under a line of its own ("A background agent waits on your answer"). Answer it there or in the window, whichever is first; it closes on the page once it is answered in the window or once that agent ends, and the line's reply says how it closed. Before, the page showed nothing and the agent waited for someone at the laptop. A background agent's ask still open when a turn of the window ends, or when the window begins a turn, is asked again in the turn that follows instead of closing with no answer.
+
+## 0.58.0 — 2026-11-17
+
+- devcorner's page can start a laptop chat on this machine ("New chat → On my laptop"), or move a chat here ("Continue on my laptop"). An idle window of this plugin, or the background launcher, takes the ask, and the plugin's own script, never the model, runs `claude --bg -n <name> "/dc chat --launch N"` (or `/dc continue <chat> --launch N`) in the repo's folder, with this window's own session variables cleared for it; the new session joins the chat and its window mirrors it, and `claude attach <name>` shows it in a terminal. The folder is the one devcorner knows of the chat, else the one this machine's windows last opened in for that repo (each window notes its own as it starts). How it went is said back at once, so the page shows it: started, a folder Claude Code does not trust yet ("open `claude` there once"), no folder of the repo on this machine yet, or Claude Code's own words. Only a window signed in with this machine's token takes one, for its own person.
+- `/dc launcher on` starts one background session, `devcorner-launcher`, in this project's folder (never the home folder), which keeps devcorner's page able to reach this machine with every window closed; `/dc launcher off` stops it and `/dc launcher` says whether it runs. Its first words ask you to pin it once (`Ctrl+T` in `claude agents`), since Claude Code parks a background session left idle for about an hour unless it is pinned.
+
+## 0.57.0 — 2026-11-17
+
+- Local subagents start on a laptop whose login shell finds a Node older than 22.19 while a newer one is installed beside it, as nvm's default 22.18 with 24 installed: the plugin runs the newest released version installed there that is new enough, and keeps it. A Node it kept earlier that is now too old makes it look again, rather than refuse. Where none is installed, the refusal names the shell's Node and what to do: install a newer one with its version manager (`nvm install --lts` with nvm), or, for a Node from no version manager, put a newer one first on your login shell's PATH.
+
+## 0.56.0 — 2026-11-17
+
+- A laptop chat's page now lists this window's own commands when you type `/`: its skills, plugin commands and MCP prompts, beside `/compact`, `/context`, `/model <name>` and `/effort <level>`. The plugin sends devcorner the window's commands (each one's name, its one line and where it comes from, nothing else) as the chat opens, rejoins or continues here, and again with a turn's beginning once they changed, as after `/reload-skills` or a plugin added. A command the window does not have is refused on the page as you send it, rather than said in the thread afterwards. It needs the devcorner that keeps the list, which comes before it.
+
+## 0.55.0 — 2026-11-17
+
+- In a laptop chat, a turn that Claude Code ends on an API failure now shows on the page as failed, with one plain line after what it had said: what happened and what to do, in words of its own for each kind (the usage limit, an overload, a server error, a sign-in or billing problem, a model your account cannot use, a request Claude did not accept). For the usage limit the line says when it resets, once the windows say. The API's own error text is never shown. Before, the page showed nothing and you waited with no clue why. A turn that ends normally or that you stop is as before.
+- A ToolSearch call's label, in the chat and in a permission ask, shows short tool names: `select: ticket, run`, not the long `mcp__...` names. Other labels, a command's text above all, are as they were.
+- A local subagent called just after a conversation's `start` runs instead of being refused with "No window of this machine works as" its session. The plugin now tells devcorner which session the window works as before it asks for the subagent token, and if devcorner is updating after a deploy it waits as long as devcorner asks, up to two minutes; before, the call failed until a later status read caught up, as after one more devcorner call.
+
+## 0.54.0 — 2026-11-17
+
+- A question about local subagents that you close without answering, in a window, now reads as "not now" and keeps nothing, so the next call asks again; before, it was answered as if nobody could be asked there. Where nobody can be asked (`claude -p`) the answer is as before.
+- `/dc local-agent install` no longer keeps a yes you never saw the question for: with the local agent not published and no launcher named it says so and keeps nothing, and otherwise it shows the same first-use question before keeping a yes.
+- The 24-hour cleanup of children's folders checks each folder again as it removes it, and a resume marks its child's folder in use as soon as devcorner takes it, so a cleanup beside a resume never removes the child being resumed. A cleanup that fails, including one that could not remove a folder, is logged in the debug channel instead of passing unseen.
+
+## 0.53.0 — 2026-11-17
+
+- In a laptop chat, a reply the window finished stays its own answer when devcorner hands the window a message as it stops, or another stop hook keeps it going. Claude Code carries on in the same turn then, so the chat used to fold the finished reply under "What it did" as a step of what came next, and show only the last reply as the answer. Now the reply ends there, with its own steps, and what the window does next is a turn of its own: under devcorner's line for a message that woke the window, or "A stop hook carried the turn on" for another hook. Live on the page and after a reload alike; a turn no stop hook carries on looks as before.
+
 ## 0.52.0 — 2026-11-17
 
 - A slash command you send from a laptop chat's page runs in the window, as if you typed it there: a skill, a plugin's command or an MCP prompt as the window lists it, and of Claude Code's own commands `/compact`, `/context`, `/model <name>` and `/effort <level>`. It runs alone, once the window is idle, in its place among your messages, never joined with words. A skill begins a turn like any words, shown on the page as your `/name` line; any other shows what it came to under your line, `/context`'s whole breakdown included. A command the window does not run (a name it does not have, another of Claude Code's own commands, or one Claude Code refuses, as after Esc in the window) is said once on the page and dropped, so the messages after it go on: before, a message that began with `/` was refused by Claude Code, put back and tried again at every turn's end, and every message after it waited behind it until a Stop on the page. It needs the devcorner that marks a page's command, which comes before it.
