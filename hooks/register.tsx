@@ -1,6 +1,8 @@
 import { atom, read, update } from "claude-code";
 import type {
   Register,
+  CommandInfo,
+  CommandRunResult,
   EngineInterface as Engine,
   PromptMedia,
   PromptSubmitAttachment,
@@ -5273,11 +5275,22 @@ interface PageFile {
   size: number;
 }
 
-/** The person's words from devcorner's page, as a post's answer gives them: what to type, and the files to fetch first. */
+/** A slash command the person sent from devcorner's page: its name, without the slash, and the words after it. */
+interface PageCommand {
+  name: string;
+  args: string;
+}
+
+/**
+ * The person's words from devcorner's page, as a post's answer gives them:
+ * what to type, and the files to fetch first; or a slash command, which the
+ * window runs alone (`runPageCommand`), never typed in.
+ */
 interface PageWords {
   key: string;
   text: string;
   files: PageFile[];
+  command: PageCommand | null;
 }
 
 /** The page's words a post answered with, waiting for the window to be idle. */
@@ -5904,7 +5917,8 @@ interface MirrorPayload {
     text: string;
     tools: MirrorTool[];
     steps: MirrorStep[];
-    outcome: "done" | "stopped";
+    /** `failed` only for a command from the page the window did not run (`commandTurn`). */
+    outcome: "done" | "stopped" | "failed";
   } | null;
   /** How many of its retries failed once its turn was over. */
   tries: number;
@@ -5924,7 +5938,8 @@ const carries = (payload: MirrorPayload) =>
  * on a toast. A post that carries something and fails is kept, as it was,
  * and goes before anything after it, with the next post that has something
  * new or at its retry (`retry`): so a turn's posts reach devcorner in their
- * order, each once by its number.
+ * order, each once by its number. With `whole`, it sends that post, a turn
+ * begun and ended in one (`commandTurn`), in the same order.
  */
 async function mirrorPost(
   $: Engine,
@@ -5932,6 +5947,7 @@ async function mirrorPost(
     look?: boolean;
     turn?: string | null;
     end?: { text: string; outcome: "done" | "stopped" };
+    whole?: MirrorPayload;
     retry?: boolean;
   },
 ): Promise<void> {
@@ -5975,7 +5991,7 @@ async function mirrorPost(
   // as its parts take, and joins the posts to send at once, so a post queued
   // before it that builds the next turn's beginning sends it first; any
   // other post is read when its place in the queue comes.
-  const ending: MirrorPayload[] = [];
+  const ending: MirrorPayload[] = what.whole ? [what.whole] : [];
   while (what.end) {
     const payload = build();
     ending.push(payload);
@@ -6141,7 +6157,9 @@ async function postMirror(
     }
     if (Array.isArray(body.answers)) takeAnswers(body.answers);
     if (Array.isArray(body.words)) {
-      pageWords = pageWordsOf(body.words);
+      // One the window took alone is never taken again, though an answer
+      // sent before devcorner heard of it names it.
+      pageWords = pageWordsOf(body.words).filter((w) => !takenAlone.has(w.key));
       // The answer to the end of a turn stopped in the window names the
       // words that waited at the stop, some perhaps never told to the window
       // yet, so no answer before it lets any go; words the person said since
@@ -6325,6 +6343,7 @@ function leaveMirror(): void {
   mirror?.retry?.cancel();
   dropAsks();
   pageWords = [];
+  takenAlone.clear();
   pageHeld = null;
   stoppedFromPage = null;
   stoppedInWindow = null;
@@ -6650,10 +6669,15 @@ function inputKey(value: unknown): string {
   );
 }
 
-/** The person's words from the page a post's answer gives, each with the files it carries; anything else in it is left out. */
+/** The person's words from the page a post's answer gives, each with the files it carries or the command it runs; anything else in it is left out. */
 function pageWordsOf(given: unknown[]): PageWords[] {
   return given.flatMap((w) => {
-    const one = w as { key?: unknown; text?: unknown; files?: unknown } | null;
+    const one = w as {
+      key?: unknown;
+      text?: unknown;
+      files?: unknown;
+      command?: unknown;
+    } | null;
     if (
       one === null ||
       typeof one !== "object" ||
@@ -6677,7 +6701,24 @@ function pageWordsOf(given: unknown[]): PageWords[] {
           ]
         : [];
     });
-    return [{ key: one.key, text: one.text, files }];
+    const command = one.command as Partial<PageCommand> | null | undefined;
+    return [
+      {
+        key: one.key,
+        text: one.text,
+        files,
+        command:
+          command !== null &&
+          typeof command === "object" &&
+          typeof command.name === "string" &&
+          command.name !== ""
+            ? {
+                name: command.name,
+                args: typeof command.args === "string" ? command.args : "",
+              }
+            : null,
+      },
+    ];
   });
 }
 
@@ -6750,47 +6791,44 @@ async function fetchPageFile(
 }
 
 /**
- * The words the window types for the person's words from the page: each as
- * devcorner gave it (what it quotes as Markdown, then the words), and after
- * it the paths of the files it sent, fetched first, so Claude Code reads
- * them.
+ * The words the window types for one message of the person's from the page:
+ * its words as devcorner gave them (what it quotes as Markdown, then the
+ * words), and after them the paths of the files it sent, fetched first, so
+ * Claude Code reads them.
  */
 async function pageText(
   $: Engine,
   thread: string,
-  words: readonly PageWords[],
+  message: PageWords,
 ): Promise<string> {
-  const texts: string[] = [];
-  for (const w of words) {
-    const lines: string[] = [];
-    for (const file of w.files)
-      lines.push(await fetchPageFile($, thread, file));
-    texts.push(
-      [
-        w.text,
-        lines.length === 0
-          ? ""
-          : `Files sent from devcorner:\n${lines.join("\n")}`,
-      ]
-        .filter((part) => part.trim() !== "")
-        .join("\n\n"),
-    );
-  }
-  return texts.filter((one) => one !== "").join("\n\n");
+  const lines: string[] = [];
+  for (const file of message.files)
+    lines.push(await fetchPageFile($, thread, file));
+  return [
+    message.text,
+    lines.length === 0 ? "" : `Files sent from devcorner:\n${lines.join("\n")}`,
+  ]
+    .filter((part) => part.trim() !== "")
+    .join("\n\n");
 }
 
 /**
- * Types the person's words from devcorner's page in as their own prompt, all
- * of them in one, once the window is idle and nothing is drafted: never over
- * what the person is typing, never mid-turn, whose end tries again, and
- * never while a stop holds them (`pageHeld`). The files they sent are
- * fetched first and named by path, the words held as typed
- * (`typedFromPage`) meanwhile, so no other call types them.
+ * Types the person's words from devcorner's page in as their own prompt, one
+ * message at a time, the oldest first, once the window is idle and nothing is
+ * drafted: never over what the person is typing, never mid-turn, whose end
+ * types the next, and never while a stop holds them (`pageHeld`). Each
+ * message is a turn of its own, as the page drew it a bubble of its own:
+ * typed together, a burst said while the window answered would reach the
+ * model as one prompt. The files it sent are fetched first and named by path,
+ * the words held as typed (`typedFromPage`) meanwhile, so no other call types
+ * them. A slash command from the page waits in its place among them and runs
+ * alone when its turn comes (`runPageCommand`), never typed in.
  */
 async function typePageWords($: Engine): Promise<void> {
   const waiting = () =>
     pageWords.length > 0 &&
     typedFromPage === null &&
+    commandFromPage === null &&
     pageHeld === null &&
     !fetchingPage;
   if (!waiting()) return;
@@ -6804,14 +6842,17 @@ async function typePageWords($: Engine): Promise<void> {
   // type the words in): the check and the take go together, with no wait
   // between, so only one takes them and the other submits nothing.
   if (!waiting()) return;
-  const words = pageWords.splice(0);
-  const keys = new Set(words.map((w) => w.key));
-  let text = words.map((w) => w.text).join("\n\n");
-  if (words.some((w) => w.files.length > 0)) {
+  if (takesAlone(pageWords[0]!)) {
+    await runPageCommand($, pageWords.shift()!);
+    return;
+  }
+  const message = pageWords.shift()!;
+  let text = message.text;
+  if (message.files.length > 0) {
     const from = mirror;
     fetchingPage = true;
     try {
-      text = await pageText($, from?.thread ?? "", words);
+      text = await pageText($, from?.thread ?? "", message);
     } finally {
       fetchingPage = false;
     }
@@ -6831,23 +6872,214 @@ async function typePageWords($: Engine): Promise<void> {
       if (pageWords.length > 0) void typePageWords($);
       return;
     }
-    const since = pageWords.filter((w) => !keys.has(w.key));
+    const since = pageWords.filter((w) => w.key !== message.key);
     if (running || drafted || pageHeld !== null) {
-      pageWords = [...words, ...since];
+      pageWords = [message, ...since];
       if (drafted) $.clock.after(WAITING_MS, () => void typePageWords($));
       return;
     }
     pageWords = since;
   }
-  const typed = { keys: [...keys], text };
+  const typed = { keys: [message.key], text };
   typedFromPage = typed;
   wokeAt = await $.clock.now();
   wakingFor = null;
   await $.prompt.submit({ text: typed.text, asUser: true }).catch(() => {
-    pageWords = [...words, ...pageWords];
+    pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
     if (typedFromPage === typed) typedFromPage = null;
     wokeAt = null;
   });
+}
+
+/**
+ * The built-ins of Claude Code a laptop chat's page runs in the window: any
+ * other built-in is refused, so one Claude Code adds stays off until
+ * devcorner takes it. A skill, a plugin's command or an MCP prompt runs as
+ * the window lists it. devcorner refuses as they are said those it knows
+ * never to send (`NOT_FROM_PAGE`, src/mcp/laptop-chat.ts), and `/model` and
+ * `/effort` with nothing after them, which open a picker.
+ */
+const PAGE_BUILTINS: ReadonlySet<string> = new Set([
+  "compact",
+  "context",
+  "model",
+  "effort",
+]);
+
+/**
+ * The command the window runs for one from the page, by the commands it
+ * lists (null when they could not be read), under the name it lists it by;
+ * or why it does not: one it does not have, or a built-in not in
+ * `PAGE_BUILTINS`.
+ */
+export function pageCommandIn(
+  name: string,
+  listed: readonly CommandInfo[] | null,
+): { name: string } | { refused: string } {
+  if (listed === null)
+    return { refused: "the window's commands could not be read" };
+  const info = listed.find((one) => one.name.toLowerCase() === name);
+  if (info === undefined)
+    return { refused: `no command named /${name} in this window` };
+  if (info.source === "builtin" && !PAGE_BUILTINS.has(info.name))
+    return {
+      refused: `/${name} is one of Claude Code's own commands, which a laptop chat's page does not run: run it in the window itself`,
+    };
+  return { name: info.name };
+}
+
+/**
+ * What a command the window ran came to, for the page: what it printed, else
+ * the notes it left the model (`/context` leaves its whole breakdown, in
+ * Markdown), else that it ran.
+ */
+export function commandOutcome(line: string, ran: CommandRunResult): string {
+  const printed = ran.text?.trim() ?? "";
+  if (printed !== "") return printed;
+  const notes = (ran.context ?? [])
+    .map((note) => note.trim())
+    .filter((note) => note !== "")
+    .join("\n\n");
+  return notes !== "" ? notes : `Ran ${line} in the window.`;
+}
+
+/** Why Claude Code refused to run a command, without the plugin's and the call's names it puts first. */
+export function commandRefused(error: unknown): string {
+  const said = error instanceof Error ? error.message : String(error);
+  return said.replace(/^[\s\S]*?\$\.command\.run:\s*/, "").trim() || said;
+}
+
+/**
+ * A command from the page that began no turn, as one post: the person's
+ * line, taking its words by their key, and the window's answer, so the page
+ * shows the line as theirs and what it came to under it. It has a turn key of
+ * its own, from the words', so a post sent again is the same turn.
+ */
+function commandTurn(
+  m: Mirror,
+  key: string,
+  line: string,
+  end: { text: string; outcome: "done" | "failed" },
+): MirrorPayload {
+  return {
+    thread: m.thread,
+    turn: `page-command-${key}`,
+    begin: { text: line, from: "page", took: [key], images: [] },
+    parts: [],
+    post: 0,
+    end: { text: end.text, tools: [], steps: [], outcome: end.outcome },
+    tries: 0,
+  };
+}
+
+/**
+ * Whether the window takes one of the page's messages alone, never joined
+ * with words: a slash command, and words that begin with a slash all the
+ * same (said before devcorner marked commands, or moved here from another
+ * chat), which Claude Code refuses from a plugin.
+ */
+const takesAlone = (w: PageWords): boolean =>
+  w.command !== null || w.text.trimStart().startsWith("/");
+
+/** The keys of the page's messages the window took alone (`runPageCommand`), so none is taken twice, though an answer sent before devcorner heard of it names it; dropped as mirroring stops (`leaveMirror`). */
+const takenAlone = new Set<string>();
+
+/**
+ * The command from the page running in the window now, by the name the
+ * window lists it by, and the line and key the turn its prompt begins takes
+ * as the page's: the `prompt.submit` hook hands them over (`typedFromPage`)
+ * as Claude Code submits that prompt. Null while none runs.
+ */
+let commandFromPage: {
+  name: string;
+  typed: { keys: string[]; text: string };
+} | null = null;
+
+/** What the page is told of words that begin with a slash but are no command devcorner marked. */
+const SLASH_WORDS =
+  'Not run in the window: Claude Code takes no words from the page that begin with "/". To send them as words, put a word before the slash.';
+
+/**
+ * Takes one of the page's messages the window takes alone (`takesAlone`), once:
+ * a slash command runs in the window (`runInWindow`); words that begin with
+ * a slash are not typed in. One that begins no turn is answered at once:
+ * what it came to, or why the window did not run it, is posted with the
+ * person's line (`commandTurn`). Either way it never waits again, so the
+ * messages after it go on.
+ */
+async function runPageCommand($: Engine, words: PageWords): Promise<void> {
+  takenAlone.add(words.key);
+  const command = words.command;
+  const line =
+    command === null
+      ? words.text.trim()
+      : slashLine(command.name, command.args);
+  const from = mirror;
+  const end =
+    command === null
+      ? { text: SLASH_WORDS, outcome: "failed" as const }
+      : await runInWindow($, words.key, command, line);
+  // Its prompt was submitted: the turn it begins takes the line.
+  if (end === null) return;
+  if (mirror !== null && mirror === from)
+    await mirrorPost($, { whole: commandTurn(mirror, words.key, line, end) });
+  void typePageWords($);
+}
+
+/**
+ * Runs a slash command from the page with `$.command.run`, as the person
+ * would type it, when the window runs it (`pageCommandIn`); held meanwhile
+ * (`commandFromPage`), so no other call takes the page's words. A skill, a
+ * plugin's command or an MCP prompt submits its prompt before the run
+ * resolves and begins a turn after (Claude Code 2.1.325), which takes the
+ * line as the person's, as typed words are: null then. Else what it came to,
+ * or why it did not run.
+ */
+async function runInWindow(
+  $: Engine,
+  key: string,
+  command: PageCommand,
+  line: string,
+): Promise<{ text: string; outcome: "done" | "failed" } | null> {
+  const typed = { keys: [key], text: line };
+  commandFromPage = { name: command.name, typed };
+  try {
+    const found = pageCommandIn(
+      command.name,
+      await $.command.list().catch(() => null),
+    );
+    if ("refused" in found)
+      return {
+        text: `Not run in the window: ${found.refused}.`,
+        outcome: "failed",
+      };
+    commandFromPage = { name: found.name, typed };
+    wokeAt = await $.clock.now();
+    wakingFor = null;
+    let end: { text: string; outcome: "done" | "failed" };
+    try {
+      const ran = await $.command.run({
+        command: found.name,
+        ...(command.args === "" ? {} : { args: command.args }),
+      });
+      end = { text: commandOutcome(line, ran), outcome: "done" };
+    } catch (error) {
+      // A skill's prompt the `prompt.submit` hook handed over as the page's
+      // line, then refused (a later hook blocked it), begins no turn to take
+      // it: left handed over, it would hold the page's words and take the
+      // next turn begun in the window for this line.
+      if (typedFromPage === typed) typedFromPage = null;
+      end = {
+        text: `Not run in the window: ${commandRefused(error)}.`,
+        outcome: "failed",
+      };
+    }
+    if (typedFromPage === typed) return null;
+    wokeAt = null;
+    return end;
+  } finally {
+    commandFromPage = null;
+  }
 }
 
 /**
@@ -7158,6 +7390,947 @@ function toastHandOvers<R extends { additionalContext?: string[] }>(
   return ran;
 }
 
+// Local subagents (docs/architecture/plugin.md, 0.50.0, and
+// docs/architecture/local-subagents.md). devcorner lists its one `subagent`
+// tool read-only, so several calls in one answer run side by side, and the
+// plugin answers each before it leaves the laptop: it runs the child with
+// devcorner's local agent, Pi in a clone of the checkout, and hands back its
+// answer and its patch. A call a hook answers meets no permission prompt of
+// Claude Code's, so the plugin asks `$.tool.check` itself. The window's
+// subagent token, made on the hook route with this machine's hook token,
+// stays in the module's memory alone; each round's child credential goes to
+// the launcher on its standard input, and the launcher builds Pi's
+// environment from an allowlist, so neither the hook token nor any other
+// key of the session's reaches the child.
+
+/** An error's own words. */
+const errorText = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/** devcorner's subagent tool, on a server named for devcorner, as `CARRIER`'s: the connector's or this plugin's own. */
+export const SUBAGENT_CALL = /^mcp__[\w-]*devcorner[\w-]*__subagent$/i;
+
+/**
+ * The local agent this plugin runs, by npm's name, the version it pins and
+ * its tarball's integrity, which an install is checked against. Null until
+ * the package is published, which is its person's decision: until then a
+ * launcher is named with `LOCAL_AGENT_ENV`.
+ */
+export const LOCAL_AGENT = {
+  name: "@devcorner/local-agent",
+  version: "0.1.0",
+  integrity: null as string | null,
+};
+
+/** The oldest Node the local agent runs on: Pi's own floor. */
+export const LOCAL_AGENT_NODE = [22, 19] as const;
+
+/**
+ * A launcher to run in place of the installed package, by its path: a stub
+ * that prints a round's lines, or the launcher built from devcorner's repo
+ * while the package is not published. Whoever sets the session's
+ * environment already runs what they like as its person. `$.env.get` takes
+ * its name written out (`localLauncherOf`).
+ */
+export const LOCAL_AGENT_ENV = "DEVCORNER_LOCAL_AGENT";
+
+/** The plugin's store: the person's answer to the first-use question ("yes" or "no"), and the Node found. */
+export const LOCAL_AGENT_ANSWER = "localAgent";
+const LOCAL_AGENT_NODE_KEY = "localAgentNode";
+
+/** The most of a child's answer the result holds, as a box's child's (`childAnswer`). */
+const MAX_CHILD_ANSWER_BYTES = 16 * 1024;
+/** The most changed files the result names; the rest are counted. */
+const MAX_CHILD_FILES = 20;
+
+/** Where `$.process` is refused: the desktop app's and an IDE's Claude Code. */
+export const LOCAL_CLI_ONLY =
+  "Local subagents need Claude Code's command line on this machine; use the Agent tool here.";
+/** A machine with no hook token: signed in through a connector alone, or not at all. */
+export const LOCAL_SIGNED_OUT =
+  "Local subagents need this machine signed in to devcorner: run /dc login, or ask Claude to sign it in.";
+/** A cloud session, never signed in: its plugin runs no child, and a retry goes the same way. */
+export const LOCAL_IN_CLOUD =
+  "A cloud session runs no local subagents, and calling again goes the same way: use the Agent tool here.";
+/** A window that has not called start. */
+export const LOCAL_NO_SESSION =
+  "Call devcorner's start first: a local child runs under this conversation's session.";
+/** The person said "Not now" to the first-use question. */
+export const LOCAL_DECLINED =
+  "The person declined devcorner's local subagents on this machine: do the work yourself or use the Agent tool. /dc local-agent install turns them on.";
+/** Where nobody can answer the first-use question (`claude -p`). */
+export const LOCAL_NOBODY_FIRST =
+  "devcorner's local subagents need their person's yes once on this machine, and nobody can be asked here: run /dc local-agent install in an interactive Claude Code window first.";
+
+/**
+ * The first-use question: the trust before the size, which is said only
+ * when the yes installs the package. `$.ui.ask` takes a question that ends
+ * in its question mark, so the trust comes first.
+ */
+export function localFirstUse(installs: boolean): string {
+  return `A local subagent runs commands and edits files on this machine as you, without asking you first, like Claude Code with its permission prompts off. It works in a copy of your checkout, but can reach any file you can. Its model calls are billed to your workspace's gateway.${installs ? " Installing it downloads Pi (about 26 MB, 160 MB on disk)." : ""} Run devcorner's subagents on this laptop?`;
+}
+const INSTALL = "Install";
+const RUN_THEM = "Run them";
+const NOT_NOW = "Not now";
+
+/** A call's own question, where no rule allows the tool: it meets no permission prompt of Claude Code's. */
+export function localAskText(ask: SubagentCall): string {
+  const what =
+    ask.resume !== null
+      ? `resume the local subagent ${ask.resume}`
+      : `start a local subagent (${ask.kind}: ${ask.description})`;
+  return `devcorner's plugin would ${what}. It runs commands and edits files in a copy of your checkout, as you, without asking. Run it?`;
+}
+const RUN_IT = "Run it";
+const DONT_RUN = "Don't run it";
+
+/** Why a call that needed the person's yes was refused where nobody can be asked. */
+export const localNobodyText = (tool: string) =>
+  `devcorner's subagent runs without Claude Code's permission prompt, so the plugin asks you itself, and nobody can be asked here. Allow the tool with a rule (--allowedTools ${tool}, or permissions.allow in settings) to run local subagents in this session.`;
+
+/** A subagent call's arguments, as the plugin reads them: the rest are devcorner's to check. */
+export interface SubagentCall {
+  /** The child to continue, or null for a new one. */
+  resume: string | null;
+  kind: string | null;
+  description: string | null;
+  prompt: string;
+  /** As the call gave them, for devcorner to check. */
+  minutes: unknown;
+  budget_usd: unknown;
+}
+
+/**
+ * A subagent call's arguments, or what is wrong with them: the task, and
+ * either the child to continue or a kind and a few words. devcorner checks
+ * the kind, the words' length and the limits as it begins the round.
+ */
+export function subagentCallOf(
+  args: Record<string, unknown>,
+): SubagentCall | string {
+  if (typeof args.prompt !== "string" || args.prompt.trim() === "")
+    return "prompt must say the whole task: the child knows nothing else.";
+  const text = (v: unknown) =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+  const resume = text(args.resume);
+  const kind = text(args.subagent_type);
+  const description = text(args.description);
+  if (resume === null && (kind === null || description === null))
+    return "A new child needs subagent_type and description; resume names an earlier child to continue.";
+  return {
+    resume,
+    kind,
+    description,
+    prompt: args.prompt,
+    minutes: args.minutes,
+    budget_usd: args.budget_usd,
+  };
+}
+
+/** A Node version, `v22.19.0`, as its major and minor; null for anything else. */
+function nodeVersionOf(printed: string): [number, number] | null {
+  const m = /^v?(\d+)\.(\d+)\.\d+/.exec(printed.trim());
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+/** Whether a Node version runs the local agent. */
+export function nodeRunsLocalAgent(printed: string): boolean {
+  const v = nodeVersionOf(printed);
+  if (v === null) return false;
+  const [major, minor] = LOCAL_AGENT_NODE;
+  return v[0] > major || (v[0] === major && v[1] >= minor);
+}
+
+/** The Node the launcher runs on: its path and its version as it prints it. */
+type LocalNode = { path: string; version: string };
+
+/**
+ * The Node the launcher runs on: the path kept, while it is there, else the
+ * one the person's login shell finds (nvm puts it on that shell's PATH
+ * alone), kept for the next call. Its version is read at each call, since
+ * an upgrade may keep its path, and one older than `LOCAL_AGENT_NODE` is
+ * refused, naming it.
+ */
+async function localNodeOf(
+  $: Engine,
+  again = false,
+): Promise<LocalNode | string> {
+  const kept = await $.store.get(LOCAL_AGENT_NODE_KEY);
+  let path =
+    !again && typeof kept === "string" && (await $.fs.exists(kept))
+      ? kept
+      : undefined;
+  if (path === undefined) {
+    const shell = (await $.env.get("SHELL")) || "/bin/sh";
+    const where = await $.process.run([shell, "-ilc", "command -v node"], {
+      timeoutMs: 15_000,
+    });
+    // An interactive shell may print its own lines first: the path is the
+    // last line that is one.
+    path = where.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("/"))
+      .at(-1);
+    if (where.exitCode !== 0 || path === undefined)
+      return `Local subagents need Node ${LOCAL_AGENT_NODE.join(".")} or later, and your login shell (${shell}) finds no node.`;
+    await $.store.set(LOCAL_AGENT_NODE_KEY, path);
+  }
+  const printed = await $.process.run([path, "--version"], {
+    timeoutMs: 10_000,
+  });
+  const version = printed.stdout.trim();
+  return nodeRunsLocalAgent(version)
+    ? { path, version }
+    : `Local subagents need Node ${LOCAL_AGENT_NODE.join(".")} or later; ${path} is ${version || "of no version it says"}. /dc local-agent install looks for Node again.`;
+}
+
+/** The folder the local agent and its children are kept in: `<stateDir>/local-agent`. */
+async function localAgentDir($: Engine): Promise<string | undefined> {
+  const base = stateDir(await stateEnvOf($));
+  return base ? `${base}/local-agent` : undefined;
+}
+
+/** Where the pinned version's launcher is once installed under `dir`. */
+export const installedLauncher = (dir: string) =>
+  `${dir}/${LOCAL_AGENT.version}/node_modules/${LOCAL_AGENT.name}/bin/local-agent.js`;
+
+/** The launcher a round runs: the one `LOCAL_AGENT_ENV` names, else the installed package's, else null. */
+async function localLauncherOf(
+  $: Engine,
+  dir: string,
+): Promise<{ path: string; named: boolean } | null> {
+  const named = await $.env.get("DEVCORNER_LOCAL_AGENT");
+  if (named) return { path: named, named: true };
+  const path = installedLauncher(dir);
+  return (await $.fs.exists(path)) ? { path, named: false } : null;
+}
+
+/**
+ * Installs the pinned version under `dir` with npm, beside the Node found,
+ * running no package's scripts, and checks the installed tarball's
+ * integrity against the pinned one: a mismatch removes it. Once in, the
+ * other versions are removed, children kept. Null once installed, else why
+ * not.
+ */
+async function installLocalAgent(
+  $: Engine,
+  node: LocalNode,
+  dir: string,
+): Promise<string | null> {
+  const { name, version, integrity } = LOCAL_AGENT;
+  if (integrity === null) return localAgentUnpublished();
+  const at = `${dir}/${version}`;
+  // npm beside the Node found, run by its own path with that Node first on
+  // its PATH: a version manager's npm may be a shim or a binary, not npm's
+  // own script.
+  const bin = node.path.replace(/\/[^/]+$/, "");
+  const removeIt = () =>
+    $.process.run(["rm", "-rf", at], { timeoutMs: 60_000 });
+  const done = await $.process.run(
+    [
+      `${bin}/npm`,
+      "install",
+      "--prefix",
+      at,
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      `${name}@${version}`,
+    ],
+    {
+      env: { PATH: `${bin}:${(await $.env.get("PATH")) ?? ""}` },
+      timeoutMs: 600_000,
+    },
+  );
+  if (done.exitCode !== 0) {
+    await removeIt();
+    return `npm could not install devcorner's local agent ${version}: ${(done.stderr.trim() || done.stdout.trim()).slice(-800)}`;
+  }
+  let got: unknown;
+  try {
+    const lock = JSON.parse(String(await $.fs.read(`${at}/package-lock.json`)));
+    got = lock?.packages?.[`node_modules/${name}`]?.integrity;
+  } catch {
+    got = undefined;
+  }
+  if (got !== integrity) {
+    await removeIt();
+    return `The local agent npm installed is not the one this plugin pins (its integrity is ${typeof got === "string" ? got : "not recorded"}), so it was removed.`;
+  }
+  // One version is kept; its children stay.
+  await $.process.run(
+    [
+      "sh",
+      "-c",
+      'for d in "$1"/*; do case "${d##*/}" in children|"$2") ;; *) rm -rf "$d" ;; esac; done',
+      "sh",
+      dir,
+      version,
+    ],
+    { timeoutMs: 60_000 },
+  );
+  $.ui.log(`Installed devcorner's local agent ${version}.`);
+  return null;
+}
+
+/** The first-use question and install under way: calls side by side wait for the one, so the person is asked once and npm runs once. */
+let firstUse: Promise<{ path: string; asked: boolean } | string> | null = null;
+
+/**
+ * The launcher a call runs, once its person said yes on this machine: the
+ * one `LOCAL_AGENT_ENV` names or the pinned version installed, installed
+ * now when it is not there. A machine whose person never answered is asked
+ * the first-use question, whose yes stands for the asking call's own too
+ * (`asked`); with their earlier yes, a plugin update's new version installs
+ * with no question. "Not now" is kept, and refuses until
+ * `/dc local-agent install`; where nobody can be asked, it is refused with
+ * how to say yes. While nothing can be installed, nothing is asked.
+ */
+async function localLauncherFor(
+  $: Engine,
+  node: LocalNode,
+  dir: string,
+): Promise<{ path: string; asked: boolean } | string> {
+  const there = await localLauncherOf($, dir);
+  if (there === null && LOCAL_AGENT.integrity === null)
+    return localAgentUnpublished();
+  if (there !== null && (await $.store.get(LOCAL_AGENT_ANSWER)) === "yes")
+    return { path: there.path, asked: false };
+  if (firstUse !== null) {
+    const got = await firstUse;
+    return typeof got === "string" ? got : { path: got.path, asked: false };
+  }
+  firstUse = askAndInstall($, node, dir, there?.path ?? null);
+  try {
+    return await firstUse;
+  } finally {
+    firstUse = null;
+  }
+}
+
+/** Why nothing can be installed while the package is not published. */
+const localAgentUnpublished = () =>
+  `devcorner's local agent ${LOCAL_AGENT.version} is not on npm yet: publishing it is your person's decision. Until it is, ${LOCAL_AGENT_ENV} names a launcher for this plugin to run.`;
+
+/** `localLauncherFor`'s question, kept answer and install, one at a time; `there` is a launcher already on the machine. */
+async function askAndInstall(
+  $: Engine,
+  node: LocalNode,
+  dir: string,
+  there: string | null,
+): Promise<{ path: string; asked: boolean } | string> {
+  const answer = await $.store.get(LOCAL_AGENT_ANSWER);
+  if (answer === "no") return LOCAL_DECLINED;
+  let asked = false;
+  if (answer !== "yes") {
+    const yes = there === null ? INSTALL : RUN_THEM;
+    let said: string;
+    try {
+      said = await $.ui.ask(localFirstUse(there === null), [yes, NOT_NOW]);
+    } catch {
+      return LOCAL_NOBODY_FIRST;
+    }
+    if (said !== yes) {
+      await $.store.set(LOCAL_AGENT_ANSWER, "no");
+      return LOCAL_DECLINED;
+    }
+    await $.store.set(LOCAL_AGENT_ANSWER, "yes");
+    asked = true;
+  }
+  if (there !== null) return { path: there, asked };
+  const failed = await installLocalAgent($, node, dir);
+  return failed ?? { path: installedLauncher(dir), asked };
+}
+
+/**
+ * `/dc local-agent install`: the person's yes, kept, then the pinned
+ * version installed, or what is in use said: the launcher, its folder and
+ * the Node it runs on.
+ */
+async function localAgentHere($: Engine): Promise<string> {
+  const refused = await processRefused($);
+  if (refused !== null) return refused;
+  const dir = await localAgentDir($);
+  if (dir === undefined)
+    return "This machine has no home folder to keep devcorner's local agent in.";
+  const node = await localNodeOf($, true);
+  if (typeof node === "string") return node;
+  await $.store.set(LOCAL_AGENT_ANSWER, "yes");
+  const there = await localLauncherOf($, dir);
+  if (there?.named)
+    return `Local subagents run the launcher ${LOCAL_AGENT_ENV} names, ${there.path}, with Node ${node.version} at ${node.path}. Nothing is installed while it is set.`;
+  if (there === null) {
+    const failed = await installLocalAgent($, node, dir);
+    if (failed !== null) return failed;
+  }
+  return `devcorner's local agent ${LOCAL_AGENT.version} is installed in ${dir}/${LOCAL_AGENT.version}, run with Node ${node.version} at ${node.path}. Its children are kept in ${dir}/children.`;
+}
+
+/** `$.process` ran once in this load: the surface does not change under a module. */
+let processRuns = false;
+
+/**
+ * Why `$.process` cannot run here, in 2.5's words, or null when it can: the
+ * desktop app's and an IDE's Claude Code refuse it.
+ */
+async function processRefused($: Engine): Promise<string | null> {
+  if (processRuns) return null;
+  try {
+    await $.process.run(["true"], { timeoutMs: 5_000 });
+    processRuns = true;
+    return null;
+  } catch (error) {
+    return `${LOCAL_CLI_ONLY} (${errorText(error)})`;
+  }
+}
+
+/** The lines of a round the result is made of, as the launcher writes them (packages/local-agent/src/round.ts). */
+export interface RoundLines {
+  started: {
+    child: string;
+    kind: string;
+    model: string;
+    effort: string | null;
+  } | null;
+  answer: {
+    answer: string;
+    change: {
+      files: string[];
+      patch: string | null;
+      kept: { dir: string; why: string } | null;
+    };
+  } | null;
+  ended: {
+    outcome: string;
+    ms: number;
+    usd: number | null;
+    reason: string | null;
+  } | null;
+}
+
+/** Keeps what one line of the launcher's says of the round in `kept`; any other line is passed over. */
+export function readRoundLine(kept: RoundLines, line: string): void {
+  let v: Record<string, unknown>;
+  try {
+    v = JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (v === null || typeof v !== "object") return;
+  const str = (x: unknown) => (typeof x === "string" ? x : null);
+  if (v.type === "child-started")
+    kept.started = {
+      child: str(v.child) ?? "",
+      kind: str(v.kind) ?? "",
+      model: str(v.model) ?? "",
+      effort: str(v.effort),
+    };
+  else if (v.type === "child-answer") {
+    const change = (v.change ?? {}) as Record<string, unknown>;
+    const clone = change.kept as { dir?: unknown; why?: unknown } | null;
+    kept.answer = {
+      answer: str(v.answer) ?? "",
+      change: {
+        files: Array.isArray(change.files)
+          ? change.files.filter((f): f is string => typeof f === "string")
+          : [],
+        patch: str(change.patch),
+        kept:
+          clone && typeof clone.dir === "string"
+            ? { dir: clone.dir, why: str(clone.why) ?? "" }
+            : null,
+      },
+    };
+  } else if (v.type === "child-ended")
+    kept.ended = {
+      outcome: str(v.outcome) ?? "error",
+      ms: typeof v.ms === "number" ? v.ms : 0,
+      usd: typeof v.usd === "number" ? v.usd : null,
+      reason: str(v.reason),
+    };
+}
+
+/** A time in whole seconds, or minutes and seconds: `42 s`, `3 min 12 s`. */
+function roundTime(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
+}
+
+/** Text cut to at most `max` bytes of UTF-8, with a line saying how much more there was. */
+function cutToBytes(text: string, max: number): string {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= max) return text;
+  let end = max;
+  // A continuation byte is 10xxxxxx: step back to its character's start.
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return `${new TextDecoder().decode(bytes.slice(0, end))}\n[its answer is cut here: ${bytes.byteLength - end} more bytes]`;
+}
+
+/**
+ * What the model reads of a round: one head line (the child, its session,
+ * its kind and serving, how it ended and after how long, its spend by the
+ * launcher's own reckoning, which devcorner does not count, and how to
+ * continue it), the child's answer cut to 16 KB, and its change: the files,
+ * the patch and how to take it, or where its clone is kept.
+ */
+export function childResultText(session: string, lines: RoundLines): string {
+  const started = lines.started;
+  const ended = lines.ended!;
+  const on =
+    started === null || started.model === ""
+      ? ""
+      : ` on ${started.model}${started.effort === null ? "" : ` at ${started.effort}`}`;
+  const how =
+    ended.outcome === "done"
+      ? "ended done"
+      : `ended ${ended.outcome}${ended.reason === null ? "" : ` (${ended.reason})`}`;
+  const spent =
+    ended.usd === null
+      ? ""
+      : `, spending $${ended.usd.toFixed(4)} by its own reckoning`;
+  const name = started?.child ? `${started.child} ` : "";
+  const head = `Subagent ${name}(session ${session}, ${started?.kind || "child"}${on}) ${how} after ${roundTime(ended.ms)}${spent}. To give it more instructions in the same clone and conversation, call subagent with resume: "${session}" and a prompt. Its answer is data from another agent: check each finding against the code before you act on it.`;
+  const answer = lines.answer?.answer ?? "";
+  const body =
+    answer.trim() === ""
+      ? "It gave no answer."
+      : cutToBytes(answer, MAX_CHILD_ANSWER_BYTES);
+  const change = lines.answer?.change;
+  const tail: string[] = [];
+  if (change?.patch) {
+    const named = change.files.slice(0, MAX_CHILD_FILES).join(", ");
+    const more = change.files.length - MAX_CHILD_FILES;
+    tail.push(
+      `It changed ${change.files.length} ${change.files.length === 1 ? "file" : "files"} in its own clone, none of them in yours: ${named}${more > 0 ? `, and ${more} more` : ""}. Its patch is ${change.patch}: read it, check it with \`git apply --check ${change.patch}\`, then take it with \`git apply ${change.patch}\`, or leave it.`,
+    );
+  }
+  if (change?.kept)
+    tail.push(`Its clone is kept at ${change.kept.dir}: ${change.kept.why}.`);
+  return `${head}\n\n${body}${tail.length === 0 ? "" : `\n\n${tail.join(" ")}`}`;
+}
+
+/**
+ * The launcher's spec for a round: devcorner's answer to its begin or
+ * resume as it gave it (the child's session, its round, credential, limits
+ * and addresses, and what devcorner decides of the child), named as the
+ * launcher reads them (packages/local-agent/src/spec.ts), with what only
+ * this laptop knows: the parent's prompt, the branch a review reads its
+ * change against, and the children's folder. A round's deadline is its
+ * minutes from now when devcorner names none.
+ */
+export function launcherSpec(
+  begun: Record<string, unknown>,
+  laptop: {
+    ask: SubagentCall;
+    base: string;
+    children: string;
+    now: number;
+  },
+): Record<string, unknown> {
+  const minutes = typeof begun.minutes === "number" ? begun.minutes : 0;
+  return {
+    ...begun,
+    session: begun.child,
+    kind: begun.kind ?? laptop.ask.kind ?? undefined,
+    round: begun.round ?? (laptop.ask.resume === null ? 1 : undefined),
+    capUsd: begun.budget_usd,
+    deadline:
+      begun.deadline ?? new Date(laptop.now + minutes * 60_000).toISOString(),
+    prompt: laptop.ask.prompt,
+    base: laptop.base,
+    children: laptop.children,
+  };
+}
+
+/**
+ * The window's subagent token (dc-d2050 4.1), in this module's memory alone,
+ * for the session the window claims on this devcorner. Concurrent calls
+ * share one mint, since a second mint ends the first and its children.
+ */
+let subagentHeld: {
+  claim: string;
+  base: string;
+  token: Promise<string | { refused: string }>;
+} | null = null;
+
+/** Reads a hook route answer's JSON body, or `{}`. */
+function bodyOf(res: { text: string }): Record<string, unknown> {
+  try {
+    const v = JSON.parse(res.text) as unknown;
+    return v !== null && typeof v === "object"
+      ? (v as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** devcorner's words for a refused hook event, or the status it answered. */
+function refusalOf(res: {
+  status: number;
+  headers: Record<string, string>;
+  text: string;
+}): string {
+  if (updatingFor(res) !== null)
+    return `${UPDATING_LINE}: try the subagent again in a minute.`;
+  const error = bodyOf(res).error;
+  return typeof error === "string" && error.trim() !== ""
+    ? error
+    : `devcorner answered ${res.status}.`;
+}
+
+/**
+ * The window's subagent token for the session it claims: the one it holds,
+ * else one made with this machine's hook token. `stale` is a token devcorner
+ * refused as expired or revoked: one is made in its place only while it is
+ * still the one held, so calls side by side refused together share the one
+ * new token, never ending each other's children with a mint of their own.
+ */
+async function subagentTokenOf(
+  $: Engine,
+  claimed: string,
+  hook: string,
+  stale: string | null,
+): Promise<string | { refused: string }> {
+  const base = await baseOf($);
+  for (;;) {
+    const held = subagentHeld;
+    if (held === null || held.claim !== claimed || held.base !== base) break;
+    const got = await held.token.catch(() => null);
+    // Another call changed the token meanwhile: look again.
+    if (subagentHeld !== held) continue;
+    if (got !== null && (typeof got !== "string" || got !== stale)) return got;
+    break;
+  }
+  const token = (async (): Promise<string | { refused: string }> => {
+    const res = await postEvent($, hook, {
+      hook_event_name: "SubagentToken",
+      claim: claimed,
+    });
+    const body = bodyOf(res);
+    return res.status === 200 && typeof body.token === "string"
+      ? body.token
+      : { refused: refusalOf(res) };
+  })();
+  const held = { claim: claimed, base, token };
+  subagentHeld = held;
+  // A refusal or a failure is not kept: the next call asks again.
+  void token
+    .then((got) => {
+      if (typeof got !== "string" && subagentHeld === held) subagentHeld = null;
+    })
+    .catch(() => {
+      if (subagentHeld === held) subagentHeld = null;
+    });
+  return token;
+}
+
+/**
+ * Begins or resumes the round on the hook route with the window's subagent
+ * token: devcorner's answer, or its refusal. A held token refused as no
+ * longer valid (401: expired at its 24 hours, or revoked) is made again
+ * once; any other refusal stands, so a mint never stops the window's other
+ * children for a refusal it would not cure.
+ */
+async function beginRound(
+  $: Engine,
+  claimed: string,
+  hook: string,
+  event: Record<string, unknown>,
+): Promise<{ token: string; begun: Record<string, unknown> } | string> {
+  let stale: string | null = null;
+  for (let tries = 0; tries < 2; tries++) {
+    const token = await subagentTokenOf($, claimed, hook, stale);
+    if (typeof token !== "string") return token.refused;
+    const res = await postEvent($, token, event);
+    if (res.status === 200) return { token, begun: bodyOf(res) };
+    if (res.status !== 401) return refusalOf(res);
+    stale = token;
+  }
+  return "devcorner refused this window's new subagent token too: sign this machine in again with /dc login.";
+}
+
+/**
+ * The branch a review child reads its change against: origin's default
+ * branch as the clone knows it, else origin's main or master, else the
+ * branch the checkout is on.
+ */
+async function reviewBaseIn(
+  $: Engine,
+  root: string,
+  branch: string | undefined,
+): Promise<string> {
+  const git = (args: string[]) =>
+    $.process.run(["git", ...args], { cwd: root, timeoutMs: 5_000 });
+  const head = await git([
+    "symbolic-ref",
+    "--quiet",
+    "--short",
+    "refs/remotes/origin/HEAD",
+  ]);
+  const named = head.exitCode === 0 ? head.stdout.trim() : "";
+  if (named.startsWith("origin/")) return named.slice("origin/".length);
+  for (const name of ["main", "master"])
+    if (
+      (
+        await git([
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `refs/remotes/origin/${name}`,
+        ])
+      ).exitCode === 0
+    )
+      return name;
+  return branch ?? "HEAD";
+}
+
+/** A folder made for its owner alone. */
+async function privateFolder($: Engine, dir: string): Promise<void> {
+  await $.process.run(["sh", "-c", 'umask 077 && mkdir -p "$1"', "sh", dir], {
+    timeoutMs: 5_000,
+  });
+}
+
+/**
+ * The children's folder cleaned (dc-d2050 8.3): a Pi whose launcher was
+ * killed outright is stopped, by its process group, once its pid file is
+ * older than any round runs and its command line still names its child's
+ * folder, so no other process is ever signalled; and a child whose folder
+ * nothing touched for 24 hours (its last round's patch, or a launcher's pid
+ * file, is written into it) goes with its clone, its Pi conversation and
+ * its patches.
+ */
+async function sweepChildren($: Engine, children: string): Promise<void> {
+  await $.process.run(
+    [
+      "sh",
+      "-c",
+      [
+        '[ -d "$1" ] || exit 0',
+        'for f in "$1"/*/pi.pid; do',
+        '  [ -f "$f" ] || continue',
+        '  [ -n "$(find "$f" -mmin +70)" ] || continue',
+        '  d="${f%/pi.pid}"; p="$(cat "$f")"',
+        '  case "$(ps -o args= -p "$p" 2>/dev/null)" in *"$d"*) kill -TERM -- "-$p" 2>/dev/null ;; esac',
+        '  rm -f "$f"',
+        "done",
+        'find "$1" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} +',
+      ].join("\n"),
+      "sh",
+      children,
+    ],
+    { timeoutMs: 60_000 },
+  );
+}
+
+/** `sweepChildren` at a session's start, when there is a children's folder. */
+async function sweepAtStart($: Engine): Promise<void> {
+  const dir = await localAgentDir($);
+  if (dir !== undefined && (await $.fs.exists(`${dir}/children`)))
+    await sweepChildren($, `${dir}/children`);
+}
+
+/**
+ * Answers a subagent call on this laptop (dc-d2050 2.2): the call's own
+ * gate, what it needs here, the launcher (installed on the person's first
+ * yes), the round begun on devcorner, then the launcher run to its end in
+ * the repo's root with the spec on its standard input and the session's
+ * DEVCORNER_TOKEN blanked, its lines read, the round ended on devcorner and
+ * the child's answer and patch answered as the tool's result. An interrupt
+ * aborts `signal`: Claude Code then stops the launcher and its whole tree
+ * and never runs this hook's code after the loop again, so the round's end
+ * is posted from the abort listener at once.
+ */
+async function answerSubagent(
+  $: Engine,
+  e: { tool: string } & Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<{ result: string } | { deny: string }> {
+  const args = callArguments(e);
+  const ask = subagentCallOf(args);
+  if (typeof ask === "string") return { deny: ask };
+
+  // A call a hook answers meets no permission prompt, so the session's own
+  // rules are asked here: a deny refuses, an ask is the person's below.
+  const verdict = await $.tool.check({ tool: e.tool, input: args });
+  if (verdict.decision === "deny")
+    return {
+      deny:
+        verdict.reason ??
+        "A permission rule of this session denies devcorner's subagent.",
+    };
+
+  const refused = await processRefused($);
+  if (refused !== null) return { deny: refused };
+  const hook = await tokenOf($);
+  if (hook === null)
+    return { deny: (await inCloud($)) ? LOCAL_IN_CLOUD : LOCAL_SIGNED_OUT };
+  const claimed = await claimOf($);
+  if (claimed === null) return { deny: LOCAL_NO_SESSION };
+  const dir = await localAgentDir($);
+  if (dir === undefined)
+    return {
+      deny: "This machine has no home folder to keep devcorner's local agent and its children in.",
+    };
+  const node = await localNodeOf($);
+  if (typeof node === "string") return { deny: node };
+  const launcher = await localLauncherFor($, node, dir);
+  if (typeof launcher === "string") return { deny: launcher };
+  if (verdict.decision === "ask" && !launcher.asked) {
+    let said: string;
+    try {
+      said = await $.ui.ask(localAskText(ask), [RUN_IT, DONT_RUN]);
+    } catch {
+      return { deny: localNobodyText(e.tool) };
+    }
+    if (said !== RUN_IT)
+      return { deny: "The person did not let devcorner's subagent run." };
+  }
+
+  const cwd = await $.session.cwd();
+  const top = await $.process.run(["git", "rev-parse", "--show-toplevel"], {
+    cwd,
+    timeoutMs: 5_000,
+  });
+  const root = top.exitCode === 0 ? top.stdout.trim() : "";
+  if (root === "")
+    return {
+      deny: "A local subagent works in a clone of this conversation's git checkout, and this folder is in none.",
+    };
+  const branch = await branchIn($, root).catch(() => undefined);
+  const base = await reviewBaseIn($, root, branch);
+  const children = `${dir}/children`;
+  await privateFolder($, children);
+
+  const begin = await beginRound(
+    $,
+    claimed,
+    hook.token,
+    ask.resume !== null
+      ? {
+          hook_event_name: "ChildResume",
+          child: ask.resume,
+          minutes: ask.minutes,
+          budget_usd: ask.budget_usd,
+        }
+      : {
+          hook_event_name: "ChildBegin",
+          subagent_type: ask.kind,
+          description: ask.description,
+          minutes: ask.minutes,
+          budget_usd: ask.budget_usd,
+          branch,
+        },
+  );
+  if (typeof begin === "string") return { deny: begin };
+  const { token, begun } = begin;
+  const child = typeof begun.child === "string" ? begun.child : "";
+  const started = Date.now();
+
+  // The round's end is posted once, whichever comes first: the launcher's
+  // end, read after its loop, or an interrupt, from the abort listener.
+  let ending: Promise<void> | null = null;
+  const endRound = (
+    outcome: string,
+    reason: string | null,
+    ms: number,
+  ): Promise<void> => {
+    ending ??= postEvent($, token, {
+      hook_event_name: "ChildEnd",
+      child,
+      round: begun.round,
+      outcome,
+      reason,
+      ms,
+    })
+      .then((res) => {
+        if (res.status !== 200)
+          $.ui.log(
+            `devcorner did not take the end of ${child}'s round: ${refusalOf(res)}`,
+            { to: "debug" },
+          );
+      })
+      .catch((error: unknown) =>
+        $.ui.log(
+          `the end of ${child}'s round did not reach devcorner: ${errorText(error)}`,
+          { to: "debug" },
+        ),
+      )
+      .then(() => sweepChildren($, children))
+      .catch(() => {});
+    return ending;
+  };
+  const stopped = () =>
+    void endRound(
+      "stopped",
+      "the person interrupted the turn",
+      Date.now() - started,
+    );
+  if (signal.aborted) {
+    stopped();
+    return { deny: "The turn was interrupted before the subagent started." };
+  }
+  signal.addEventListener("abort", stopped, { once: true });
+
+  const kept: RoundLines = { started: null, answer: null, ended: null };
+  let stderr = "";
+  let pending = "";
+  let exit: { code: number | null; signal: string | null } | null = null;
+  try {
+    const run = $.process.spawn({
+      argv: [node.path, launcher.path, "run"],
+      cwd: root,
+      // Laid over the session's environment, which cannot be removed from:
+      // the launcher builds Pi's from an allowlist, and gets no hook token.
+      env: { DEVCORNER_TOKEN: "" },
+      input: JSON.stringify(
+        launcherSpec(begun, { ask, base, children, now: started }),
+      ),
+    });
+    for (let step = await run.next(); ; step = await run.next()) {
+      if (step.done) {
+        exit = step.value;
+        break;
+      }
+      if (step.value.stream === "stderr") {
+        stderr = (stderr + step.value.text).slice(-4_000);
+        continue;
+      }
+      pending += step.value.text;
+      let at: number;
+      while ((at = pending.indexOf("\n")) >= 0) {
+        readRoundLine(kept, pending.slice(0, at));
+        pending = pending.slice(at + 1);
+      }
+    }
+  } catch (error) {
+    stderr += `\n${errorText(error)}`;
+  } finally {
+    signal.removeEventListener("abort", stopped);
+  }
+  readRoundLine(kept, pending);
+
+  if (kept.ended === null) {
+    await endRound(
+      "error",
+      "the launcher ended before its round did",
+      Date.now() - started,
+    );
+    const how =
+      exit === null
+        ? "could not run"
+        : `ended (${exit.signal ?? `exit ${exit.code}`})`;
+    return {
+      deny: `devcorner's local agent ${how} before its round ended: ${stderr.trim().slice(-1_500) || "it said nothing"}`,
+    };
+  }
+  await endRound(kept.ended.outcome, kept.ended.reason, kept.ended.ms);
+  return { result: childResultText(child, kept) };
+}
+
 export const register: Register = (on) => {
   // The person sees each hand-over of messages as one toast, and the model
   // gets it whole. Between tool calls and on a prompt Claude Code gives a
@@ -7215,6 +8388,23 @@ export const register: Register = (on) => {
     return next(e);
   });
 
+  // devcorner's subagent tool, answered on this laptop and never passed on
+  // to devcorner's server, which only refuses it. A failure is the call's
+  // error, in its own words.
+  on("tool.call", { tool: SUBAGENT_CALL }, async ($, e, next) => {
+    try {
+      return await answerSubagent(
+        $,
+        e as { tool: string } & Record<string, unknown>,
+        next.signal,
+      );
+    } catch (error) {
+      return {
+        deny: `devcorner's plugin could not run the subagent: ${errorText(error)}`,
+      };
+    }
+  });
+
   on("session.start", async ($, e, next) => {
     try {
       const saved = await $.store.get("dismissed");
@@ -7224,15 +8414,23 @@ export const register: Register = (on) => {
       await $.command.register({
         name: "dc",
         description:
-          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), rename this machine (/dc machine MacBook Air 1), name this conversation (/dc name reviewer), mirror this window as a laptop chat you can drive from devcorner (/dc chat [title], /dc chat off, /dc continue me-k3), send your words to another conversation of yours (/dc send me-h3 text), have another session of yours do something and answer here (/dc ask me-s4 run the tests), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
+          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), rename this machine (/dc machine MacBook Air 1), name this conversation (/dc name reviewer), mirror this window as a laptop chat you can drive from devcorner (/dc chat [title], /dc chat off, /dc continue me-k3), send your words to another conversation of yours (/dc send me-h3 text), have another session of yours do something and answer here (/dc ask me-s4 run the tests), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), install devcorner's local agent, which runs devcorner's subagents on this laptop (/dc local-agent install), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
         argumentHint:
-          "[now | waits | sessions | login | logout | machine [<name>] | name [<name>] | chat [<title> | off] | continue <chat> [--takeover] | send <to> <text> | ask <to> <task> | paste [<id>] | pastes | setup | hide | what to ask]",
+          "[now | waits | sessions | login | logout | machine [<name>] | name [<name>] | chat [<title> | off] | continue <chat> [--takeover] | send <to> <text> | ask <to> <task> | paste [<id>] | pastes | local-agent install | setup | hide | what to ask]",
       });
     } catch {
       /* stay silent */
     }
     // The hooks' copy of the machine's token is made what the store says.
     await syncHandOver($).catch(() => {});
+    // Local children's leftovers: a Pi a killed launcher left, and files
+    // past their 24 hours.
+    void sweepAtStart($).catch((error: unknown) =>
+      $.ui.log(
+        `devcorner could not clean its local children's folder: ${errorText(error)}`,
+        { to: "debug" },
+      ),
+    );
     // With no token, delivery is off: said, and offered once (dc-t576).
     void offerDelivery($);
     forgetSession();
@@ -7303,6 +8501,15 @@ export const register: Register = (on) => {
         )),
       );
     }
+    // A command from the page that submits a prompt (a skill, a plugin's
+    // command, an MCP prompt) begins its turn with it: that turn is the
+    // page's line.
+    if (
+      commandFromPage !== null &&
+      e.origin?.kind === "plugin" &&
+      e.command?.name === commandFromPage.name
+    )
+      typedFromPage = commandFromPage.typed;
     noteSubmitted(submitted, {
       text: e.text,
       origin: e.origin ?? null,
@@ -7348,7 +8555,9 @@ export const register: Register = (on) => {
       e.turnId,
       woke ?? { by: from === "harness" ? "harness" : "person" },
     );
-    const said = words?.text ?? e.text;
+    // A command from the page begins its turn with the command's own prompt:
+    // the person said the line it was typed as.
+    const said = words?.text ?? page?.text ?? e.text;
     if (from === "window" || from === "page")
       keepExchange(exchanges, "person", said);
     // A turn the person began lets go of the page's words a stop held.
@@ -7417,10 +8626,11 @@ export const register: Register = (on) => {
       /* stay silent */
     }
     // The reply, kept for an opening and, for this window's laptop chat,
-    // posted as the turn's end; then the page's words that waited for it are
-    // typed in, unless the person stopped it in the window, which holds them
-    // as they are. A Stop from the page holds none: devcorner dropped those
-    // that waited, so the words here now came after it.
+    // posted as the turn's end; then the oldest of the page's messages that
+    // waited for it is typed in, unless the person stopped it in the window,
+    // which holds them as they are. A Stop from the page holds none:
+    // devcorner dropped those that waited, so the words here now came after
+    // it.
     const answer = e.answer;
     keepExchange(exchanges, "window", answer);
     if (mirror !== null && mirror.turn === e.turnId) {
@@ -7837,6 +9047,8 @@ export const register: Register = (on) => {
     }
     // A repo devcorner does not know: set it up, or hide the row's offer
     // (dc-t533, in place of the row's buttons).
+    // Local subagents on this machine: the person's yes and the install.
+    if (arg === "local-agent install") return { text: await localAgentHere($) };
     if (arg === "setup") return { text: await setUpHere($) };
     if (arg === "hide") return { text: await hideNudge($) };
     if (arg) {

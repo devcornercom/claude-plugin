@@ -2,6 +2,22 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.52.0 — 2026-11-17
+
+- A slash command you send from a laptop chat's page runs in the window, as if you typed it there: a skill, a plugin's command or an MCP prompt as the window lists it, and of Claude Code's own commands `/compact`, `/context`, `/model <name>` and `/effort <level>`. It runs alone, once the window is idle, in its place among your messages, never joined with words. A skill begins a turn like any words, shown on the page as your `/name` line; any other shows what it came to under your line, `/context`'s whole breakdown included. A command the window does not run (a name it does not have, another of Claude Code's own commands, or one Claude Code refuses, as after Esc in the window) is said once on the page and dropped, so the messages after it go on: before, a message that began with `/` was refused by Claude Code, put back and tried again at every turn's end, and every message after it waited behind it until a Stop on the page. It needs the devcorner that marks a page's command, which comes before it.
+
+## 0.51.0 — 2026-11-16
+
+- Messages you send on a laptop chat's page while its window answers reach the window one at a time, each as a turn of its own, in the order you sent them, as the page shows each in a bubble of its own. They used to be typed in together, as one prompt split by blank lines, once the turn ended. The next goes in once the turn the last one began ends, still never mid-turn and never over a draft.
+
+## 0.50.0 — 2026-11-16
+
+- devcorner's `subagent` tool runs on your laptop. The plugin answers the call itself, before it leaves the machine: it asks devcorner to begin the child's round, runs devcorner's local agent (Pi on your workspace's box model, in a clone of your checkout), and hands Claude the child's answer and its patch, with how to check and apply it and how to give the same child more instructions (`resume`). Several calls in one answer run side by side. It needs Claude Code's command line on a machine signed in to devcorner (`/dc login`), Node 22.19 or later on your login shell's PATH, and a conversation that called `start`; each of those missing is answered with how to fix it.
+- A local child runs commands and edits files as you, without asking you first. Such a call meets no permission prompt of Claude Code's, so the plugin asks you itself, in a window, whenever no rule of yours allows the tool; a rule that denies it refuses it, and in `claude -p`, where nobody can be asked, it is refused unless a rule allows it.
+- The first call on a machine asks you once whether to run devcorner's subagents here, saying what a local child may do before what installing it downloads; several calls at once ask once. "Not now" is kept, and `/dc local-agent install` says yes later and installs it, or says which version, folder and Node are in use. The local agent is not published yet, so for now `DEVCORNER_LOCAL_AGENT` names the launcher to run, and with none named a call says so and asks nothing.
+- An interrupt stops the child: its round's end is told to devcorner at once, and the child's clone and patch stay for a resume. A child's files are removed 24 hours after its last round, and a child a killed launcher left running is stopped, when a session starts.
+- `/devcorner:how-we-work` is now revision 9: devcorner's subagent tool runs a child on the laptop, and its answer and patch are read, checked and applied by the session that started it.
+
 ## 0.49.0 — 2026-11-16
 
 - A laptop chat draws each tool call on one short line, as a project chat does. devcorner's own tools go by their name and what they act on, such as `workspace: coordinator web` or `show: dc-t12`, never the MCP prefix or the session they are made as; any other tool goes by its short name and one short argument, a file by its name and a command by its first words, such as `Read: register.tsx` or `Bash: pnpm test`. Of a devcorner call, its short arguments go to devcorner, which names what it acts on by the project chat's own rule; of any other, only the short label leaves the machine. It needs the devcorner that takes them, which comes before it.

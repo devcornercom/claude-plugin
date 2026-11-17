@@ -80,6 +80,9 @@ import {
   keepTasks,
   seenFor,
   turnWords,
+  pageCommandIn,
+  commandOutcome,
+  commandRefused,
   pastedImages,
   droppedImagePaths,
   droppedImages,
@@ -8559,6 +8562,119 @@ describe("a laptop chat's mirror", () => {
     });
   });
 
+  test("messages said while the window answers are typed in one at a time, in order, each the turn of its own", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    // Every post's answer names the words that wait, as devcorner keeps them:
+    // each turn's beginning takes the one it typed.
+    const waiting = (...keys: string[]) => ({
+      status: 200,
+      body: {
+        ok: true,
+        words: keys.map((key) => ({ key, text: `message ${key}` })),
+      },
+    });
+    seen.chatAnswer = waiting("w1", "w2", "w3");
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    expect(seen.submitted).toEqual([]);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w1"]);
+    for (const [turn, key, rest] of [
+      ["t2", "w1", ["w2", "w3"]],
+      ["t3", "w2", ["w3"]],
+      ["t4", "w3", []],
+    ] as const) {
+      seen.chatAnswer = waiting(...rest);
+      await $.turn.start({ text: `message ${key}`, turnId: turn });
+      await flush(clock);
+      expect(parts(seen).at(-1)).toMatchObject({
+        turn,
+        begin: { text: `message ${key}`, from: "page", took: [key] },
+      });
+      // Never mid-turn: the next waits for this one's end.
+      expect(seen.submitted.at(-1)).toBe(`message ${key}`);
+      await $.turn.complete(done(turn));
+      await flush(clock);
+    }
+    expect(seen.submitted).toEqual(["message w1", "message w2", "message w3"]);
+  });
+
+  test("a refused submit puts the message back first, and it is typed once the window takes it, never doubled", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    const waiting = (...keys: string[]) => ({
+      status: 200,
+      body: {
+        ok: true,
+        words: keys.map((key) => ({ key, text: `message ${key}` })),
+      },
+    });
+    seen.chatAnswer = waiting("w1", "w2");
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.submitRefused = true;
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual([]);
+    // The next turn's end, every post's answer naming both again, types the
+    // first message again, ahead of the second and only once.
+    seen.submitRefused = false;
+    await $.turn.start({ text: "by hand", turnId: "t2" });
+    await flush(clock);
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w1"]);
+  });
+
+  test("a message with files is fetched alone while others wait, and the rest are typed after its turn", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { home: "/Users/ann" });
+    const shot = {
+      id: "dc-k3-a1",
+      name: "shot.png",
+      type: "image/png",
+      size: 7,
+    };
+    const said = {
+      status: 200,
+      body: {
+        ok: true,
+        words: [
+          { key: "w1", text: "Fix that", files: [shot] },
+          { key: "w2", text: "and the docs" },
+        ],
+      },
+    };
+    seen.chatAnswers.push(said, said, {
+      status: 200,
+      body: { ok: true, name: shot.name, base64: "iVBORw0=" },
+    });
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const path =
+      "/Users/ann/.cache/devcorner/laptop-files/conversation-1/dc-k3-a1-shot.png";
+    // The second message does not pass the first while its files are read.
+    expect(seen.submitted).toEqual([
+      `Fix that\n\nFiles sent from devcorner:\n- ${path}`,
+    ]);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w2", text: "and the docs" }] },
+    };
+    await $.turn.start({ text: seen.submitted[0]!, turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      begin: { from: "page", took: ["w1"] },
+    });
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    expect(seen.submitted).toEqual([
+      `Fix that\n\nFiles sent from devcorner:\n- ${path}`,
+      "and the docs",
+    ]);
+  });
+
   /** A window that mirrors a chat, idle after a turn, holding its request. */
   const holding = async ($: Parameters<TestBody>[0], on: On) => {
     const w = world(on, { hold: true });
@@ -8761,14 +8877,288 @@ describe("a laptop chat's mirror", () => {
     await flush(clock);
     expect(seen.chats.at(-1)).toMatchObject({ turn: null, post: 0 });
     expect(seen.submitted).toEqual([]);
-    // The person says more on the page: all of it goes in, in order.
+    // The person says more on the page: all of it goes in, in order, each
+    // message a turn of its own.
     seen.chatAnswer = {
       status: 200,
       body: { ok: true, words: [docs, { key: "w2", text: "and the tests" }] },
     };
     seen.held.pop()!(JSON.stringify({ chat: "me-k3" }));
     await flush(clock);
-    expect(seen.submitted).toEqual(["and the docs\n\nand the tests"]);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w2", text: "and the tests" }] },
+    };
+    await $.turn.start({ text: "and the docs", turnId: "t2" });
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs", "and the tests"]);
+  });
+
+  /** The window's commands as `$.command.list()` gives them, and its answers to `$.command.run`: each run kept, then answered, refused, or held until the test lets it go. */
+  const commands = (on: On) => {
+    const ran: { command: string; args: string }[] = [];
+    const held: ((result: object) => void)[] = [];
+    /** By name: what it prints, why Claude Code refuses it, or "held" (until `held` answers it, an Error refusing it). */
+    const answers: Record<string, object | string> = {};
+    on("command.list", async () => ({
+      value: [
+        { name: "context", description: "", source: "builtin" },
+        { name: "simplify", description: "", source: "builtin" },
+        { name: "hello", description: "", source: "user" },
+      ],
+    }));
+    on("command.run", async (_$, e) => {
+      ran.push({ command: e.command, args: e.args });
+      const answer = answers[e.command] ?? {};
+      // A hook that throws leaves the call unanswered, which rejects it.
+      if (typeof answer === "string" && answer !== "held")
+        throw new Error(answer);
+      if (answer === "held")
+        return new Promise<object>((resolve, reject) =>
+          held.push((result) =>
+            result instanceof Error ? reject(result) : resolve(result),
+          ),
+        );
+      return answer;
+    });
+    return { ran, held, answers };
+  };
+  const command = (key: string, name: string, args = "") => ({
+    key,
+    text: `/${name}${args === "" ? "" : ` ${args}`}`,
+    command: { name, args },
+  });
+
+  test("a command from the page runs alone, in its place among the words, and its outcome goes with the person's line", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    window.answers.context = { context: ["## Context Usage\n\n| a | b |"] };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    const first = { key: "w1", text: "first" };
+    const after = { key: "w2", text: "after" };
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [first, command("c1", "context"), after] },
+    });
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    // The message before the command goes in alone, never joined with it.
+    expect(seen.submitted).toEqual(["first"]);
+    expect(window.ran).toEqual([]);
+    await $.turn.start({ text: "first", turnId: "t2" });
+    await flush(clock);
+    seen.chatAnswers.push(
+      {
+        status: 200,
+        body: { ok: true, words: [command("c1", "context"), after] },
+      },
+      // An answer that still names the command, as one sent before
+      // devcorner took it does, runs it no second time.
+      {
+        status: 200,
+        body: { ok: true, words: [command("c1", "context"), after] },
+      },
+    );
+    await $.turn.complete({ ...done("t2"), answer: "Read." });
+    await flush(clock);
+    expect(window.ran).toEqual([{ command: "context", args: "" }]);
+    expect(parts(seen).find((p) => p.turn === "page-command-c1")).toMatchObject(
+      {
+        begin: { text: "/context", from: "page", took: ["c1"] },
+        parts: [],
+        end: { text: "## Context Usage\n\n| a | b |", outcome: "done" },
+      },
+    );
+    // No turn of the window's ran it, so the words after it go on at once.
+    expect(seen.submitted).toEqual(["first", "after"]);
+  });
+
+  test("a command the window does not run is said once on the page and dropped, and the words after it are not held", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    window.answers.hello =
+      "the session was stopped and nobody has sent input since";
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    const waiting = [
+      command("c1", "simplify"),
+      command("c2", "nosuch"),
+      command("c3", "hello"),
+      // Said before devcorner marked commands: never typed in.
+      { key: "w4", text: "/clear" },
+      { key: "w5", text: "after" },
+    ];
+    seen.chatAnswers.push({ status: 200, body: { ok: true, words: waiting } });
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    // A built-in not on devcorner's list, and a name the window does not
+    // have, are never run; one the window refuses is run once.
+    expect(window.ran).toEqual([{ command: "hello", args: "" }]);
+    const said = (key: string) =>
+      parts(seen).filter((p) => p.turn === `page-command-${key}`);
+    expect(said("c1")).toEqual([
+      expect.objectContaining({
+        begin: expect.objectContaining({ text: "/simplify", took: ["c1"] }),
+        end: expect.objectContaining({
+          text: "Not run in the window: /simplify is one of Claude Code's own commands, which a laptop chat's page does not run: run it in the window itself.",
+          outcome: "failed",
+        }),
+      }),
+    ]);
+    expect(said("c2")[0]).toMatchObject({
+      end: {
+        text: "Not run in the window: no command named /nosuch in this window.",
+        outcome: "failed",
+      },
+    });
+    expect(said("c3")[0]).toMatchObject({
+      end: {
+        text: expect.stringMatching(/^Not run in the window: /),
+        outcome: "failed",
+      },
+    });
+    expect(said("w4")[0]).toMatchObject({
+      begin: { took: ["w4"] },
+      end: {
+        text: expect.stringMatching(/begin with "\/"/),
+        outcome: "failed",
+      },
+    });
+    expect(seen.submitted).toEqual(["after"]);
+    // Never put back to wait: no later moment runs them again.
+    await clock.advance(WAITING_MS);
+    await flush(clock);
+    expect(window.ran).toHaveLength(1);
+    expect(said("c3")).toHaveLength(1);
+  });
+
+  test("a skill from the page runs as the window's turn, which begins with the person's line", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    window.answers.hello = "held";
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "hello", "world")] },
+    });
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    expect(window.ran).toEqual([{ command: "hello", args: "world" }]);
+    // Claude Code submits the skill's prompt, then the run resolves, then
+    // its turn begins.
+    const prompt = "<command-message>hello</command-message>\nSay hello.";
+    await $.prompt.submit({
+      text: prompt,
+      origin: { kind: "plugin", name: "devcorner" },
+      command: { name: "hello", args: "world" },
+      wait: false,
+    } as never);
+    window.held.shift()!({});
+    await flush(clock);
+    expect(parts(seen).some((p) => p.turn === "page-command-c1")).toBe(false);
+    await $.turn.start({ text: prompt, turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { text: "/hello world", from: "page", took: ["c1"] },
+    });
+  });
+
+  test("a skill from the page refused once its prompt was handed over is said once, and holds neither the words after it nor the window's next turn", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    window.answers.hello = "held";
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        words: [command("c1", "hello"), { key: "w2", text: "after" }],
+      },
+    });
+    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await flush(clock);
+    // Its prompt is handed over as the page's line, then a later hook
+    // blocks it: no turn begins.
+    const prompt = "<command-message>hello</command-message>\nSay hello.";
+    await $.prompt.submit({
+      text: prompt,
+      origin: { kind: "plugin", name: "devcorner" },
+      command: { name: "hello", args: "" },
+      wait: false,
+    } as never);
+    window.held.shift()!(new Error("blocked by a hook"));
+    await flush(clock);
+    expect(parts(seen).filter((p) => p.turn === "page-command-c1")).toEqual([
+      expect.objectContaining({
+        begin: expect.objectContaining({ text: "/hello", took: ["c1"] }),
+        end: expect.objectContaining({
+          text: expect.stringMatching(/^Not run in the window: /),
+          outcome: "failed",
+        }),
+      }),
+    ]);
+    // The words after it go in at once, as no turn's end comes to type them.
+    expect(seen.submitted).toEqual([prompt, "after"]);
+    await $.turn.start({ text: "after", turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { text: "after", from: "page", took: ["w2"] },
+    });
+  });
+
+  test("the window runs a command the page sent by where it comes from, and says what it came to", () => {
+    const listed = [
+      { name: "compact", description: "", source: "builtin" as const },
+      { name: "status", description: "", source: "builtin" as const },
+      { name: "Deploy", description: "", source: "user" as const },
+      {
+        name: "devcorner:how-we-work",
+        description: "",
+        source: "plugin" as const,
+      },
+      { name: "mcp__github__review", description: "", source: "mcp" as const },
+    ];
+    expect(pageCommandIn("compact", listed)).toEqual({ name: "compact" });
+    // devcorner reads a name lower-cased; the window runs it as it lists it.
+    expect(pageCommandIn("deploy", listed)).toEqual({ name: "Deploy" });
+    expect(pageCommandIn("devcorner:how-we-work", listed)).toEqual({
+      name: "devcorner:how-we-work",
+    });
+    expect(pageCommandIn("mcp__github__review", listed)).toEqual({
+      name: "mcp__github__review",
+    });
+    expect(pageCommandIn("status", listed)).toEqual({
+      refused: expect.stringMatching(/Claude Code's own commands/),
+    });
+    expect(pageCommandIn("model", listed)).toEqual({
+      refused: "no command named /model in this window",
+    });
+    expect(pageCommandIn("compact", null)).toEqual({
+      refused: "the window's commands could not be read",
+    });
+    expect(
+      commandRefused(
+        new Error(
+          "devcorner: $.command.run: the session was stopped and nobody has sent input since",
+        ),
+      ),
+    ).toBe("the session was stopped and nobody has sent input since");
+    expect(commandOutcome("/rename x", { text: " Named x. " })).toBe(
+      "Named x.",
+    );
+    expect(commandOutcome("/context", { context: ["## Context", " "] })).toBe(
+      "## Context",
+    );
+    expect(commandOutcome("/model sonnet", {})).toBe(
+      "Ran /model sonnet in the window.",
+    );
   });
 
   test("an answer still on its way at a stop in the window lets none of the words go", async ($, on) => {
