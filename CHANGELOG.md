@@ -2,6 +2,36 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.67.0 — 2026-11-18
+
+- A window chat's words sent from the page while the window works reach the turn under way, as words typed into Claude Code mid-turn do: at its next tool result they are added to that result, marked as your own words from the page, and the page shows them added while it answered. A slash command, and anything sent after it, still waits for the turn to end. Words that reach the window only after the turn ended (sent while it wrote its final answer) are typed in marked as sent before that reply, with the time you sent them and the reply's opening quoted, so a "yes" is never read as approving what the reply proposed. Files sent mid-turn are fetched at once, ready to join. A Stop from the page now keeps the words waiting until you say more or press Send now. Words typed in after Run in background are not marked: its line already says the turn was ended so they could reach Claude.
+
+## 0.66.0 — 2026-11-18
+
+- A window chat whose background session Claude Code parked (idle about an hour) comes back from its page: Revive, or your words sent there, has an idle window or the launcher on that machine run `claude respawn <id>`, which restarts the same session, with its whole context, and it rejoins the chat. Before it restarts one it reads `claude agents --json --all`, and leaves a session alone that still runs (one listed with a status, as `busy` or `idle`, or with a process that lives). Each held request says the plugin can revive, and each opening of a window chat says whether its window is a background session (`claude agents --json`), which a chat in a terminal window of its own never is.
+- A chat's session started from the page, a new chat's too, is named `<title> · me-k3`, so agent view's search and `claude attach me-k3` find it by the chat's id. `/dc chat` and `/dc continue` typed in a window offer the same name with `/rename`, since a plugin cannot rename its session.
+- A launch devcorner answers with no prompt and no session to restart starts nothing, rather than an empty session.
+
+## 0.65.0 — 2026-11-18
+
+- A window chat's page says what holds the window while its words wait: a command the window has run in the foreground for over 10 seconds (by its tool and first words, as `Bash: pnpm dev`), a plan waiting for its approval, or a question the page cannot show. For a foreground Bash command it offers Run in background: the window ends its turn, which moves the command to the background where it keeps running, then types the words that waited, after one line telling Claude what moved and to carry on; with no words waiting, that line alone goes, so Claude carries on as after Ctrl+B. The turn's reply ends with "Moved `pnpm dev` to the background from the page."
+
+## 0.64.0 — 2026-11-18
+
+- In a window chat, a background agent's permission prompt shows in the Claude Code window at once. Claude Code draws a background agent's prompt only after the plugin's hook returns, and the hook used to wait there for an answer from the chat's page, so the window stayed blank for minutes. A subagent's prompt now shows on the page as one to answer in the window, without Allow and Deny, and closes there once it is answered in the window: the plugin cannot tell for sure whether an agent runs in the background, so it never holds a subagent's prompt. A prompt of the window's own turn is still answerable on the page or in the window, whichever is first.
+
+## 0.63.0 — 2026-11-18
+
+- A window started with `--plugin-dir` (a plugin of its own, with a store of its own) no longer deletes the machine's hook token at its start. The file the command hooks read is shared by every conversation, and a store that holds no token says nothing about it; only signing out removes it, and only while it still holds the token signed out. That window says delivery is off for itself alone, since the hooks still send with the machine's token, and every other conversation keeps its delivery.
+
+## 0.62.0 — 2026-11-18
+
+- A window chat keeps its title current, as a project chat does: the window is told to title the chat once its topic is clear and to set it again when the topic moves on, until you rename it. A name you give the chat is never replaced.
+
+## 0.61.0 — 2026-11-18
+
+- A chat that runs in a Claude Code window is now called a "window chat", not a "laptop chat": the line above the prompt reads `window chat <id> live` (or `reconnecting…`), and the `/dc` messages say the same.
+
 ## 0.60.0 — 2026-11-17
 
 - An `/effort <level>` sent from a laptop chat's page, typed or picked from its model control, shows on the page at once as the window's effort. The window's effort was known only from its next model call, so the chat's head and model control kept the old level until the next turn began.

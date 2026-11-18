@@ -11,6 +11,8 @@ import type {
   StatusWake,
 } from "../types";
 import {
+  JOINED_FROM_PAGE,
+  sentBefore,
   PASTE_USAGE,
   PASTER,
   RECALL_AFTER_MS,
@@ -81,6 +83,12 @@ import {
   launchArgv,
   launchOutcome,
   launcherListed,
+  respawnArgv,
+  respawnOutcome,
+  backgroundOf,
+  agentsListed,
+  listedLife,
+  renameLine,
   stepParts,
   toolCall,
   lineLabel,
@@ -113,6 +121,11 @@ import {
   LAPTOP_CHAT_INSTRUCTION,
   ASK_LOOK_MS,
   BACKGROUND_ASK_LINE,
+  BACKGROUND_LINE,
+  HOLD_AFTER_MS,
+  backgroundNote,
+  holdOf,
+  withMovedLine,
   MIRROR_BEAT_MS,
   askQuestions,
   pageAnswer,
@@ -142,6 +155,7 @@ import {
   codeKey,
   CLOUD_DELIVERY,
   DELIVERY_OFF,
+  WINDOW_DELIVERY_OFF,
   offeredKey,
   handedText,
   handOverLine,
@@ -1426,12 +1440,12 @@ function world(
       | "held",
     /** The Memory asks held open while `memoryAnswer` is "held", answered by the test. */
     heldMemories: [] as ((answer: { status: number; body: unknown }) => void)[],
-    /** What each laptop chat event (ChatOpen, ChatParts, ChatClose, ChatFile) carried, in order. */
+    /** What each window chat event (ChatOpen, ChatParts, ChatClose, ChatFile) carried, in order. */
     chats: [] as Record<string, unknown>[],
-    /** How the next laptop chat events are answered, in order; once spent, as `chatAnswer`. */
+    /** How the next window chat events are answered, in order; once spent, as `chatAnswer`. */
     chatAnswers: [] as ({ status: number; body: unknown } | "down" | "held")[],
     chatAnswer: { status: 200, body: { ok: true } as unknown },
-    /** The laptop chat events held open, answered by the test. */
+    /** The window chat events held open, answered by the test. */
     heldChats: [] as ((answer: { status: number; body: unknown }) => void)[],
     /** The chunks the model's response streams at each turn.step. */
     chunks: [] as TurnStepChunk[],
@@ -2756,6 +2770,7 @@ describe("the held request", () => {
         session_id: "conversation-1",
         timeout: HOLD_MS,
         launcher: true,
+        revive: true,
       },
     ]);
     const atStart = seen.asks;
@@ -4206,7 +4221,7 @@ describe("signing this machine in from Claude Code (dc-t224)", () => {
     expect(seen.files.get(handedFile)).toBe(HANDED);
   });
 
-  test("a copy the store no longer holds is taken back at a session's start", async ($, on) => {
+  test("a store with no token leaves the hooks' token another store owns", async ($, on) => {
     const { clock, seen } = world(on, {
       token: false,
       home: "/home/ann",
@@ -4214,7 +4229,40 @@ describe("signing this machine in from Claude Code (dc-t224)", () => {
     });
     await $.session.start(START);
     await flush(clock);
-    expect(seen.files.has(handedFile)).toBe(false);
+    expect(seen.files.get(handedFile)).toBe(HANDED);
+    expect(await rowText($)).toContain("not signed in");
+    // Delivery is off for this window alone: the hooks still send with the
+    // machine's token.
+    expect(seen.logs).toEqual([WINDOW_DELIVERY_OFF]);
+    expect(said(await $.command.run({ command: "dc", args: "" }))).toBe(
+      WINDOW_DELIVERY_OFF,
+    );
+  });
+
+  test("a sign-out or a revocation leaves the hooks' token another store wrote since", async ($, on) => {
+    const other = handedText(`dch_${"o".repeat(43)}`, "http://dc.test");
+    const { clock, seen, stored } = world(on, {
+      token: false,
+      home: "/home/ann",
+      store: { [STORE_KEY]: machineToken },
+    });
+    seen.answer = WHOLE;
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.files.get(handedFile)).toBe(HANDED);
+    // Another store of the machine hands the hooks its own token.
+    seen.files.set(handedFile, other);
+    seen.answer = "refused";
+    await $.command.run({ command: "dc", args: "" });
+    await flush(clock);
+    expect(stored.get(STORE_KEY)).toBe(undefined);
+    expect(seen.files.get(handedFile)).toBe(other);
+
+    stored.set(STORE_KEY, machineToken);
+    seen.answer = WHOLE;
+    await $.command.run({ command: "dc", args: "logout" });
+    expect(stored.get(STORE_KEY)).toBe(undefined);
+    expect(seen.files.get(handedFile)).toBe(other);
   });
 
   test("/dc says which person and which machine this is, when devcorner says", async ($, on) => {
@@ -7492,7 +7540,7 @@ describe("a lookup in Claude Code's own memory asks devcorner's Memory", () => {
   });
 });
 
-describe("a laptop chat's mirror", () => {
+describe("a window chat's mirror", () => {
   test("the held request's chat frame names the chat alone", () => {
     expect(readHeld('{"chat":"me-k3"}')).toEqual({
       kind: "chat",
@@ -7658,11 +7706,11 @@ describe("a laptop chat's mirror", () => {
       /* read to its end */
     }
   };
-  /** A world with this window's laptop chat open. */
+  /** A world with this window's window chat open. */
   const mirrored = async (
     $: Parameters<TestBody>[0],
     on: On,
-    options: { hold?: boolean; home?: string } = {},
+    options: { hold?: boolean; home?: string; tools?: boolean } = {},
   ) => {
     const w = world(on, options);
     await $.session.start(START);
@@ -7685,7 +7733,7 @@ describe("a laptop chat's mirror", () => {
     await $.turn.complete({ ...done("t2"), answer: "Answered dc-m3." });
     seen.chatAnswers.push(OPENED);
     const out = await $.command.run({ command: "dc", args: "chat" } as never);
-    expect(out.text).toContain("laptop chat me-k3");
+    expect(out.text).toContain("window chat me-k3");
     expect(seen.chats[0]).toMatchObject({
       hook_event_name: "ChatOpen",
       history: [
@@ -8778,8 +8826,8 @@ describe("a laptop chat's mirror", () => {
     await clock.advance(MIRROR_BATCH_MS);
     await flush(clock);
     expect(seen.aborted).toEqual(["t1"]);
-    // devcorner dropped the words that waited at the Stop, so these came
-    // after it: they are not held. Never mid-turn.
+    // devcorner holds the words that waited at the Stop and hands none of
+    // them, so these came after it: they are not held. Never mid-turn.
     expect(seen.submitted).toEqual([]);
     seen.draft = "half a thought";
     await $.turn.complete({
@@ -8813,7 +8861,8 @@ describe("a laptop chat's mirror", () => {
       size: 70,
     };
     // Said while a turn runs: each post's answer names them until a turn
-    // takes them, the end's too, and the file is fetched once it ends.
+    // takes them, the end's too, and the file is fetched at once, ready to
+    // join the turn, and once only.
     const said = {
       status: 200,
       body: {
@@ -8827,25 +8876,34 @@ describe("a laptop chat's mirror", () => {
         ],
       },
     };
-    seen.chatAnswers.push(said, said, {
-      status: 200,
-      body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-    });
+    seen.chatAnswers.push(
+      said,
+      {
+        status: 200,
+        body: { ok: true, name: shot.name, base64: "iVBORw0=" },
+      },
+      said,
+    );
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     expect(seen.submitted).toEqual([]);
-    await $.turn.complete(done("t1"));
-    await flush(clock);
-    const path =
-      "/Users/ann/.cache/devcorner/laptop-files/conversation-1/dc-k3-a1-cart_bug.png";
     expect(seen.chats.at(-1)).toMatchObject({
       hook_event_name: "ChatFile",
       thread: "me-k3",
       file: "dc-k3-a1",
     });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const path =
+      "/Users/ann/.cache/devcorner/laptop-files/conversation-1/dc-k3-a1-cart_bug.png";
+    expect(
+      seen.chats.filter((post) => post.hook_event_name === "ChatFile"),
+    ).toHaveLength(1);
     // Written whole, by its owner alone, from the bytes devcorner gave.
     expect(seen.files.get(path)).toBe("iVBORw0=");
-    expect(seen.runs.at(-1)!.argv[2]).toContain("umask 077");
+    expect(seen.runs.find((run) => run.argv[0] === "sh")!.argv[2]).toContain(
+      "umask 077",
+    );
     expect(seen.submitted).toEqual([
       `> The cart drops items.\n\nFix that\n\nFiles sent from devcorner:\n- ${path}`,
     ]);
@@ -8933,27 +8991,27 @@ describe("a laptop chat's mirror", () => {
     expect(seen.submitted).toEqual(["and the docs"]);
   });
 
-  test("the row names the laptop chat the window mirrors, live or reconnecting, and nothing once mirroring is off", async ($, on) => {
+  test("the row names the window chat the window mirrors, live or reconnecting, and nothing once mirroring is off", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     seen.answer = { ...base, known: true } as Status;
     await clock.advance(IDLE_MS);
     await flush(clock);
-    expect(await rowText($)).toContain("laptop chat me-k3 live");
+    expect(await rowText($)).toContain("window chat me-k3 live");
     // A post that fails says so until one goes.
     seen.chatAnswers.push("down");
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
-    expect(await rowText($)).toContain("laptop chat me-k3 reconnecting…");
+    expect(await rowText($)).toContain("window chat me-k3 reconnecting…");
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
-    expect(await rowText($)).toContain("laptop chat me-k3 live");
+    expect(await rowText($)).toContain("window chat me-k3 live");
     seen.chatAnswers.push({ status: 200, body: { ok: true } });
     await $.command.run({ command: "dc", args: "chat off" } as never);
     await flush(clock);
-    expect(await rowText($)).not.toContain("laptop chat");
+    expect(await rowText($)).not.toContain("window chat");
     expect(
       laptopLineText({ thread: "me-k3", url: null, reconnecting: false }),
-    ).toBe("laptop chat me-k3 live");
+    ).toBe("window chat me-k3 live");
   });
 
   test("words that both the turn's end and its end post's answer find are typed in once, whole", async ($, on) => {
@@ -9017,6 +9075,137 @@ describe("a laptop chat's mirror", () => {
     expect(seen.submitted).toEqual(["message w1", "message w2", "message w3"]);
   });
 
+  test("messages said mid-turn join it at its next main-loop tool result, up to a command, once, and devcorner is told", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { tools: true });
+    seen.chatAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        words: [
+          { key: "w1", text: "only src/", at: 1 },
+          { key: "w2", text: "> its reply\n\nand keep the tests", at: 2 },
+          {
+            key: "w3",
+            text: "/compact",
+            command: { name: "compact", args: "" },
+            at: 3,
+          },
+          { key: "w4", text: "then push", at: 4 },
+        ],
+      },
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    // A subagent's result never takes them.
+    const inside = await $.tool.call({
+      tool: "Read",
+      file_path: "a",
+      agentId: "agent-1",
+    } as never);
+    expect(inside.context).toBeUndefined();
+    const ran = await $.tool.call({ tool: "Read", file_path: "b" } as never);
+    expect(ran.context).toEqual([
+      `${JOINED_FROM_PAGE}\n\nonly src/\n\n---\n\n> its reply\n\nand keep the tests`,
+    ]);
+    expect(seen.toasts.at(-1)).toBe(
+      "dc: your words from the page reached this turn",
+    );
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      join: ["w1", "w2"],
+    });
+    // Every answer still naming them until devcorner took the join, none is
+    // joined again; the command waits, and the words behind it with it.
+    const again = await $.tool.call({ tool: "Read", file_path: "c" } as never);
+    expect(again.context).toBeUndefined();
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [] } };
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual([]);
+    expect(parts(seen).filter((post) => post.join !== undefined)).toHaveLength(
+      1,
+    );
+  });
+
+  test("words a page Stop holds since devcorner's last answer never join: it is asked first", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { tools: true });
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "only src/", at: 1 }] },
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    // The person pressed Stop while the tool ran: devcorner holds the words.
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, stop: true, words: [] },
+    };
+    const ran = await $.tool.call({ tool: "Read", file_path: "b" } as never);
+    expect(ran.context).toBeUndefined();
+    await flush(clock);
+    expect(seen.aborted).toEqual(["t1"]);
+    expect(parts(seen).filter((post) => post.join !== undefined)).toEqual([]);
+  });
+
+  test("a message sent before the reply it came during is typed in marked as such, quoting it", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "yes", at: 0 }] },
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete({
+      ...done("t1"),
+      answer: "Shall I push the release branch?",
+    });
+    await flush(clock);
+    expect(seen.submitted).toEqual([
+      expect.stringMatching(
+        /^\[Sent from devcorner's page at \d\d:\d\d, while you were still writing your reply that begins "Shall I push the release branch\?", before your person had read it: these words do not answer that reply, so a yes or a go-ahead in them is no approval of what it proposed\. If they could be read as one, ask\.\]\n\nyes$/,
+      ),
+    ]);
+    // Words said during no reply, or one with no words, are typed as they
+    // are; a reply that opens with no space to cut at is quoted cut all the
+    // same.
+    expect(sentBefore({ at: 200 }, "and tag it", null)).toBe("and tag it");
+    expect(sentBefore({ at: 200 }, "and tag it", " \n")).toBe("and tag it");
+    expect(sentBefore({ at: null }, "ok", "x".repeat(300))).toStartWith(
+      `[Sent from devcorner's page, while you were still writing your reply that begins "${"x".repeat(200)}…"`,
+    );
+  });
+
+  test("a message held past a later reply is marked by the reply it came during", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "yes", at: 0 }] },
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    // Stopped in the window: the words that wait are held.
+    await $.turn.complete({
+      ...done("t1"),
+      answer: "Shall I push the release branch?",
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    expect(seen.submitted).toEqual([]);
+    // The person's own turn in the window lets them go; its reply is not
+    // the one they were said during.
+    await $.turn.start({ text: "show the diff first", turnId: "t2" });
+    await flush(clock);
+    await $.turn.complete({ ...done("t2"), answer: "Here is the diff." });
+    await flush(clock);
+    expect(seen.submitted).toEqual([
+      expect.stringContaining(
+        'your reply that begins "Shall I push the release branch?"',
+      ),
+    ]);
+  });
+
   test("a refused submit puts the message back first, and it is typed once the window takes it, never doubled", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     const waiting = (...keys: string[]) => ({
@@ -9061,10 +9250,14 @@ describe("a laptop chat's mirror", () => {
         ],
       },
     };
-    seen.chatAnswers.push(said, said, {
-      status: 200,
-      body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-    });
+    seen.chatAnswers.push(
+      said,
+      {
+        status: 200,
+        body: { ok: true, name: shot.name, base64: "iVBORw0=" },
+      },
+      said,
+    );
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     await $.turn.complete(done("t1"));
@@ -9361,7 +9554,7 @@ describe("a laptop chat's mirror", () => {
       status: 200,
       body: { ok: true, words: [first, command("c1", "context"), after] },
     });
-    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await $.turn.complete(done("t1"));
     await flush(clock);
     // The message before the command goes in alone, never joined with it.
     expect(seen.submitted).toEqual(["first"]);
@@ -9436,7 +9629,7 @@ describe("a laptop chat's mirror", () => {
       { key: "w5", text: "after" },
     ];
     seen.chatAnswers.push({ status: 200, body: { ok: true, words: waiting } });
-    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await $.turn.complete(done("t1"));
     await flush(clock);
     // A built-in not on devcorner's list, and a name the window does not
     // have, are never run; one the window refuses is run once.
@@ -9447,7 +9640,7 @@ describe("a laptop chat's mirror", () => {
       expect.objectContaining({
         begin: expect.objectContaining({ text: "/simplify", took: ["c1"] }),
         end: expect.objectContaining({
-          text: "Not run in the window: /simplify is one of Claude Code's own commands, which a laptop chat's page does not run: run it in the window itself.",
+          text: "Not run in the window: /simplify is one of Claude Code's own commands, which a window chat's page does not run: run it in the window itself.",
           outcome: "failed",
         }),
       }),
@@ -9525,7 +9718,7 @@ describe("a laptop chat's mirror", () => {
         words: [command("c1", "hello"), { key: "w2", text: "after" }],
       },
     });
-    await $.turn.complete({ ...done("t1"), answer: "Done." });
+    await $.turn.complete(done("t1"));
     await flush(clock);
     // Its prompt is handed over as the page's line, then a later hook
     // blocks it: no turn begins.
@@ -9693,7 +9886,7 @@ describe("a laptop chat's mirror", () => {
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     expect(seen.toasts.at(-1)).toBe(
-      "dc: this window no longer mirrors its laptop chat. me-k3 moved to another window.",
+      "dc: this window no longer mirrors its window chat. me-k3 moved to another window.",
     );
     expect(stored.has("laptopChat:conversation-1")).toBe(false);
     await $.turn.complete({ ...done("t1"), answer: "done" });
@@ -9719,7 +9912,7 @@ describe("a laptop chat's mirror", () => {
     await flush(clock);
     expect(seen.aborted).toEqual(["t1"]);
     expect(seen.toasts.at(-1)).toBe(
-      "dc: this window no longer mirrors its laptop chat. me-k3 was terminated: it takes nothing more.",
+      "dc: this window no longer mirrors its window chat. me-k3 was terminated: it takes nothing more.",
     );
     expect(stored.has("laptopChat:conversation-1")).toBe(false);
     await $.turn.complete({
@@ -9878,7 +10071,7 @@ describe("a laptop chat's mirror", () => {
     await $.session.start(START);
     await flush(clock);
     const briefing =
-      'devcorner: this window now continues laptop chat me-k3 "Fix the cart", which moved here from a window on MacBook.';
+      'devcorner: this window now continues window chat me-k3 "Fix the cart", which moved here from a window on MacBook.';
     seen.chatAnswers.push({
       status: 200,
       body: {
@@ -10035,7 +10228,12 @@ describe("a laptop chat's mirror", () => {
     expect(opened).toEqual({
       id: expect.any(String),
       state: "open",
-      ask: { kind: "permission", tool: "Bash", label: "pnpm deploy" },
+      ask: {
+        kind: "permission",
+        tool: "Bash",
+        label: "pnpm deploy",
+        windowOnly: false,
+      },
     });
     const id = opened!.id;
     // While it waits, the turn asks devcorner every ASK_LOOK_MS.
@@ -10104,7 +10302,9 @@ describe("a laptop chat's mirror", () => {
     const { clock, seen } = await mirrored($, on);
     await $.turn.start({ text: "clean up", turnId: "t1" });
     await flush(clock);
-    void $.tool.call({ tool: "Bash", command: "rm -rf dist" });
+    $.tool
+      .call({ tool: "Bash", command: "rm -rf dist" })
+      .catch(() => undefined);
     await flush(clock);
     const hook = $.classic.PermissionRequest({
       tool_name: "Bash",
@@ -10165,7 +10365,9 @@ describe("a laptop chat's mirror", () => {
     const { clock, seen } = await mirrored($, on, { hold: true });
     await $.turn.start({ text: "deploy it", turnId: "t1" });
     await flush(clock);
-    void $.tool.call({ tool: "Bash", command: "pnpm deploy" });
+    $.tool
+      .call({ tool: "Bash", command: "pnpm deploy" })
+      .catch(() => undefined);
     await flush(clock);
     const waits = seen.waitBodies.length;
     const hook = $.classic.PermissionRequest({
@@ -10336,18 +10538,22 @@ describe("a laptop chat's mirror", () => {
     const { clock, seen } = await mirrored($, on);
     // No turn mirrored (a window that began mirroring mid-turn): nothing is
     // asked, and no turn is begun for it.
-    void $.tool.call({
-      tool: "AskUserQuestion",
-      questions: QUESTIONS,
-    } as never);
+    $.tool
+      .call({
+        tool: "AskUserQuestion",
+        questions: QUESTIONS,
+      } as never)
+      .catch(() => undefined);
     await flush(clock);
     expect(asksTold(seen)).toEqual([]);
     await $.turn.start({ text: "review it", turnId: "t1" });
     await flush(clock);
-    void $.tool.call({
-      tool: "AskUserQuestion",
-      questions: QUESTIONS,
-    } as never);
+    $.tool
+      .call({
+        tool: "AskUserQuestion",
+        questions: QUESTIONS,
+      } as never)
+      .catch(() => undefined);
     await flush(clock);
     const id = asksTold(seen)[0]!.id;
     await $.turn.complete({
@@ -10379,7 +10585,7 @@ describe("a laptop chat's mirror", () => {
         : [{ turn: p.turn, end: (p.end as { text: string }).text }]),
     ]);
 
-  test("a background agent's permission ask while no turn is mirrored opens a turn of its own, answered from the page, which ends as the ask closes", async ($, on) => {
+  test("a background agent's permission ask while no turn is mirrored opens a turn of its own as the window's alone: the hook returns at once, so Claude Code shows its dialog, and the call's end closes it", async ($, on) => {
     let ran!: (result: { result: string }) => void;
     on("tool.call", () => new Promise((resolve) => (ran = resolve)) as never);
     on("classic.PermissionRequest", async () => ({}));
@@ -10394,13 +10600,17 @@ describe("a laptop chat's mirror", () => {
       agentId: "a1",
     });
     await flush(clock);
-    const hook = $.classic.PermissionRequest({
+    // Claude Code draws a background agent's dialog only once this hook
+    // returns: it decides nothing and waits on nothing, the clock unmoved.
+    const hook = await $.classic.PermissionRequest({
       tool_name: "Bash",
       tool_input: { command: "rm -rf dist && pnpm build" },
       agent_id: "a1",
     } as never);
+    expect(hook.decision).toBeUndefined();
     await flush(clock);
-    // A turn of its own, begun as the harness's line, holds the ask.
+    // A turn of its own, begun as the harness's line, holds the ask, which
+    // the page is told only the window answers.
     const begun = turnsTold(seen).at(-1)!;
     expect(begun.begin).toMatchObject({
       from: "harness",
@@ -10413,6 +10623,7 @@ describe("a laptop chat's mirror", () => {
         kind: "permission",
         tool: "Bash",
         label: "rm -rf dist && pnpm build",
+        windowOnly: true,
       },
     });
     const asked = parts(seen).find((p) =>
@@ -10421,18 +10632,12 @@ describe("a laptop chat's mirror", () => {
       ),
     )!;
     expect(asked.turn).toBe(begun.turn);
-    // The page's answer is the hook's.
-    seen.chatAnswer = {
-      status: 200,
-      body: {
-        ok: true,
-        answers: [{ id: opened!.id, answer: { allow: true } }],
-      },
-    };
-    await clock.advance(ASK_LOOK_MS);
+    // Nothing looks for the page's answer while it waits.
+    const waiting = parts(seen).length;
+    await clock.advance(ASK_LOOK_MS * 3);
     await flush(clock);
-    expect(await hook).toMatchObject({ decision: { behavior: "allow" } });
-    // The call's end closes the ask, and the turn with it, saying how.
+    expect(parts(seen).length).toBe(waiting);
+    // The call's end closes the ask as the window's, and the turn with it.
     seen.chatAnswer = { status: 200, body: { ok: true } };
     ran({ result: "ok" });
     await call;
@@ -10440,18 +10645,46 @@ describe("a laptop chat's mirror", () => {
     expect(asksTold(seen).at(-1)).toEqual({
       id: opened!.id,
       state: "answered",
-      by: "page",
+      by: "window",
       said: "Allowed",
     });
     expect(turnsTold(seen).at(-1)).toEqual({
       turn: begun.turn,
-      end: expect.stringContaining("Allowed from the page"),
+      end: "- Bash (rm -rf dist && pnpm build): Allowed in the window",
     });
-    // Nothing more is posted for it.
-    const posts = parts(seen).length;
-    await clock.advance(ASK_LOOK_MS * 3);
+  });
+
+  test("a foreground subagent's permission ask is the window's alone too, while the main loop's turn runs: the hook returns at once", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "test it", turnId: "t1" });
     await flush(clock);
-    expect(parts(seen).length).toBe(posts);
+    $.tool
+      .call({ tool: "Bash", command: "pnpm test", agentId: "a1" })
+      .catch(() => undefined);
+    await flush(clock);
+    const hook = await $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm test" },
+      agent_id: "a1",
+    } as never);
+    expect(hook.decision).toBeUndefined();
+    await flush(clock);
+    // Asked in the main loop's turn, as the window's alone.
+    expect(asksTold(seen)).toEqual([
+      {
+        id: expect.any(String),
+        state: "open",
+        ask: {
+          kind: "permission",
+          tool: "Bash",
+          label: "pnpm test",
+          windowOnly: true,
+        },
+      },
+    ]);
+    expect(turnsTold(seen).filter((t) => "begin" in t)).toHaveLength(1);
   });
 
   test("two background agents asking at once share one turn of asks, which ends as the last ask closes", async ($, on) => {
@@ -10485,7 +10718,7 @@ describe("a laptop chat's mirror", () => {
     await flush(clock);
     expect(turnsTold(seen).at(-1)).toEqual({
       turn: asking,
-      end: "- Bash (pnpm a1): Allowed in the window\n- Bash (pnpm a2): Allowed in the window",
+      end: `- Bash (pnpm a1): Allowed in the window\n- Bash (pnpm a2): Allowed in the window`,
     });
   });
 
@@ -10495,7 +10728,9 @@ describe("a laptop chat's mirror", () => {
     const { clock, seen } = await mirrored($, on);
     await $.turn.start({ text: "deploy it", turnId: "t1" });
     await flush(clock);
-    void $.tool.call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" });
+    $.tool
+      .call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" })
+      .catch(() => undefined);
     await flush(clock);
     void $.classic.PermissionRequest({
       tool_name: "Bash",
@@ -10523,8 +10758,230 @@ describe("a laptop chat's mirror", () => {
     expect(asksTold(seen).at(-1)).toEqual({ id: opened!.id, state: "expired" });
     expect(turnsTold(seen).at(-1)).toEqual({
       turn: told.at(-1)!.turn,
-      end: "- Bash (pnpm deploy): closed with no answer",
+      end: `- Bash (pnpm deploy): closed with no answer`,
     });
+  });
+
+  /** Every state of a hold the turn's posts told the page, in order. */
+  const holdsTold = (seen: { chats: Record<string, unknown>[] }) =>
+    parts(seen).flatMap((p) =>
+      ((p.parts ?? []) as { type: string; data?: unknown }[])
+        .filter((part) => part.type === "data-hold")
+        .map((part) => part.data as Record<string, unknown>),
+    );
+  /** A mirrored turn whose main loop runs `pnpm dev` in the foreground, as call toolu_1, held past `HOLD_AFTER_MS`. */
+  const heldTurn = async ($: Parameters<TestBody>[0], on: On) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    // No settings hook answers beneath.
+    on("classic.PostToolUse", async () => ({}));
+    const w = await mirrored($, on);
+    await $.turn.start({ text: "start the server", turnId: "t1" });
+    await flush(w.clock);
+    w.seen.chunks = [
+      { kind: "tool", index: 0, id: "toolu_1", name: "Bash" },
+      { kind: "input", index: 0, json: '{"command":"pnpm dev"}' },
+      { kind: "stop", stopReason: "tool_use", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    // The turn's abort stops the call, which then rejects.
+    $.tool
+      .call({
+        tool: "Bash",
+        command: "pnpm dev",
+        tool_use_id: "toolu_1",
+      } as never)
+      .catch(() => undefined);
+    await w.clock.advance(HOLD_AFTER_MS);
+    await flush(w.clock);
+    return w;
+  };
+
+  test("what a call holds: a foreground Bash command may go to the background, a plan's approval and a question the page cannot show are dialogs", () => {
+    expect(holdOf("Bash", { command: "pnpm dev\n--port 1" })).toEqual({
+      kind: "command",
+      tool: "Bash",
+      label: "pnpm dev",
+      background: true,
+    });
+    expect(
+      holdOf("Bash", { command: "pnpm dev", run_in_background: true }),
+    ).toBe(null);
+    expect(holdOf("mcp__devcorner__board", { section: "docs" })).toMatchObject({
+      kind: "command",
+      tool: "board",
+      background: false,
+    });
+    expect(holdOf("ExitPlanMode", { plan: "1. Fix it" })).toMatchObject({
+      kind: "dialog",
+      background: false,
+    });
+    expect(holdOf("AskUserQuestion", { questions: QUESTIONS })).toBe(null);
+    expect(
+      holdOf("AskUserQuestion", {
+        questions: [{ ...QUESTIONS[0], options: [] }],
+      }),
+    ).toMatchObject({ kind: "dialog" });
+  });
+
+  test("a foreground command of the main loop is told to the page once it held the turn a while, and over as it ends; one in the background and a subagent's are not", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PostToolUse", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "start the server", turnId: "t1" });
+    await flush(clock);
+    seen.chunks = [
+      { kind: "tool", index: 0, id: "toolu_1", name: "Bash" },
+      { kind: "input", index: 0, json: '{"command":"pnpm dev"}' },
+      { kind: "tool", index: 1, id: "toolu_2", name: "Bash" },
+      {
+        kind: "input",
+        index: 1,
+        json: '{"command":"pnpm build","run_in_background":true}',
+      },
+      { kind: "stop", stopReason: "tool_use", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    // Each call runs until the test ends, which stops it.
+    for (const call of [
+      { command: "pnpm dev", tool_use_id: "toolu_1" },
+      {
+        command: "pnpm build",
+        run_in_background: true,
+        tool_use_id: "toolu_2",
+      },
+      { command: "pnpm test", tool_use_id: "toolu_9", agentId: "a1" },
+    ])
+      $.tool.call({ tool: "Bash", ...call } as never).catch(() => undefined);
+    await clock.advance(HOLD_AFTER_MS - 1);
+    await flush(clock);
+    expect(holdsTold(seen)).toEqual([]);
+    await clock.advance(1);
+    await flush(clock);
+    expect(holdsTold(seen)).toEqual([
+      {
+        id: "toolu_1",
+        state: "held",
+        hold: {
+          kind: "command",
+          tool: "Bash",
+          label: "pnpm dev",
+          background: true,
+        },
+      },
+    ]);
+    await $.classic.PostToolUse({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm dev" },
+      tool_response: {},
+      tool_use_id: "toolu_1",
+    });
+    await flush(clock);
+    expect(holdsTold(seen).at(-1)).toEqual({ id: "toolu_1", state: "over" });
+  });
+
+  test("Run in background from the page ends the turn, keeps the page's words and types them after a note of what moved", async ($, on) => {
+    const { seen, clock } = await heldTurn($, on);
+    seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        background: "toolu_1",
+        words: [{ key: "w1", text: "and add a health check" }],
+      },
+    });
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(seen.aborted).toEqual(["t1"]);
+    // The aborted command's result names its background task.
+    await $.classic.PostToolUse({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm dev" },
+      tool_response: { backgroundTaskId: "bg7", backgroundedByTurnAbort: true },
+      tool_use_id: "toolu_1",
+    });
+    expect(seen.submitted).toEqual([]);
+    await $.turn.complete({
+      ...done("t1"),
+      answer: "Starting it.",
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      end: {
+        text: withMovedLine("Starting it.", ["pnpm dev"]),
+        outcome: "done",
+      },
+    });
+    // Unlike a stop in the window, the words are not held.
+    expect(seen.submitted).toEqual([
+      `${backgroundNote({ labels: ["pnpm dev"], tasks: ["bg7"] }, true)}\n\nand add a health check`,
+    ]);
+    expect(seen.asUser).toEqual([true]);
+    expect(seen.submitted[0]).toContain("background task bg7");
+    await $.turn.start({ text: seen.submitted[0]!, turnId: "t2" });
+    await flush(clock);
+    // devcorner keeps the person's words as they sent them.
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { text: "and add a health check", from: "page", took: ["w1"] },
+    });
+  });
+
+  test("with no words waiting, the note alone tells the model to carry on, kept on the page as the harness's line", async ($, on) => {
+    const { seen, clock } = await heldTurn($, on);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, background: "toolu_1" },
+    });
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(seen.aborted).toEqual(["t1"]);
+    await $.turn.complete({
+      ...done("t1"),
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    const note = backgroundNote({ labels: ["pnpm dev"], tasks: [] }, false);
+    expect(seen.submitted).toEqual([note]);
+    expect(seen.asUser).toEqual([false]);
+    // No task named: the note does not say the command still runs.
+    expect(note).toContain("check whether it runs");
+    await $.turn.start({ text: note, turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { text: BACKGROUND_LINE, from: "harness", took: [] },
+    });
+  });
+
+  test("the page's ask moves nothing that is not a held foreground command, nor a turn the page stopped", async ($, on) => {
+    const { seen, clock } = await heldTurn($, on);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, background: "toolu_other" },
+    });
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(seen.aborted).toEqual([]);
+    // A Stop and a move in one answer: the stop wins, once.
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, stop: true, background: "toolu_1" },
+    });
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(seen.aborted).toEqual(["t1"]);
+    await $.turn.complete({
+      ...done("t1"),
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ end: { outcome: "stopped" } });
+    expect(seen.submitted).toEqual([]);
   });
 
   test("an aborted turn closes a subagent's ask with it, since a foreground subagent ends with it, and begins no turn for it", async ($, on) => {
@@ -10533,7 +10990,9 @@ describe("a laptop chat's mirror", () => {
     const { clock, seen } = await mirrored($, on);
     await $.turn.start({ text: "deploy it", turnId: "t1" });
     await flush(clock);
-    void $.tool.call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" });
+    $.tool
+      .call({ tool: "Bash", command: "pnpm deploy", agentId: "a1" })
+      .catch(() => undefined);
     await flush(clock);
     const hook = $.classic.PermissionRequest({
       tool_name: "Bash",
@@ -10557,7 +11016,9 @@ describe("a laptop chat's mirror", () => {
     on("tool.call", () => new Promise(() => undefined) as never);
     on("classic.PermissionRequest", async () => ({}));
     const { clock, seen } = await mirrored($, on);
-    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    $.tool
+      .call({ tool: "Bash", command: "pnpm build", agentId: "a1" })
+      .catch(() => undefined);
     await flush(clock);
     const hook = $.classic.PermissionRequest({
       tool_name: "Bash",
@@ -10567,8 +11028,10 @@ describe("a laptop chat's mirror", () => {
     await flush(clock);
     const asking = turnsTold(seen).at(-1)!.turn;
     const [opened] = asksTold(seen);
+    // Nothing looks for an answer to the window's own ask: the turn's beat
+    // takes the Stop.
     seen.chatAnswer = { status: 200, body: { ok: true, stop: true } };
-    await clock.advance(ASK_LOOK_MS);
+    await clock.advance(MIRROR_BEAT_MS);
     await flush(clock);
     // The window's dialog still waits: the hook decides nothing.
     expect((await hook).decision).toBeUndefined();
@@ -10584,7 +11047,9 @@ describe("a laptop chat's mirror", () => {
     on("tool.call", () => new Promise(() => undefined) as never);
     on("classic.PermissionRequest", async () => ({}));
     const { clock, seen } = await mirrored($, on);
-    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    $.tool
+      .call({ tool: "Bash", command: "pnpm build", agentId: "a1" })
+      .catch(() => undefined);
     await flush(clock);
     void $.classic.PermissionRequest({
       tool_name: "Bash",
@@ -11062,5 +11527,305 @@ describe("a laptop launch: devcorner's page starts a session on this machine", (
     } as never);
     expect(stopped.text).toMatch(/the launcher is off/);
     expect(w.seen.runs.at(-1)?.argv).toEqual(["claude", "stop", LAUNCHER_NAME]);
+  });
+});
+
+describe("a revive: devcorner's page brings a chat's parked background session back as itself", () => {
+  // `claude agents --json` on Claude Code 2.1.327, as read on a laptop: a
+  // background session Claude Code parked (no status, no pid), the same
+  // session once `claude respawn` restarted it (a status, still no pid, its
+  // state unchanged), and an interactive window (a pid and a status).
+  const PARKED = {
+    id: "78b29eb4",
+    cwd: "/Users/me/Development/devcorner/devcorner",
+    kind: "background",
+    startedAt: 1794984033666,
+    sessionId: "78b29eb4-10d9-4d4a-9178-45c31bd37767",
+    name: "devcorner-8",
+    state: "blocked",
+  };
+  const RESPAWNED = {
+    ...PARKED,
+    cwd: "/Users/me/Development/devcorner/devcorner/.claude/worktrees/chat",
+    startedAt: 1794987633666,
+    status: "busy",
+  };
+  const INTERACTIVE = {
+    kind: "interactive",
+    sessionId: "a1b2c3d4-0000-4000-8000-000000000000",
+    pid: 4242,
+    status: "idle",
+    name: "x",
+  };
+
+  test("claude respawn runs with no shell and no flag, and reads as restarted or failed in its own words", () => {
+    expect(respawnArgv("78b29eb4")).toEqual([
+      "env",
+      "-u",
+      "CLAUDECODE",
+      "-u",
+      "CLAUDE_CODE_SESSION_ID",
+      "claude",
+      "respawn",
+      "78b29eb4",
+    ]);
+    expect(
+      respawnOutcome({ exitCode: 0, stdout: "", stderr: "" }, "78b29eb4"),
+    ).toEqual({ problem: null, words: null, bg: "78b29eb4" });
+    expect(
+      respawnOutcome(
+        { exitCode: 1, stdout: "", stderr: "No background session 78b29eb4" },
+        "78b29eb4",
+      ),
+    ).toEqual({
+      problem: "failed",
+      words: "No background session 78b29eb4",
+      bg: null,
+    });
+  });
+
+  test("claude agents --json tells a background session from an interactive window", () => {
+    const listed = JSON.stringify([INTERACTIVE, PARKED]);
+    expect(backgroundOf(listed, PARKED.sessionId)).toBe(true);
+    expect(backgroundOf(listed, INTERACTIVE.sessionId)).toBe(false);
+    expect(backgroundOf(listed, "c3")).toBeNull();
+    expect(backgroundOf("not json", PARKED.sessionId)).toBeNull();
+  });
+
+  test("a revive frame is taken and claude respawn runs, said back with the session it restarted", async ($, on) => {
+    const w = world(on, { hold: true });
+    w.seen.answer = {
+      ...base,
+      session: null,
+      conversation: {
+        id: "dc-h2",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 0,
+      },
+    };
+    await $.session.start(START);
+    await flush(w.clock);
+    await w.clock.advance(IDLE_MS);
+    await flush(w.clock);
+    // claude agents lists it parked: no status and no process.
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([INTERACTIVE, PARKED]),
+      stderr: "",
+    };
+    w.seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: "/work/shop",
+        name: "78b29eb4",
+        prompt: "",
+        respawn: "78b29eb4",
+      },
+    });
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "11" }));
+    await flush(w.clock);
+    expect(
+      w.seen.chats.filter((c) =>
+        String(c.hook_event_name).startsWith("Launch"),
+      ),
+    ).toEqual([
+      expect.objectContaining({ hook_event_name: "LaunchTake", launch: "11" }),
+      expect.objectContaining({
+        hook_event_name: "LaunchDone",
+        launch: "11",
+        problem: null,
+        bg: "78b29eb4",
+        folder: null,
+      }),
+    ]);
+    const ran = w.seen.runs.filter((r) => r.argv[0] === "env");
+    expect(ran.map((r) => r.argv)).toEqual([respawnArgv("78b29eb4")]);
+    expect(w.seen.toasts.at(-1)).toMatch(/revived background session 78b29eb4/);
+  });
+
+  test("claude agents says whether a session runs, found by the id it begins with: by its status, else its process", () => {
+    const life = (one: object) =>
+      listedLife(agentsListed(JSON.stringify([INTERACTIVE, one]))!, "78b29eb4");
+    // Parked: no status and no pid, its state "blocked".
+    expect(life(PARKED)).toBe("parked");
+    // Restarted: a status, still no pid, and the same state.
+    expect(life(RESPAWNED)).toBe("runs");
+    expect(life({ ...RESPAWNED, status: "idle" })).toBe("runs");
+    // As 2.1.325 and 2.1.326 listed one parked or stopped.
+    expect(life({ ...PARKED, status: "done" })).toBe("parked");
+    // A pid is for kill -0 to judge.
+    expect(life({ ...RESPAWNED, pid: 4242 })).toEqual({ pid: 4242 });
+    // Not listed: claude respawn says why in its own words.
+    expect(life({ ...PARKED, sessionId: "85f0618c-0000" })).toBe("parked");
+    expect(agentsListed("not json")).toBeNull();
+    expect(agentsListed(JSON.stringify({ agents: [{ name: "x" }] }))).toEqual([
+      { name: "x" },
+    ]);
+  });
+
+  test("a session whose process still runs is not restarted, and that is said back", async ($, on) => {
+    const w = world(on, { hold: true });
+    w.seen.answer = {
+      ...base,
+      session: null,
+      conversation: {
+        id: "dc-h2",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 0,
+      },
+    };
+    await $.session.start(START);
+    await flush(w.clock);
+    await w.clock.advance(IDLE_MS);
+    await flush(w.clock);
+    const revive = {
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: null,
+        name: "78b29eb4",
+        prompt: "",
+        respawn: "78b29eb4",
+      },
+    };
+    // Running again after a respawn: a status, and no pid to ask about.
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([INTERACTIVE, RESPAWNED]),
+      stderr: "",
+    };
+    w.seen.chatAnswers.push(revive);
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "12" }));
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      launch: "12",
+      problem: "failed",
+      words: expect.stringMatching(/still runs on this machine/),
+    });
+    expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
+    expect(w.seen.runs.some((r) => r.argv[0] === "kill")).toBe(false);
+    // One listed with its process, which lives.
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([{ ...RESPAWNED, pid: 4242 }]),
+      stderr: "",
+    };
+    w.seen.chatAnswers.push(revive);
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "14" }));
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      launch: "14",
+      problem: "failed",
+      words: expect.stringMatching(/still runs on this machine/),
+    });
+    expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
+    expect(w.seen.runs.some((r) => r.argv[0] === "kill")).toBe(true);
+    // A list it cannot read restarts nothing either.
+    w.seen.claudeRun = { exitCode: 0, stdout: "not json", stderr: "" };
+    w.seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: null,
+        name: "78b29eb4",
+        prompt: "",
+        respawn: "78b29eb4",
+      },
+    });
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "13" }));
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      launch: "13",
+      problem: "failed",
+      words: expect.stringMatching(/could not say whether/),
+    });
+    expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
+  });
+
+  test("/dc chat says whether its window is a background session, and offers /rename by the chat's id", async ($, on) => {
+    const w = world(on);
+    await $.session.start(START);
+    await flush(w.clock);
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        INTERACTIVE,
+        { ...RESPAWNED, sessionId: "conversation-1" },
+      ]),
+      stderr: "",
+    };
+    const opened = {
+      status: 200,
+      body: {
+        ok: true,
+        chat: { thread: "me-k3" },
+        started: true,
+        url: "http://dc.test/k/me-k3",
+        resume: "claude --resume conversation-1",
+        name: "Fix the cart · me-k3",
+      },
+    };
+    w.seen.chatAnswers.push(opened);
+    const said = await $.command.run({
+      command: "dc",
+      args: "chat Fix the cart",
+    } as never);
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "ChatOpen",
+      background: true,
+    });
+    expect(said.text).toContain(renameLine("Fix the cart · me-k3"));
+    // A session a launch started was named as it started: nothing to rename.
+    w.seen.chatAnswers.push(opened);
+    const launched = await $.command.run({
+      command: "dc",
+      args: "chat --launch 7",
+    } as never);
+    expect(launched.text).not.toContain("/rename");
+  });
+
+  test("a launch with no prompt and no session to respawn starts nothing", async ($, on) => {
+    const w = world(on, { hold: true });
+    w.seen.answer = {
+      ...base,
+      session: null,
+      conversation: {
+        id: "dc-h2",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 0,
+      },
+    };
+    await $.session.start(START);
+    await flush(w.clock);
+    await w.clock.advance(IDLE_MS);
+    await flush(w.clock);
+    // A revive a devcorner that cannot revive answered: no respawn.
+    w.seen.chatAnswers.push({
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: null,
+        name: "78b29eb4",
+        prompt: "",
+      },
+    });
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "15" }));
+    await flush(w.clock);
+    expect(w.seen.runs.some((r) => r.argv.includes("--bg"))).toBe(false);
   });
 });

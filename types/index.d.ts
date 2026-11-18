@@ -458,7 +458,7 @@ declare module "claude-code" {
        */
       signIn: SignIn | null;
       /**
-       * The laptop chat this window mirrors, which the row names, and whether
+       * The window chat this window mirrors, which the row names, and whether
        * its last post or held request reached devcorner; null while
        * mirroring is off.
        */
@@ -467,7 +467,7 @@ declare module "claude-code" {
   }
 }
 
-/** The laptop chat a window mirrors, as the row says it. */
+/** The window chat a window mirrors, as the row says it. */
 export interface LaptopLine {
   /** The chat, as its person is shown it (me-k3). */
   thread: string;

@@ -803,9 +803,9 @@ export function rowSegments(
   return [head, ...id, ...(cut ? [piece(` ${cut}`)] : []), ...waiting];
 }
 
-/** What the row says of the laptop chat this window mirrors: its id, and whether it reaches devcorner now. */
+/** What the row says of the window chat this window mirrors: its id, and whether it reaches devcorner now. */
 export function laptopLineText(chat: LaptopLine): string {
-  return `laptop chat ${chat.thread} ${chat.reconnecting ? "reconnecting…" : "live"}`;
+  return `window chat ${chat.thread} ${chat.reconnecting ? "reconnecting…" : "live"}`;
 }
 
 /**
@@ -1788,10 +1788,10 @@ export function readHeld(text: string): Held {
     // The session the conversation works as changed (dc-t588): a Status says
     // the one it kept from its start.
     if (typeof o.claim === "string") return { kind: "claim" };
-    // Words from devcorner's page wait for this window's laptop chat: ids
+    // Words from devcorner's page wait for this window's window chat: ids
     // only, fetched with ChatParts.
     if (typeof o.chat === "string") return { kind: "chat", chat: o.chat };
-    // A laptop chat to start on this machine, asked from devcorner's page:
+    // A window chat to start on this machine, asked from devcorner's page:
     // the launch's number alone, taken with LaunchTake.
     if (typeof o.launch === "string")
       return { kind: "launch", launch: o.launch };
@@ -1923,7 +1923,7 @@ async function branchIn($: Engine, cwd: string): Promise<string | undefined> {
 }
 
 /**
- * Where a laptop chat's window leaves its folder in git, sent with its
+ * Where a window chat's window leaves its folder in git, sent with its
  * opening and with each turn's end, never as it leaves, since a closed lid
  * sends nothing: the commit it is on, by its short id and subject, and its
  * files not committed, how many and the first `MAX_GIT_PATHS` of them.
@@ -1976,7 +1976,7 @@ async function gitIn(
 }
 
 /**
- * Where this window's folder stands in git now, as a laptop chat's opening
+ * Where this window's folder stands in git now, as a window chat's opening
  * and turn's end say it (`gitIn`); undefined when it cannot say now, which
  * a post leaves out.
  */
@@ -1985,7 +1985,7 @@ async function windowGit($: Engine): Promise<WindowGit | null | undefined> {
   return cwd ? gitIn($, cwd).catch(() => undefined) : undefined;
 }
 
-/** One of this window's own commands as a laptop chat's page is told it: its name, its line and where it comes from, nothing else. */
+/** One of this window's own commands as a window chat's page is told it: its name, its line and where it comes from, nothing else. */
 interface WindowCommand {
   name: string;
   description: string;
@@ -1993,7 +1993,7 @@ interface WindowCommand {
 }
 
 /**
- * This window's own commands, as a laptop chat's `/` list offers them: its
+ * This window's own commands, as a window chat's `/` list offers them: its
  * skills, plugin commands and MCP prompts (`$.command.list()`), never
  * Claude Code's built-ins, which devcorner offers from its own list
  * (`PAGE_BUILTINS`); undefined when they cannot be read now, which a post
@@ -2216,15 +2216,29 @@ export const handedText = (token: string, base: string) =>
   `${token}\n${base}\n`;
 
 /**
- * Takes the token for the devcorner at `base` back from the command hooks.
- * A file another devcorner's conversation handed them is its own, and stays.
+ * Takes `token` for the devcorner at `base` back from the command hooks. The
+ * file is shared by every plugin store of the machine, so it goes only while
+ * it holds that token: one another store wrote since, or another devcorner's
+ * conversation handed them, is its own, and stays.
  */
-async function takeBack($: Engine, base: string): Promise<void> {
+async function takeBack($: Engine, base: string, token: string): Promise<void> {
   const file = await tokenFileOf($);
-  if (!file || !(await $.fs.exists(file).catch(() => false))) return;
-  const there = String(await $.fs.read(file).catch(() => ""));
-  if (there.split("\n")[1] !== base) return;
+  if (!file) return;
+  const [held, forBase] = await handedIn($, file);
+  if (held !== token || forBase !== base) return;
   await $.process.run(["rm", "-f", file], { timeoutMs: 5000 });
+}
+
+/** The hooks' file's token and the devcorner it is for, both empty with no file. */
+async function handedIn(
+  $: Engine,
+  file: string,
+): Promise<[token: string, base: string]> {
+  if (!(await $.fs.exists(file).catch(() => false))) return ["", ""];
+  const [token = "", base = ""] = String(
+    await $.fs.read(file).catch(() => ""),
+  ).split("\n");
+  return [token, base];
 }
 
 /** Keeps a token devcorner gave this machine: in the store, and handed to the hooks. */
@@ -2243,30 +2257,30 @@ async function keepToken($: Engine, token: string): Promise<void> {
  */
 async function forgetToken($: Engine, only?: string): Promise<void> {
   const base = await baseOf($);
-  if (only !== undefined && (await keptToken($, base)) !== only) return;
+  const kept = await keptToken($, base);
+  if (only !== undefined && kept !== only) return;
   await $.store.delete(tokenKey(base));
-  await takeBack($, base);
+  if (kept) await takeBack($, base, kept);
 }
 
 /**
  * At a session's start the hooks' copy is made what the store says for this
- * devcorner: written when the store holds a token, removed when it holds
- * none, so a sign-out in another conversation, or a store cleared by hand,
- * leaves no copy behind. A copy for another devcorner is left alone.
+ * devcorner when the store holds a token. A store that holds none is no
+ * evidence the file is stale: the file is shared by every conversation of the
+ * machine, and a window with a store of its own (an inline plugin) is empty
+ * while the installed plugin's store holds the token. So an empty store
+ * leaves the file alone; only a sign-out (`forgetToken`) takes it back.
  */
 async function syncHandOver($: Engine): Promise<void> {
   const file = await tokenFileOf($);
   if (!file) return;
   const base = await baseOf($);
   const kept = await keptToken($, base);
+  if (!kept) return;
   const there = (await $.fs.exists(file))
     ? String(await $.fs.read(file))
     : null;
-  if (kept) {
-    if (there !== handedText(kept, base)) await handOver($, kept, base);
-  } else if (there !== null) {
-    await takeBack($, base);
-  }
+  if (there !== handedText(kept, base)) await handOver($, kept, base);
 }
 
 /**
@@ -2279,6 +2293,29 @@ async function syncHandOver($: Engine): Promise<void> {
  */
 export const DELIVERY_OFF =
   "devcorner: delivery is off in this window: this machine has no hook token, so devcorner's messages, dispatches and wakes never reach this conversation, though the agent's devcorner tools still work. /dc login signs this machine in, or ask Claude to sign it in, or set DEVCORNER_TOKEN to a hook token from devcorner's connections page.";
+
+/**
+ * What the plugin says, where it says `DELIVERY_OFF`, when its store holds no
+ * token but the hooks' file holds one for this devcorner: another plugin
+ * store of the machine handed it over, as the installed plugin does beside a
+ * window started with --plugin-dir. The command hooks still send with that
+ * token, so only this window's line above the prompt and its wake are off.
+ */
+export const WINDOW_DELIVERY_OFF =
+  "devcorner: delivery is off for this window alone: its plugin holds no token of its own (a window started with --plugin-dir keeps a store of its own), so the line above the prompt and the wake are off here. This machine keeps its hook token, and the hooks still send with it, so devcorner's messages still reach this conversation and every other. /dc login signs this window's plugin in too.";
+
+/**
+ * The line that says delivery is off with no token of the plugin's own:
+ * `WINDOW_DELIVERY_OFF` while the hooks' file holds a hook token for the
+ * devcorner at `base`, else `DELIVERY_OFF`.
+ */
+async function deliveryOff($: Engine, base: string): Promise<string> {
+  const file = await tokenFileOf($);
+  const [token, forBase] = file ? await handedIn($, file) : ["", ""];
+  return forBase === base && hookTokenShape.test(token)
+    ? WINDOW_DELIVERY_OFF
+    : DELIVERY_OFF;
+}
 
 /** What /dc says in a cloud session, which is never signed in (`NO_SIGN_IN.cloud`), so has no hooks' delivery. */
 export const CLOUD_DELIVERY =
@@ -2314,8 +2351,8 @@ async function offerDelivery($: Engine): Promise<void> {
     if ((await noSignIn($)) !== null) return;
     // A plain -p run draws nowhere, and has no person to approve a code.
     if (!(await draws($))) return;
-    $.ui.log(DELIVERY_OFF);
     const base = await baseOf($);
+    $.ui.log(await deliveryOff($, base));
     if ((await $.store.get(offeredKey(base))) !== undefined) return;
     const got = await showCode($);
     // A code devcorner could not give is offered again at the next start.
@@ -3982,7 +4019,9 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     const held = await tokenOf($);
     if (!held) {
       return {
-        ...failed((await inCloud($)) ? CLOUD_DELIVERY : DELIVERY_OFF),
+        ...failed(
+          (await inCloud($)) ? CLOUD_DELIVERY : await deliveryOff($, base),
+        ),
         signedOut: "none",
       };
     }
@@ -4142,9 +4181,9 @@ let failures = 0;
 // turn start, the end of the session or a newer hold makes the old answer
 // count for nothing. Any failure hands the conversation to the Status poll.
 let epoch = 0;
-/** Quick answers in a row that held nothing: empty, or a laptop chat's frame. */
+/** Quick answers in a row that held nothing: empty, or a window chat's frame. */
 let quick = 0;
-/** Held requests in a row that failed or answered at once, while mirroring a laptop chat. */
+/** Held requests in a row that failed or answered at once, while mirroring a window chat. */
 let holdFailures = 0;
 /** The earliest time a held request may be tried again. */
 let holdAfter = 0;
@@ -4205,10 +4244,12 @@ async function waitOnce($: Engine): Promise<Held> {
         hook_event_name: "Wait",
         session_id: await $.session.id(),
         timeout: HOLD_MS,
-        // This plugin can start Claude Code sessions for laptop chats
-        // (`takeLaunch`): devcorner keeps this window as a launcher of the
-        // machine its token is.
+        // This plugin can start Claude Code sessions for window chats
+        // (`takeLaunch`), and revive a chat's parked background session
+        // (`claude respawn`): devcorner keeps this window as a launcher of
+        // the machine its token is.
         launcher: true,
+        revive: true,
         ...(from ? { cursor: from } : {}),
         // The newest woken for in each store (dc-t312): the held request
         // holds on two, each of which reads only its own ids.
@@ -4275,7 +4316,7 @@ async function hold($: Engine): Promise<void> {
         continue;
       }
       if (held.kind === "launch") {
-        // A laptop chat to start on this machine: taken by the first window
+        // A window chat to start on this machine: taken by the first window
         // that asks, and started by this script, never the model. Held again
         // once it is done.
         quick = 0;
@@ -4285,7 +4326,7 @@ async function hold($: Engine): Promise<void> {
       }
       if (held.kind === "chat" && quick < QUICK_MAX) {
         // The person's words from devcorner's page wait for this window's
-        // laptop chat: fetched and typed in as theirs while the window is
+        // window chat: fetched and typed in as theirs while the window is
         // idle, the look's post ending devcorner's frames for them. Held
         // again at once.
         await mirrorPost($, { look: true });
@@ -4320,7 +4361,7 @@ async function hold($: Engine): Promise<void> {
         return;
       }
       // Failed, or answering at once: the poll has it for a while. A window
-      // that mirrors a laptop chat, which hears its page's words only on a
+      // that mirrors a window chat, which hears its page's words only on a
       // held request, holds again at the poll's next ask after the first such
       // hold, and later after each one more in a row (`backoff`), never past
       // WAIT_RETRY_MS: the poll's good Status resets `failures`, not these.
@@ -5146,9 +5187,9 @@ function deliver<R extends { deny?: unknown; context?: readonly string[] }>(
   };
 }
 
-// ---- Laptop chats ----
+// ---- Window chats ----
 //
-// `/dc chat` opens this window as a laptop chat in devcorner: each turn's
+// `/dc chat` opens this window as a window chat in devcorner: each turn's
 // words, live parts and reply are posted with the machine's hook token
 // (ChatParts), and the person's own words typed on devcorner's page come back
 // in the answer to a post, or on the held request (`{chat}`), to be typed in
@@ -5159,15 +5200,18 @@ function deliver<R extends { deny?: unknown; context?: readonly string[] }>(
 // project chat's rule. Nothing is mirrored until `/dc chat` in this window.
 
 /**
- * What a window that mirrors a laptop chat is told of where its replies are
+ * What a window that mirrors a window chat is told of where its replies are
  * read: as a row of its conversation wherever its mirroring begins from none
  * (`/dc chat`, `/dc continue`, a rejoin after a restart or a resume), and
  * after each compaction while it mirrors, as the SessionStart hook's context.
  * Only what a laptop window needs on top of the chat rules devcorner gives
- * every chat.
+ * every chat, and when to title the chat, as a project chat's turn frame
+ * tells its coordinator (`titleFrameLines`): the window is told no title
+ * per turn, so devcorner's refusal of a title its person gave is what it
+ * reads to leave theirs.
  */
 export const LAPTOP_CHAT_INSTRUCTION =
-  "Your replies are read in a devcorner chat, on a page or a phone, and the person may write to you from there. Write plain chat prose: short paragraphs and simple lists, no headings, no tables. Do work through devcorner's tools so it shows in the chat's tracking, and ask what is the person's to decide as a question rather than a paragraph.";
+  "Your replies are read in a devcorner chat, on a page or a phone, and the person may write to you from there. Write plain chat prose: short paragraphs and simple lists, no headings, no tables. Do work through devcorner's tools so it shows in the chat's tracking, and ask what is the person's to decide as a question rather than a paragraph. Keep the chat's title current: once its topic is clear, usually in your first answer, give it a title that names the topic in a few plain words with devcorner's run(action: \"title\", title), and set it again only when the topic has clearly moved on, never to reword it. Use rename only when the person asks you to name the chat, since it makes the name theirs; once devcorner says the person named it, leave its title as it is.";
 
 /** How long a mirrored turn's parts gather before they go: the page runs about this far behind the window, plus the post. */
 export const MIRROR_BATCH_MS = 250;
@@ -5177,13 +5221,13 @@ export const MIRROR_BEAT_MS = 30_000;
 export const MAX_EXCHANGES = 100;
 /** The most a tool's label holds: the tool's own first argument, cut. */
 const MAX_LABEL = 120;
-/** The most cells a tool call's line in a laptop chat gives its argument, cut at a word. */
+/** The most cells a tool call's line in a window chat gives its argument, cut at a word. */
 const LINE_LABEL = 60;
 /** The longest argument of a devcorner call sent for its line: longer ones (a body, a summary) name nothing it acts on. */
 const LINE_ARG = 200;
 
 /**
- * What a tool call carries for its line in a laptop chat: a short label of
+ * What a tool call carries for its line in a window chat: a short label of
  * its argument, or, for one of devcorner's own tools, its short arguments,
  * which go to devcorner anyway as the call itself, so devcorner names what
  * it acts on by the project chat's rule (`namedIn`, src/mcp/chat-calls.ts).
@@ -5212,7 +5256,27 @@ export type MirrorPart =
       input: MirrorToolInput;
     }
   | { type: "data-ask"; data: AskState }
+  | { type: "data-hold"; data: HoldState }
   | { type: "data-tasks"; data: { tasks: WindowTask[] } };
+
+/**
+ * What holds this window's turn in place while the page's words wait: a tool
+ * call of the main loop that runs on (`command`), by its name and label, and
+ * whether the page may move it to the background (a foreground Bash
+ * command); or a dialog only the window answers (`dialog`), as a plan's
+ * approval.
+ */
+export interface Hold {
+  kind: "command" | "dialog";
+  tool: string;
+  label: string;
+  background: boolean;
+}
+
+/** Where one hold of this window's stands, as devcorner's page is told (`data-hold`): holding, or over. */
+export type HoldState =
+  | { id: string; state: "held"; hold: Hold }
+  | { id: string; state: "over" };
 
 /** A task of this window's own list, Claude Code's checklist, as devcorner's page draws it: its words and where it stands. */
 export interface WindowTask {
@@ -5228,9 +5292,9 @@ export interface AskQuestion {
   multi: boolean;
 }
 
-/** What this window waits on its person for: a tool by its name and label (never its input whole), or the model's questions. */
+/** What this window waits on its person for: a tool by its name and label (never its input whole), and whether only the window can answer it (a subagent's, since a background agent's dialog waits on the hook), or the model's questions. */
 export type Ask =
-  | { kind: "permission"; tool: string; label: string }
+  | { kind: "permission"; tool: string; label: string; windowOnly: boolean }
   | { kind: "question"; questions: AskQuestion[] };
 
 /** Where one of this window's asks stands, as devcorner's page is told (`data-ask`). */
@@ -5248,7 +5312,7 @@ interface MirrorStep {
   calls: number;
 }
 
-/** This window's laptop chat while it mirrors one, and its turn under way. */
+/** This window's window chat while it mirrors one, and its turn under way. */
 interface Mirror {
   /** The chat, as the person is shown it (me-k3). */
   thread: string;
@@ -5279,6 +5343,8 @@ interface Mirror {
   } | null;
   /** Parts gathered since the last post. */
   parts: MirrorPart[];
+  /** The keys of the page's words joined to the turn (`joinPageWords`) since the last post, which the next one tells devcorner. */
+  join: string[];
   /** The turn's tool calls, for its kept reply's lines. */
   tools: MirrorTool[];
   /** The turn's steps that made tool calls, each its words and how many calls, as the page drew them live (`keepStep`). */
@@ -5343,6 +5409,8 @@ interface PageWords {
   text: string;
   files: PageFile[];
   command: PageCommand | null;
+  /** When the person said them, by devcorner's clock (ms); null from an older devcorner. */
+  at: number | null;
 }
 
 /** The page's words a post answered with, waiting for the window to be idle. */
@@ -5356,7 +5424,7 @@ let fetchingPage = false;
  * a turn in the window. Null when nothing is held.
  */
 let pageHeld: Set<string> | null = null;
-/** The turn the page's Stop aborted, whose end holds nothing: devcorner dropped the words that waited then, so any the window holds now came after the Stop. */
+/** The turn the page's Stop aborted, whose end holds nothing here: devcorner holds the words that waited then until the person says more or sends them now, so any the window is handed came after the Stop or were sent now. */
 let stoppedFromPage: string | null = null;
 /** The turn stopped in the window whose end is not answered yet, by the key its end is posted under (`Mirror.key`): the words its answer names are those that waited at the stop, and are held. */
 let stoppedInWindow: string | null = null;
@@ -5379,7 +5447,7 @@ let failureArrived: (() => void) | null = null;
  */
 let windowEffort: string | null = null;
 
-/** What a laptop chat's head says the window runs on (`runsOn` on ChatOpen and ChatParts). */
+/** What a window chat's head says the window runs on (`runsOn` on ChatOpen and ChatParts). */
 interface WindowModel {
   model: string | null;
   effort: string | null;
@@ -5441,11 +5509,11 @@ export interface PromptSeen {
   command: { name: string; args: string } | null;
   meta: boolean;
   at: number;
-  /** The images pasted with it, read while this window mirrors a laptop chat (`pastedImages`); none otherwise. */
+  /** The images pasted with it, read while this window mirrors a window chat (`pastedImages`); none otherwise. */
   images: WindowImage[];
 }
 
-/** An image pasted with a prompt, as a laptop chat's turn sends it (`begin.images`): its name, type and bytes in base64. */
+/** An image pasted with a prompt, as a window chat's turn sends it (`begin.images`): its name, type and bytes in base64. */
 export interface WindowImage {
   name: string;
   type: string;
@@ -5502,7 +5570,7 @@ export async function pastedImages(
 
 /**
  * Whether a prompt is the person's own words typed in this window, the one
- * kind whose images a laptop chat's turn sends: not a slash command, not a
+ * kind whose images a window chat's turn sends: not a slash command, not a
  * prompt the person did not see typed, and not one Claude Code or a plugin
  * made, the page's words this module types in among them (`originLine`).
  */
@@ -5604,7 +5672,7 @@ export function withinPost(images: readonly WindowImage[]): WindowImage[] {
   return kept;
 }
 
-/** What a turn of the window began with, as its laptop chat keeps it: the person's words, or a short line for a prompt the harness made. */
+/** What a turn of the window began with, as its window chat keeps it: the person's words, or a short line for a prompt the harness made. */
 export interface TurnWords {
   from: "window" | "harness";
   text: string;
@@ -5737,7 +5805,7 @@ function slashLine(name: string, args: string): string {
 }
 
 /**
- * What a turn of the window began with, for its laptop chat: the person's
+ * What a turn of the window began with, for its window chat: the person's
  * own words, or, for a prompt the harness or another plugin made, a short
  * line of what came, never its paths, ids or output. Read from where the
  * engine says the prompt came from (`seen`, its `prompt.submit`): a slash
@@ -5830,9 +5898,12 @@ export function shortToolNames(text: string): string {
 
 /** A tool call's label: the first line of its first string argument, a ToolSearch selection by short names, cut; "" when its arguments hold none or do not parse. */
 function toolLabel(json: string): string {
-  const first = Object.values(toolArgs(json) ?? {}).find(
-    (v) => typeof v === "string",
-  );
+  return argsLabel(toolArgs(json) ?? {});
+}
+
+/** `toolLabel` of arguments already read. */
+function argsLabel(args: Record<string, unknown>): string {
+  const first = Object.values(args).find((v) => typeof v === "string");
   return typeof first === "string"
     ? shortToolNames(first.split("\n")[0]!).slice(0, MAX_LABEL)
     : "";
@@ -5851,7 +5922,7 @@ function toolArgs(json: string): Record<string, unknown> | null {
 }
 
 /**
- * A tool call as its line in a laptop chat goes: its short name, with no
+ * A tool call as its line in a window chat goes: its short name, with no
  * MCP prefix (`mcp__github__get_me` is `get_me`), and, for one of
  * devcorner's own tools, its short arguments, from which devcorner names
  * what it acts on by the project chat's rule; for any other, whose
@@ -5875,7 +5946,7 @@ export function toolCall(
 }
 
 /**
- * A tool call's label as its line in a laptop chat says it, cut at a word
+ * A tool call's label as its line in a window chat says it, cut at a word
  * to one short line: the first line of its first string argument, a path
  * (an argument named `path` or `..._path`, as `file_path`) by its file's
  * name alone, and a command by its first words, a leading `cd <dir> &&`
@@ -6143,7 +6214,7 @@ const MIRROR_TRIES = 3;
 /** The most parts one post carries, as devcorner keeps no more of one (`MAX_POST_PARTS`, src/mcp/laptop-chat.ts): more go in the posts after it. */
 export const MIRROR_POST_PARTS = 400;
 
-/** One post of a laptop chat, as it is sent: read from the mirror before any wait, so a turn that begins meanwhile never takes another's parts. */
+/** One post of a window chat, as it is sent: read from the mirror before any wait, so a turn that begins meanwhile never takes another's parts. */
 interface MirrorPayload {
   thread: string;
   /** The turn devcorner keeps it under: a part's key (`Mirror.key`). */
@@ -6152,6 +6223,8 @@ interface MirrorPayload {
   of: string | null;
   begin: Mirror["begin"];
   parts: MirrorPart[];
+  /** The keys of the page's words joined to the turn since the post before (`Mirror.join`); empty for none. */
+  join: string[];
   /**
    * The turn's number of its parts (1, 2, 3...), the last one given when it
    * carries none: devcorner keeps parts once by it, so a post sent again
@@ -6171,14 +6244,19 @@ interface MirrorPayload {
 
 /** Whether a post carries what devcorner must take: a beginning, parts or an end. A look or a beat carries none, and a failed one is not sent again. */
 const carries = (payload: MirrorPayload) =>
-  payload.begin !== null || payload.parts.length > 0 || payload.end !== null;
+  payload.begin !== null ||
+  payload.parts.length > 0 ||
+  payload.join.length > 0 ||
+  payload.end !== null;
 
 /**
- * One post of this window's laptop chat (ChatParts): the turn's beginning,
+ * One post of this window's window chat (ChatParts): the turn's beginning,
  * the parts gathered and its end, or with `look` a look at what waits; `turn`
  * names the turn when it is not the one under way (its end, posted as the
- * next may begin). Its answer is acted on: a stop aborts the turn, the
- * person's words are typed in once the window is idle, and a chat this
+ * next may begin). Its answer is acted on: a stop aborts the turn, a move of
+ * a held command to the background aborts it keeping the page's words
+ * (`backgroundFromPage`), the person's words are typed in once the window is
+ * idle, and a chat this
  * window no longer holds (moved, turned off, ended) stops the mirror, said
  * on a toast. A post that carries something and fails is kept, as it was,
  * and goes before anything after it, with the next post that has something
@@ -6213,6 +6291,7 @@ async function mirrorPost(
       of: turn === null ? null : m.turn,
       begin: turn === null ? null : m.begin,
       parts,
+      join: turn === null ? [] : m.join.splice(0),
       post: turn === null ? 0 : m.posted,
       // An end goes with the turn's last parts.
       end:
@@ -6243,7 +6322,11 @@ async function mirrorPost(
   const sent = m.sending.then(async () => {
     // Behind posts that failed, a post with nothing new (a look, a beat)
     // waits for their retry.
-    const fresh = ending.length > 0 || m.begin !== null || m.parts.length > 0;
+    const fresh =
+      ending.length > 0 ||
+      m.begin !== null ||
+      m.parts.length > 0 ||
+      m.join.length > 0;
     if (!what.retry && !fresh && m.unsent.length > 0) return;
     if (!(await sendUnsent($, m, what.retry === true))) return;
     if (ending.length > 0) return;
@@ -6290,7 +6373,11 @@ async function sendUnsent(
       ++payload.tries >= MIRROR_TRIES
     )
       m.unsent.shift();
-    const waits = m.unsent.length > 0 || m.begin !== null || m.parts.length > 0;
+    const waits =
+      m.unsent.length > 0 ||
+      m.begin !== null ||
+      m.parts.length > 0 ||
+      m.join.length > 0;
     if (waits && mirror === m)
       m.retry ??= $.clock.after(MIRROR_RETRY_MS, () => {
         m.retry = undefined;
@@ -6375,6 +6462,7 @@ async function postMirror(
       thread: payload.thread,
       turn: payload.turn,
       ...(payload.begin ? { begin: payload.begin } : {}),
+      ...(payload.join.length > 0 ? { join: payload.join } : {}),
       parts: payload.parts,
       post: payload.post,
       ...(payload.end ? { end: payload.end } : {}),
@@ -6382,6 +6470,7 @@ async function postMirror(
     });
     const body = JSON.parse(res.text) as {
       stop?: unknown;
+      background?: unknown;
       words?: unknown;
       answers?: unknown;
       code?: unknown;
@@ -6424,11 +6513,24 @@ async function postMirror(
         await $.turn.abort({ turnId: payload.of }).catch(() => undefined);
       }
     }
+    // The page's ask to move a held command to the background, by its hold.
+    if (typeof body.background === "string" && payload.of !== null)
+      await backgroundFromPage($, payload.of, body.background);
     if (Array.isArray(body.answers)) takeAnswers(body.answers);
     if (Array.isArray(body.words)) {
-      // One the window took alone is never taken again, though an answer
-      // sent before devcorner heard of it names it.
-      pageWords = pageWordsOf(body.words).filter((w) => !takenAlone.has(w.key));
+      // One the window took alone, or joined to its turn, is never taken
+      // again, though an answer sent before devcorner heard of it names it.
+      pageWords = pageWordsOf(body.words).filter(
+        (w) => !takenAlone.has(w.key) && !joinedFromPage.has(w.key),
+      );
+      // devcorner answers a turn's end once it kept the reply: the words it
+      // names were said before the person could read it whole.
+      if (payload.end !== null && payload.of !== null)
+        markDuring(
+          pageWords.map((w) => w.key),
+          payload.end.text,
+        );
+      readyPageFiles($);
       // The answer to the end of a turn stopped in the window names the
       // words that waited at the stop, some perhaps never told to the window
       // yet, so no answer before it lets any go; words the person said since
@@ -6487,15 +6589,17 @@ function mirrorChunk($: Engine, m: Mirror, chunk: TurnStepChunk): void {
   if (parts.length === 0) return;
   for (const part of parts) {
     keepStep(m, part);
-    if (part.type === "tool-input-available")
+    if (part.type === "tool-input-available") {
       m.tools.push({ name: part.toolName, input: part.input });
+      mainCalls.add(part.toolCallId);
+    }
   }
   m.parts.push(...parts);
   mirrorSoon($);
 }
 
 /**
- * Begins a part of the window's turn under way in its laptop chat: devcorner
+ * Begins a part of the window's turn under way in its window chat: devcorner
  * keeps it under `key` as a turn of its own, beginning with `begin`, and
  * what the turn gathers from here (its posts' numbers, tool lines, steps and
  * words) is this part's.
@@ -6693,8 +6797,18 @@ function leaveMirror(): void {
   mirror?.beat?.cancel();
   mirror?.retry?.cancel();
   dropAsks();
+  for (const held of holds.values()) held.timer?.cancel();
+  holds.clear();
+  mainCalls.clear();
+  backgroundedFromPage = null;
+  movedFromPage = null;
+  carryingOn = false;
   pageWords = [];
   takenAlone.clear();
+  joinedFromPage.clear();
+  pageTextReady.clear();
+  replyDuring.clear();
+  waitedAtStart = new Set();
   pageHeld = null;
   stoppedFromPage = null;
   stoppedInWindow = null;
@@ -6708,10 +6822,10 @@ function stopMirror($: Engine, why: string | null): void {
   typedFromPage = null;
   void update($, laptop, () => null).catch(() => undefined);
   if (why)
-    $.ui.toast(`dc: this window no longer mirrors its laptop chat. ${why}`);
+    $.ui.toast(`dc: this window no longer mirrors its window chat. ${why}`);
 }
 
-// ---- Asks in a laptop chat ----
+// ---- Asks in a window chat ----
 //
 // While its turn runs, the window may stop on its person: a tool's
 // permission dialog, or the model's AskUserQuestion. A mirrored turn shows
@@ -6720,6 +6834,15 @@ function stopMirror($: Engine, why: string | null): void {
 // PermissionRequest hook beside its dialog and takes the first answer of the
 // two, so the page's answer to a permission is the hook's; a tool.call hook
 // on AskUserQuestion that answers while its dialog is open closes the dialog.
+// A background agent's permission is the exception: Claude Code draws its
+// dialog only once every PermissionRequest hook has returned, so a hook that
+// waited on the page kept the window blank for as long as it waited (2 min
+// 42 s on 2.1.326). Such an ask goes to the page as one answered in the
+// window alone (`windowOnly`), and the hook returns at once. Every
+// subagent's ask is: nothing the plugin hears says for sure whether an
+// agent runs in the background (its definition may force it, Ctrl+B may
+// move it there mid-run), and a dialog held for the page is the window left
+// blank, while one the page cannot answer is only the page's loss.
 // No hook is told when the person answered here, so a permission ask closes
 // once its tool call ends, or at its agent's next step when no call was found
 // for it, and the main loop's asks still open close as its turn ends.
@@ -6906,8 +7029,27 @@ function askWhat(ask: Ask): string {
  * `hold`: devcorner gives it to every hold until a post is heard, so posts
  * that never go would otherwise hold again and again at once.
  */
-async function holdForPage($: Engine, id: string): Promise<void> {
-  const waiting = () => asks.get(id)?.taken === false;
+function holdForPage($: Engine, id: string): Promise<void> {
+  return holdWhile(
+    $,
+    () => asks.get(id)?.taken === false,
+    () => {
+      askLookMs = ASK_LOOK_MS;
+      lookForAnswers($);
+    },
+  );
+}
+
+/**
+ * Holds devcorner's held request while `waiting` says something waits on the
+ * page, posting a look each time it ends, as `holdForPage` says; `fallback`
+ * takes the looking over once holds fail or answer at once.
+ */
+async function holdWhile(
+  $: Engine,
+  waiting: () => boolean,
+  fallback: () => void,
+): Promise<void> {
   let quickly = 0;
   while (waiting()) {
     const began = await $.clock.now();
@@ -6922,9 +7064,7 @@ async function holdForPage($: Engine, id: string): Promise<void> {
       held.kind === "updating" ||
       quickly >= QUICK_MAX
     ) {
-      if (!waiting()) return;
-      askLookMs = ASK_LOOK_MS;
-      lookForAnswers($);
+      if (waiting()) fallback();
       return;
     }
   }
@@ -6995,6 +7135,10 @@ function dropAsks(): void {
   callsUnderWay.length = 0;
 }
 
+/** Whether only the window answers an ask: a subagent's permission, which no hook waits on. */
+const byWindowAlone = (ask: Ask): boolean =>
+  ask.kind === "permission" && ask.windowOnly;
+
 /** The page's answers a post's answer carries, each handed to its ask's wait once. */
 function takeAnswers(answers: unknown[]): void {
   for (const raw of answers) {
@@ -7002,7 +7146,15 @@ function takeAnswers(answers: unknown[]): void {
     const { id, answer } = raw as { id?: unknown; answer?: unknown };
     const pending = typeof id === "string" ? asks.get(id) : undefined;
     const read = pageAnswer(answer);
-    if (pending === undefined || pending.taken || read === null) continue;
+    // A devcorner on the previous code may still take one for an ask that
+    // is the window's alone, which nothing here waits for.
+    if (
+      pending === undefined ||
+      pending.taken ||
+      read === null ||
+      byWindowAlone(pending.ask)
+    )
+      continue;
     pending.taken = true;
     pending.done(read);
   }
@@ -7030,9 +7182,256 @@ function lookForAnswers($: Engine): void {
     askLook = undefined;
     askLookMs = Math.min(ASK_LOOK_MAX_MS, Math.round(askLookMs * 1.5));
     if (mirror === null || mirror.turn === null) return;
-    if (![...asks.values()].some((one) => !one.taken)) return;
+    if (
+      ![...asks.values()].some((one) => !one.taken && !byWindowAlone(one.ask))
+    )
+      return;
     void mirrorPost($, {}).then(() => lookForAnswers($));
   });
+}
+
+// ---- What holds a window chat's turn ----
+//
+// The page's words wait while the window's turn runs, and a turn runs on
+// while a tool call of its main loop does: a dev server or a build run in
+// the foreground, up to its timeout, or a dialog only the window answers (a
+// plan's approval, a question the page cannot show). Such a call, once it
+// held the turn `HOLD_AFTER_MS`, or a dialog at once, is told to the page as
+// a hold (`data-hold`), so the page says what its words wait for. A
+// foreground Bash command may be moved to the background from the page: the
+// post's answer names it (`background`), and the plugin aborts the turn,
+// which moves a running Bash command to the background rather than stopping
+// it (`backgroundedByTurnAbort`). Unlike a stop, the words that waited are
+// kept and typed in once the turn ended, after a note that says the command
+// runs on (`backgroundNote`); with none waiting, the note alone goes, so the
+// model carries on as it does after Ctrl+B.
+//
+// A call is kept from `classic.PreToolUse`, which fires before it runs and
+// wraps nothing, until `classic.PostToolUse`, the main loop's next step or
+// its turn's end.
+
+/** How long a tool call of the main loop runs before the page is told it holds the turn: past most calls, so the page does not flicker. */
+export const HOLD_AFTER_MS = 10_000;
+
+/** One hold of the mirrored turn: its call's id, the turn, what it is, whether the page was told, and its timer until then. */
+interface HeldCall {
+  id: string;
+  turn: string;
+  hold: Hold;
+  told: boolean;
+  timer: Timer | null;
+}
+
+/** The main loop's tool calls under way in the mirrored turn, by their ids, each a hold once told. */
+const holds = new Map<string, HeldCall>();
+/** The ids of the tool calls the mirrored main loop's last step made, as its stream names them: `classic.PreToolUse` names no agent. */
+const mainCalls = new Set<string>();
+/** The turn the page asked to move a held command of to the background, which this window aborted; null otherwise. */
+let backgroundedFromPage: string | null = null;
+/** The labels of the commands the page moved to the background, the ids of their background tasks once their results named them, until the note after them is typed. */
+let movedFromPage: { labels: string[]; tasks: string[] } | null = null;
+/** Set while the note `backgroundNote` submitted alone waits for its turn to begin, which is then kept as the harness's line `BACKGROUND_LINE`. */
+let carryingOn = false;
+/** Set while devcorner's request is held for the holds the page may move to the background (`tellHold`). */
+let holdingForPage = false;
+
+/** The line a turn begun by the note alone (`backgroundNote`) is kept as on the page. */
+export const BACKGROUND_LINE =
+  "Moved to the background from the page; Claude Code goes on";
+
+/**
+ * What one tool call of the main loop holds, from what `classic.PreToolUse`
+ * gives: a dialog only the window answers, a command (a foreground Bash call
+ * may go to the background), or nothing, for one that never holds the turn
+ * (a Bash call already in the background, a question the page shows).
+ */
+export function holdOf(tool: string, input: unknown): Hold | null {
+  const args =
+    input !== null && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  if (tool === "ExitPlanMode")
+    return {
+      kind: "dialog",
+      tool,
+      label: "Its plan waits for approval in the window",
+      background: false,
+    };
+  if (tool === "AskUserQuestion")
+    return askQuestions(args.questions) === null
+      ? {
+          kind: "dialog",
+          tool,
+          label: "A question the page cannot answer waits in the window",
+          background: false,
+        }
+      : null;
+  if (tool === "Bash" && args.run_in_background === true) return null;
+  return {
+    kind: "command",
+    tool: shortToolName(tool),
+    label: argsLabel(args),
+    background: tool === "Bash",
+  };
+}
+
+/**
+ * The words that tell the model what the page did: its foreground commands
+ * (`labels`) moved to the background, which run on as the background tasks
+ * named (`tasks`), or, with no task named, that its turn was ended for that
+ * and the command may have stopped; then to carry on, with the person's
+ * words after it when `words`.
+ */
+export function backgroundNote(
+  moved: { labels: string[]; tasks: string[] },
+  words: boolean,
+): string {
+  const what = movedWhat(moved.labels);
+  const why = words ? ", so their words below could reach you" : "";
+  const then = words
+    ? "Carry on from where you were, taking their words into account."
+    : "Carry on from where you were.";
+  if (moved.tasks.length > 0)
+    return `[devcorner: your person moved ${what} to the background from devcorner's page${why}. It keeps running as background task ${moved.tasks.join(", ")}. ${then}]`;
+  return `[devcorner: your person ended your turn from devcorner's page to move ${what} to the background${why}; it may not have started, or may have stopped, so check whether it runs before you rely on it. ${then}]`;
+}
+
+/** The commands moved to the background, by their labels in code: `pnpm dev`. */
+function movedWhat(labels: readonly string[]): string {
+  const named = labels
+    .filter((label) => label !== "")
+    .map((label) => `\`${label}\``)
+    .join(", ");
+  return named === "" ? "a foreground command" : named;
+}
+
+/** The reply of a turn ended to move its commands to the background from the page: what it had said, then a line of what moved. */
+export function withMovedLine(
+  answer: string,
+  labels: readonly string[],
+): string {
+  const line = `Moved ${movedWhat(labels)} to the background from the page.`;
+  return answer.trim() === "" ? line : `${answer.trimEnd()}\n\n${line}`;
+}
+
+/** Says one state of a hold to the page with the turn's next post, at once. */
+function sayHold($: Engine, data: HoldState): void {
+  if (mirror === null || mirror.turn === null) return;
+  mirror.parts.push({ type: "data-hold", data });
+  void mirrorPost($, {});
+}
+
+/**
+ * Keeps a tool call of the main loop that may hold the mirrored turn, and
+ * tells the page once it held it `HOLD_AFTER_MS`, a dialog at once.
+ */
+function beginHold($: Engine, id: string, tool: string, input: unknown): void {
+  const m = mirror;
+  if (m === null || m.turn === null || holds.has(id)) return;
+  const hold = holdOf(tool, input);
+  if (hold === null) return;
+  const held: HeldCall = { id, turn: m.turn, hold, told: false, timer: null };
+  holds.set(id, held);
+  if (hold.kind === "dialog") tellHold($, held);
+  else held.timer = $.clock.after(HOLD_AFTER_MS, () => tellHold($, held));
+}
+
+/**
+ * Tells the page of a hold still under way in its turn and, for one the page
+ * may move to the background, holds devcorner's request while any such hold
+ * lasts, one hold of the request for them all (`holdingForPage`), so the
+ * page's ask comes at once (`holdWhile`). A call held this long may still
+ * wait on its permission dialog rather than run; moved then, its turn ends
+ * without running it, which the note says (`backgroundNote`).
+ */
+function tellHold($: Engine, held: HeldCall): void {
+  held.timer = null;
+  if (holds.get(held.id) !== held || mirror?.turn !== held.turn) return;
+  held.told = true;
+  sayHold($, { id: held.id, state: "held", hold: held.hold });
+  if (!held.hold.background || holdingForPage) return;
+  holdingForPage = true;
+  void holdWhile(
+    $,
+    () =>
+      [...holds.values()].some(
+        (one) => one.told && one.hold.background && one.turn === mirror?.turn,
+      ),
+    () => undefined,
+  ).finally(() => {
+    holdingForPage = false;
+  });
+}
+
+/** Ends one hold: its timer stops, and the page, if told, is told it is over. */
+function endHold($: Engine, id: string): void {
+  const held = holds.get(id);
+  if (held === undefined) return;
+  holds.delete(id);
+  held.timer?.cancel();
+  if (held.told) sayHold($, { id, state: "over" });
+}
+
+/** Ends every hold, and forgets the main loop's calls: it went on to its next step, or its turn ended. */
+function endHolds($: Engine): void {
+  for (const id of [...holds.keys()]) endHold($, id);
+  mainCalls.clear();
+}
+
+/**
+ * Moves the held commands of the mirrored turn to the background as the
+ * page asked, by the hold's id: only a foreground Bash command still held in
+ * the turn under way, once, and never a turn the page stopped. Aborting the
+ * turn moves a running Bash command to the background; the turn's end then
+ * keeps the page's words and types them in after the note.
+ */
+async function backgroundFromPage(
+  $: Engine,
+  turnId: string,
+  id: string,
+): Promise<void> {
+  const held = holds.get(id);
+  if (
+    held === undefined ||
+    !held.hold.background ||
+    held.turn !== turnId ||
+    mirror?.turn !== turnId ||
+    stoppedFromPage === turnId ||
+    backgroundedFromPage === turnId
+  )
+    return;
+  backgroundedFromPage = turnId;
+  movedFromPage = {
+    labels: [...holds.values()]
+      .filter((one) => one.turn === turnId && one.hold.background)
+      .map((one) => one.hold.label),
+    tasks: [],
+  };
+  await $.turn.abort({ turnId }).catch(() => {
+    // A turn that ended meanwhile was not aborted: nothing moved.
+    if (backgroundedFromPage === turnId) {
+      backgroundedFromPage = null;
+      movedFromPage = null;
+    }
+  });
+}
+
+/** Keeps the background task a command the page moved runs on as, as its result names it. */
+function keepMoved(response: unknown): void {
+  const result = response as {
+    backgroundTaskId?: unknown;
+    backgroundedByTurnAbort?: unknown;
+  } | null;
+  if (
+    movedFromPage === null ||
+    result === null ||
+    typeof result !== "object" ||
+    result.backgroundedByTurnAbort !== true ||
+    typeof result.backgroundTaskId !== "string"
+  )
+    return;
+  if (!movedFromPage.tasks.includes(result.backgroundTaskId))
+    movedFromPage.tasks.push(result.backgroundTaskId);
 }
 
 /**
@@ -7134,6 +7533,7 @@ function pageWordsOf(given: unknown[]): PageWords[] {
       text?: unknown;
       files?: unknown;
       command?: unknown;
+      at?: unknown;
     } | null;
     if (
       one === null ||
@@ -7174,6 +7574,8 @@ function pageWordsOf(given: unknown[]): PageWords[] {
                 args: typeof command.args === "string" ? command.args : "",
               }
             : null,
+        at:
+          typeof one.at === "number" && Number.isFinite(one.at) ? one.at : null,
       },
     ];
   });
@@ -7279,11 +7681,15 @@ async function pageText(
  * model as one prompt. The files it sent are fetched first and named by path,
  * the words held as typed (`typedFromPage`) meanwhile, so no other call types
  * them. A slash command from the page waits in its place among them and runs
- * alone when its turn comes (`runPageCommand`), never typed in.
+ * alone when its turn comes (`runPageCommand`), never typed in. After a
+ * move to the background from the page (`backgroundFromPage`), its note
+ * (`backgroundNote`) goes first: before the next message's words, or alone
+ * when none waits or a command is next, so the model carries on.
  */
 async function typePageWords($: Engine): Promise<void> {
   const waiting = () =>
-    pageWords.length > 0 &&
+    (pageWords.length > 0 || movedFromPage !== null) &&
+    backgroundedFromPage === null &&
     typedFromPage === null &&
     commandFromPage === null &&
     pageHeld === null &&
@@ -7299,13 +7705,37 @@ async function typePageWords($: Engine): Promise<void> {
   // type the words in): the check and the take go together, with no wait
   // between, so only one takes them and the other submits nothing.
   if (!waiting()) return;
+  // After a move to the background from the page, the note goes with the
+  // next words typed, or alone first when none waits or a command is next.
+  if (
+    movedFromPage !== null &&
+    (pageWords.length === 0 || takesAlone(pageWords[0]!))
+  ) {
+    const moved = movedFromPage;
+    movedFromPage = null;
+    carryingOn = true;
+    wokeAt = await $.clock.now();
+    wakingFor = null;
+    await $.prompt.submit({ text: backgroundNote(moved, false) }).catch(() => {
+      carryingOn = false;
+      movedFromPage ??= moved;
+      wokeAt = null;
+    });
+    return;
+  }
   if (takesAlone(pageWords[0]!)) {
     await runPageCommand($, pageWords.shift()!);
     return;
   }
   const message = pageWords.shift()!;
-  let text = message.text;
-  if (message.files.length > 0) {
+  // Read before any wait, while the message is still this window's to type.
+  const during = replyDuring.get(message.key) ?? null;
+  // Files fetched while the turn before ran (`readyPageFiles`) are not
+  // fetched again.
+  const ready = pageTextReady.get(message.key);
+  pageTextReady.delete(message.key);
+  let text = ready ?? message.text;
+  if (message.files.length > 0 && ready === undefined) {
     const from = mirror;
     fetchingPage = true;
     try {
@@ -7337,19 +7767,215 @@ async function typePageWords($: Engine): Promise<void> {
     }
     pageWords = since;
   }
-  const typed = { keys: [message.key], text };
+  replyDuring.delete(message.key);
+  // The note of a move to the background goes before the words, never into
+  // what devcorner keeps of them (`typedFromPage`). It says the person ended
+  // that turn so their words could reach it, so they are not marked as sent
+  // before its reply (`sentBefore`).
+  const moved = movedFromPage;
+  movedFromPage = null;
+  const typed = {
+    keys: [message.key],
+    text: moved === null ? sentBefore(message, text, during) : text,
+  };
   typedFromPage = typed;
   wokeAt = await $.clock.now();
   wakingFor = null;
-  await $.prompt.submit({ text: typed.text, asUser: true }).catch(() => {
-    pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
-    if (typedFromPage === typed) typedFromPage = null;
-    wokeAt = null;
-  });
+  await $.prompt
+    .submit({
+      text:
+        moved === null
+          ? typed.text
+          : `${backgroundNote(moved, true)}\n\n${typed.text}`,
+      asUser: true,
+    })
+    .catch(() => {
+      pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
+      if (during !== null && !replyDuring.has(message.key))
+        replyDuring.set(message.key, during);
+      if (typedFromPage === typed) typedFromPage = null;
+      movedFromPage ??= moved;
+      wokeAt = null;
+    });
 }
 
 /**
- * The built-ins of Claude Code a laptop chat's page runs in the window: any
+ * The reply each of the page's words was said while the mirrored window
+ * wrote, by its key: words that came after that reply's turn began
+ * (`waitedAtStart`) and waited as it ended, or that its end post's answer
+ * named (devcorner answers that post once it kept the reply). Words held
+ * past a later reply (a stop, a wake's turn) keep the first. What
+ * `sentBefore` marks.
+ */
+const replyDuring = new Map<string, string>();
+/** The keys of the page's words that waited as the mirrored turn began: said before its reply, not during it. */
+let waitedAtStart = new Set<string>();
+
+/** Keeps `reply` as the one the words under `keys` were said during, for each not marked yet that came after its turn began. A reply with no words proposed nothing to mark against. */
+function markDuring(keys: readonly string[], reply: string): void {
+  if (reply.trim() === "") return;
+  for (const key of keys)
+    if (!waitedAtStart.has(key) && !replyDuring.has(key))
+      replyDuring.set(key, reply);
+}
+
+/** How much of a reply the line before words sent while it was written quotes. */
+const SENT_BEFORE_QUOTE = 200;
+
+/**
+ * The page's words as the window types them, after the reply they were sent
+ * while it was being written (`replyDuring`): opened with a line saying when
+ * they were sent, on this machine's clock, and quoting that reply, so a
+ * "yes" said before the person read it is never taken as their go for what
+ * it proposed. Words said during no reply (null) are typed as they are.
+ */
+export function sentBefore(
+  message: Pick<PageWords, "at">,
+  text: string,
+  reply: string | null,
+): string {
+  const flat = reply?.replace(/\s+/g, " ").trim() ?? "";
+  if (flat === "") return text;
+  const cut = flat.slice(0, SENT_BEFORE_QUOTE);
+  // Cut at a word, unless the words hold no space to cut at.
+  const quote =
+    flat.length <= SENT_BEFORE_QUOTE
+      ? flat
+      : `${cut.replace(/\s+\S*$/, "") || cut}…`;
+  const when = message.at === null ? null : new Date(message.at);
+  const time =
+    when === null
+      ? ""
+      : ` at ${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  return `[Sent from devcorner's page${time}, while you were still writing your reply that begins "${quote}", before your person had read it: these words do not answer that reply, so a yes or a go-ahead in them is no approval of what it proposed. If they could be read as one, ask.]\n\n${text}`;
+}
+
+/** What joins the page's words to a running turn's tool result, before them (`joinPageWords`). */
+export const JOINED_FROM_PAGE =
+  "Your person wrote this to you on devcorner's page of this chat while you were working: these are their own words, sent mid-turn. Take them into account now, as if they had typed them here:";
+
+/**
+ * The keys of the page's words joined to the mirrored turn (`joinPageWords`):
+ * devcorner's answers may still name them waiting until it took the post
+ * that joined them, so they are left out of every answer until that turn's
+ * end was posted.
+ */
+const joinedFromPage = new Set<string>();
+
+/** The page's messages with files, fetched while a turn runs so they are ready to join it, by key: their words with the files' paths (`pageText`). */
+const pageTextReady = new Map<string, string>();
+/** The keys of the messages whose files `readyPageFiles` is fetching. */
+const readying = new Set<string>();
+
+/**
+ * Fetches, while the mirrored turn runs, the files of the page's messages
+ * that wait, so each is ready to join the turn at its next tool result: a
+ * tool's result is never held up for a fetch. A message whose files are
+ * still on their way waits for the result after.
+ */
+function readyPageFiles($: Engine): void {
+  // A message taken back on the page waits no more.
+  for (const key of pageTextReady.keys())
+    if (!pageWords.some((w) => w.key === key)) pageTextReady.delete(key);
+  const m = mirror;
+  if (m === null || m.turn === null) return;
+  for (const w of pageWords) {
+    if (
+      w.files.length === 0 ||
+      takesAlone(w) ||
+      pageTextReady.has(w.key) ||
+      readying.has(w.key)
+    )
+      continue;
+    readying.add(w.key);
+    void pageText($, m.thread, w)
+      .then((text) => {
+        if (mirror === m) pageTextReady.set(w.key, text);
+      })
+      .catch(() => undefined)
+      .finally(() => readying.delete(w.key));
+  }
+}
+
+/**
+ * Joins the page's words that wait to the mirrored turn at a tool call's
+ * result, as words typed into Claude Code mid-turn reach it: the
+ * result goes on with them after it (`context`), which the model reads in
+ * the turn's next request, marked as the person's own words. Only the main
+ * loop's result, never a subagent's; never a denied call's, which takes no
+ * context; never while a stop holds them, the page stopped the turn or moved
+ * its command to the background (its words go in after that turn's end,
+ * behind the note), or the window types or runs one of them alone; and only
+ * while the call's turn is
+ * the one mirrored. Every message that waits joins, in order, up to the
+ * first slash command, which waits for the window to be idle, and up to the
+ * first whose files are not fetched yet. devcorner is asked first, by a
+ * post whose answer says whether the page stopped the turn and which words
+ * still wait: a Stop since its last answer holds them, and a turn the window
+ * has not heard was stopped would otherwise take words devcorner holds and
+ * hands again once the person says more. Told of the join at the next post
+ * (`Mirror.join`); the window says so on a toast.
+ */
+async function joinPageWords<
+  R extends { deny?: unknown; context?: readonly string[] },
+>($: Engine, agent: string | undefined, ran: R): Promise<R> {
+  const m = mirror;
+  const at = m?.turn ?? null;
+  if (
+    m === null ||
+    at === null ||
+    agent !== undefined ||
+    ran.deny !== undefined
+  )
+    return ran;
+  /** The words that may join now, in order; none while anything holds them. */
+  const ready = (): { key: string; text: string }[] => {
+    if (
+      mirror !== m ||
+      m.turn !== at ||
+      pageHeld !== null ||
+      stoppedFromPage === at ||
+      backgroundedFromPage === at ||
+      typedFromPage !== null ||
+      commandFromPage !== null
+    )
+      return [];
+    const ones: { key: string; text: string }[] = [];
+    for (const w of pageWords) {
+      if (takesAlone(w)) break;
+      const text = w.files.length === 0 ? w.text : pageTextReady.get(w.key);
+      if (text === undefined) break;
+      ones.push({ key: w.key, text });
+    }
+    return ones;
+  };
+  if (ready().length === 0 || (await read($, turn)) !== at) return ran;
+  // A post that fails is kept and sent again by the mirror itself; the words
+  // then join as the last answer left them.
+  await mirrorPost($, {}).catch(() => undefined);
+  const joining = ready();
+  if (joining.length === 0) return ran;
+  const keys = new Set(joining.map((one) => one.key));
+  pageWords = pageWords.filter((w) => !keys.has(w.key));
+  for (const key of keys) {
+    joinedFromPage.add(key);
+    pageTextReady.delete(key);
+    replyDuring.delete(key);
+  }
+  m.join.push(...keys);
+  $.ui.toast("dc: your words from the page reached this turn");
+  void mirrorPost($, {});
+  return {
+    ...ran,
+    context: [
+      ...(ran.context ?? []),
+      `${JOINED_FROM_PAGE}\n\n${joining.map((one) => one.text).join("\n\n---\n\n")}`,
+    ],
+  };
+}
+
+/**
+ * The built-ins of Claude Code a window chat's page runs in the window: any
  * other built-in is refused, so one Claude Code adds stays off until
  * devcorner takes it. A skill, a plugin's command or an MCP prompt runs as
  * the window lists it. devcorner offers the same, and refuses any other as
@@ -7382,7 +8008,7 @@ export function pageCommandIn(
     return { refused: `no command named /${name} in this window` };
   if (info.source === "builtin" && !PAGE_BUILTINS.has(info.name))
     return {
-      refused: `/${name} is one of Claude Code's own commands, which a laptop chat's page does not run: run it in the window itself`,
+      refused: `/${name} is one of Claude Code's own commands, which a window chat's page does not run: run it in the window itself`,
     };
   return { name: info.name };
 }
@@ -7445,6 +8071,7 @@ function commandTurn(
     of: null,
     begin: { text: line, from: "page", took: [key], images: [] },
     parts: [],
+    join: [],
     post: 0,
     end: { text: end.text, tools: [], steps: [], outcome: end.outcome },
     tries: 0,
@@ -7598,6 +8225,7 @@ async function mirrorOpened(
     next: null,
     begin: null,
     parts: [],
+    join: [],
     tools: [],
     steps: [],
     said: [],
@@ -7623,7 +8251,7 @@ async function mirrorOpened(
   })).catch(() => undefined);
   if (began) await instructWindow($, id);
   return [
-    `dc: ${body.started === true ? "This window is now" : "This window mirrors"} laptop chat ${id}${typeof body.url === "string" ? `: ${body.url}` : "."}`,
+    `dc: ${body.started === true ? "This window is now" : "This window mirrors"} window chat ${id}${typeof body.url === "string" ? `: ${body.url}` : "."}`,
     typeof body.movedFrom === "string"
       ? `It moved here from ${body.movedFrom}, which no longer mirrors it.`
       : null,
@@ -7634,7 +8262,7 @@ async function mirrorOpened(
     .join("\n");
 }
 
-// Laptop launches: devcorner's page asks to start a laptop chat on this
+// Laptop launches: devcorner's page asks to start a window chat on this
 // machine, or to move a chat here, so the person can begin or carry on a
 // chat from the page without typing in a terminal, and a window of this
 // plugin that holds devcorner's held request (any idle window, or the
@@ -7679,6 +8307,99 @@ export function launchArgv(name: string, prompt: string): string[] {
     name,
     prompt,
   ];
+}
+
+/**
+ * The command that revives a window chat's parked background session as
+ * itself: `claude respawn <id>`, which restarts it under the same id, in its
+ * saved folder with its saved options (its name among them), so it rejoins
+ * its chat with its whole context. Never `claude --bg --resume <id>` with a
+ * flag, which starts a copy under a new id. Run with no shell, the window's
+ * own session variables cleared.
+ */
+export function respawnArgv(id: string): string[] {
+  return [
+    "env",
+    ...NESTED_VARIABLES.flatMap((one) => ["-u", one]),
+    "claude",
+    "respawn",
+    id,
+  ];
+}
+
+/** Reads `claude respawn`'s answer: exit 0 restarted the session `id`; anything else failed, said in its own words. */
+export function respawnOutcome(
+  ran: { exitCode: number; stdout: string; stderr: string },
+  id: string,
+): LaunchOutcome {
+  if (ran.exitCode === 0) return { problem: null, words: null, bg: id };
+  const said = `${ran.stdout}\n${ran.stderr}`.trim();
+  return {
+    problem: "failed",
+    words:
+      said === ""
+        ? `claude respawn exited ${ran.exitCode}`
+        : said.slice(0, 400),
+    bg: null,
+  };
+}
+
+/** One session as `claude agents --json` lists it, its fields as it prints them, each read with a check. */
+type ListedAgent = Record<string, unknown>;
+
+/**
+ * The sessions `claude agents --json` printed (a list, or one under
+ * `agents`); null when what it printed cannot be read as either.
+ */
+export function agentsListed(printed: string): ListedAgent[] | null {
+  let listed: unknown;
+  try {
+    listed = JSON.parse(printed);
+  } catch {
+    return null;
+  }
+  const all = Array.isArray(listed)
+    ? listed
+    : Array.isArray((listed as { agents?: unknown } | null)?.agents)
+      ? (listed as { agents: unknown[] }).agents
+      : null;
+  return all === null
+    ? null
+    : all.filter(
+        (one): one is ListedAgent => one !== null && typeof one === "object",
+      );
+}
+
+/**
+ * Whether `claude agents --json` lists the session `id` as a background
+ * one (`kind` other than `interactive`): a window chat whose window is one
+ * can be revived from its page once Claude Code parks it. Null when the
+ * list does not name the session, or cannot be read.
+ */
+export function backgroundOf(printed: string, id: string): boolean | null {
+  const kind = agentsListed(printed)?.find((one) => one.sessionId === id)?.kind;
+  return typeof kind === "string" ? kind !== "interactive" : null;
+}
+
+/** How long `claude agents --json` may take as a chat opens, which waits on it. */
+const AGENTS_READ_MS = 5_000;
+
+/**
+ * Whether this window is a background session of the machine, as a chat's
+ * opening tells devcorner (`ChatOpen`'s `background`), read from `claude
+ * agents --json`; null when it cannot be read, which keeps what the same
+ * session said before.
+ */
+async function backgroundHere($: Engine): Promise<boolean | null> {
+  try {
+    const id = await $.session.id();
+    const ran = await $.process.run(["claude", "agents", "--json"], {
+      timeoutMs: AGENTS_READ_MS,
+    });
+    return ran.exitCode === 0 ? backgroundOf(ran.stdout, id) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** What a launcher says `claude --bg` came to: started (with the id it printed), or why not, in its own words. */
@@ -7795,7 +8516,7 @@ async function takeLaunch($: Engine, launch: string): Promise<void> {
   const taken = await postAsYou(
     $,
     { hook_event_name: "LaunchTake", launch },
-    { command: "a laptop chat's launch", nothing: "nothing was started" },
+    { command: "a window chat's launch", nothing: "nothing was started" },
   );
   if (typeof taken === "string" || taken.status !== 200) return;
   const body = (taken.body ?? {}) as {
@@ -7803,8 +8524,21 @@ async function takeLaunch($: Engine, launch: string): Promise<void> {
     folder?: unknown;
     name?: unknown;
     prompt?: unknown;
+    respawn?: unknown;
   };
-  if (typeof body.name !== "string" || typeof body.prompt !== "string") return;
+  if (typeof body.respawn === "string" && body.respawn !== "") {
+    await reviveLaunch($, launch, body.respawn);
+    return;
+  }
+  // A launch's prompt joins its chat: one with none (a revive a devcorner
+  // that cannot revive answered without its session) would start a session
+  // that joins nothing.
+  if (
+    typeof body.name !== "string" ||
+    typeof body.prompt !== "string" ||
+    body.prompt.trim() === ""
+  )
+    return;
   const repo = typeof body.repo === "string" ? body.repo : null;
   const folder =
     (typeof body.folder === "string" && body.folder !== ""
@@ -7843,34 +8577,134 @@ async function takeLaunch($: Engine, launch: string): Promise<void> {
       bg: outcome.bg,
       folder: folder ?? null,
     },
-    { command: "a laptop chat's launch", nothing: "its outcome was not said" },
+    { command: "a window chat's launch", nothing: "its outcome was not said" },
   );
   $.ui.toast(
     outcome.problem === null
-      ? `dc: started ${body.name} in the background for devcorner's page (claude attach ${body.name})`
-      : `dc: devcorner's page asked for a laptop chat here, and it did not start: ${outcome.words ?? outcome.problem}`,
+      ? `dc: started ${body.name} in the background for devcorner's page (claude attach "${body.name}")`
+      : `dc: devcorner's page asked for a window chat here, and it did not start: ${outcome.words ?? outcome.problem}`,
+  );
+}
+
+/** The status `claude agents --json` gives a session whose process ended, as 2.1.325 and 2.1.326 listed a parked one. */
+const ENDED_STATUS = "done";
+
+/**
+ * What `claude agents --json --all` says of session `id` (the one whose id
+ * begins with it): its process, by its pid, when it names one, as it does
+ * for an interactive window; `runs` when it names a status of a live
+ * session and no pid, as 2.1.327 lists a background session that runs
+ * (`busy`, `idle`); `parked` when it names neither, as 2.1.327 lists a
+ * parked one (no status, `state` "blocked", which a running one keeps too),
+ * or only `done`, or when it lists no such session, which `claude respawn`
+ * then says in its own words.
+ */
+export function listedLife(
+  agents: ListedAgent[],
+  id: string,
+): { pid: number } | "runs" | "parked" {
+  const found = agents.find(
+    (one) => typeof one.sessionId === "string" && one.sessionId.startsWith(id),
+  );
+  if (typeof found?.pid === "number") return { pid: found.pid };
+  return typeof found?.status === "string" && found.status !== ENDED_STATUS
+    ? "runs"
+    : "parked";
+}
+
+/**
+ * Whether background session `id` is parked here, so a revive may restart
+ * it: `parked` when `claude agents --json --all` lists no live session of
+ * it (`listedLife`); `runs` when it does, or its process is alive, as when
+ * devcorner stopped hearing it for another reason (a long command in its
+ * turn, its held request failing), which a restart would cut; `unknown`
+ * when either could not be read, which restarts nothing either.
+ */
+async function parkedHere(
+  $: Engine,
+  id: string,
+): Promise<"parked" | "runs" | "unknown"> {
+  const run = (argv: string[]) =>
+    $.process.run(argv, { timeoutMs: AGENTS_READ_MS }).catch(() => null);
+  const listed = await run(["claude", "agents", "--json", "--all"]);
+  const agents =
+    listed === null || listed.exitCode !== 0
+      ? null
+      : agentsListed(listed.stdout);
+  if (agents === null) return "unknown";
+  const life = listedLife(agents, id);
+  if (typeof life === "string") return life;
+  const alive = await run(["kill", "-0", String(life.pid)]);
+  return alive === null ? "unknown" : alive.exitCode === 0 ? "runs" : "parked";
+}
+
+/** A Claude Code session id as devcorner names one to revive: hex digits alone, never a word `claude respawn` would read as a flag. */
+const SESSION_ID = /^[0-9a-f]{6,40}$/i;
+
+/**
+ * A revive this window took: `claude respawn <id>` restarts the chat's
+ * parked background session, which rejoins its chat by itself, and how it
+ * went is said to devcorner, as a launch's is. A session whose process
+ * still runs, or whose state could not be read, is left as it is, and said
+ * so.
+ */
+async function reviveLaunch(
+  $: Engine,
+  launch: string,
+  id: string,
+): Promise<void> {
+  const parked = SESSION_ID.test(id) ? await parkedHere($, id) : null;
+  const left = (words: string): LaunchOutcome => ({
+    problem: "failed",
+    words,
+    bg: null,
+  });
+  const outcome: LaunchOutcome =
+    parked === null
+      ? left(`${id} is no Claude Code session id: nothing was restarted.`)
+      : parked === "runs"
+        ? left(
+            `Background session ${id} still runs on this machine, so it is not parked and was not restarted: claude attach ${id} opens it.`,
+          )
+        : parked === "unknown"
+          ? left(
+              `claude agents could not say whether background session ${id} still runs on this machine, so it was not restarted. claude agents shows it.`,
+            )
+          : respawnOutcome(
+              await $.process
+                .run(respawnArgv(id), { timeoutMs: LAUNCH_RUN_MS })
+                .catch((error: unknown) => ({
+                  exitCode: -1,
+                  stdout: "",
+                  stderr:
+                    error instanceof Error ? error.message : String(error),
+                })),
+              id,
+            );
+  await postAsYou(
+    $,
+    {
+      hook_event_name: "LaunchDone",
+      launch,
+      problem: outcome.problem,
+      words: outcome.words,
+      bg: outcome.bg,
+      folder: null,
+    },
+    { command: "a window chat's revive", nothing: "its outcome was not said" },
+  );
+  $.ui.toast(
+    outcome.problem === null
+      ? `dc: revived background session ${id} for devcorner's page (claude attach ${id})`
+      : `dc: devcorner's page asked to revive background session ${id} here, and it did not restart: ${outcome.words ?? outcome.problem}`,
   );
 }
 
 /** What `claude agents --json` lists of the background launcher: its state, or null when it is not listed. */
 export function launcherListed(printed: string): string | null {
-  let listed: unknown;
-  try {
-    listed = JSON.parse(printed);
-  } catch {
-    return null;
-  }
-  const all = Array.isArray(listed)
-    ? listed
-    : Array.isArray((listed as { agents?: unknown } | null)?.agents)
-      ? (listed as { agents: unknown[] }).agents
-      : [];
-  const found = all.find(
-    (one) =>
-      one !== null &&
-      typeof one === "object" &&
-      (one as { name?: unknown }).name === LAUNCHER_NAME,
-  ) as { state?: unknown; status?: unknown } | undefined;
+  const found = agentsListed(printed)?.find(
+    (one) => one.name === LAUNCHER_NAME,
+  );
   if (found === undefined) return null;
   const state = [found.status, found.state].filter(
     (one): one is string => typeof one === "string",
@@ -7889,7 +8723,7 @@ export function launcherListed(printed: string): string | null {
 async function launcherHere($: Engine, words: string): Promise<string> {
   const arg = words.trim();
   if (arg === "serve")
-    return `dc: this background session is devcorner's launcher on this machine: devcorner's page starts laptop chats here through it, even with every window closed. ${LAUNCHER_PIN} /dc launcher off stops it.`;
+    return `dc: this background session is devcorner's launcher on this machine: devcorner's page starts window chats here through it, even with every window closed. ${LAUNCHER_PIN} /dc launcher off stops it.`;
   const run = (argv: string[], cwd?: string) =>
     $.process
       .run(argv, { ...(cwd ? { cwd } : {}), timeoutMs: LAUNCH_RUN_MS })
@@ -7955,7 +8789,7 @@ async function chatHere($: Engine, words: string): Promise<string> {
   const { launch, rest } = launchArg(words.trim());
   const arg = rest;
   if (arg === "off") {
-    if (mirror === null) return "dc: this window mirrors no laptop chat.";
+    if (mirror === null) return "dc: this window mirrors no window chat.";
     const thread = mirror.thread;
     const posted = await postAsYou(
       $,
@@ -7969,9 +8803,11 @@ async function chatHere($: Engine, words: string): Promise<string> {
       .then((id) => $.store.delete(mirroredKey(id)))
       .catch(() => undefined);
     return posted.status === 200
-      ? `dc: laptop chat ${thread} is off: nothing more is mirrored. /dc continue ${thread} turns it on again.`
+      ? `dc: window chat ${thread} is off: nothing more is mirrored. /dc continue ${thread} turns it on again.`
       : `dc: ${(posted.body as { error?: string } | null)?.error ?? "devcorner did not turn it off."}`;
   }
+  // Read beside the rest, so its process never adds to the opening's wait.
+  const background = backgroundHere($);
   const cwd = await $.session.cwd().catch(() => undefined);
   const commands = await windowCommands($);
   const posted = await postAsYou(
@@ -7991,15 +8827,43 @@ async function chatHere($: Engine, words: string): Promise<string> {
         ? ((await branchIn($, cwd).catch(() => undefined)) ?? null)
         : null,
       git: await windowGit($),
+      background: await background,
     },
-    { command: "/dc chat", nothing: "no laptop chat was opened" },
+    { command: "/dc chat", nothing: "no window chat was opened" },
   );
-  return typeof posted === "string"
-    ? posted
-    : mirrorOpened($, posted, "no laptop chat was opened", commands);
+  if (typeof posted === "string") return posted;
+  const said = await mirrorOpened(
+    $,
+    posted,
+    "no window chat was opened",
+    commands,
+  );
+  return launch === null ? withRename(said, posted) : said;
 }
 
-/** /dc continue <id> [--takeover]: an existing laptop chat continued in this window. */
+/**
+ * The line that names a chat's session as a launch names it (`<title> ·
+ * me-k3`), so agent view, `claude attach me-k3` and `claude --resume` find it
+ * by the chat's id: Claude Code gives a plugin no call that renames its
+ * session, so the person runs `/rename` once. A session a launch started
+ * was named as it started, and is not asked.
+ */
+export function renameLine(name: string): string {
+  return `To find this session by the chat's id in agent view and with claude attach, name it once: /rename ${name}`;
+}
+
+/** An opening's words with `renameLine` after them, when the chat opened and devcorner named its session. */
+function withRename(
+  said: string,
+  posted: { status: number; body: unknown },
+): string {
+  const name = (posted.body as { name?: unknown } | null)?.name;
+  return posted.status === 200 && typeof name === "string" && name !== ""
+    ? `${said}\n${renameLine(name)}`
+    : said;
+}
+
+/** /dc continue <id> [--takeover]: an existing window chat continued in this window. */
 async function continueHere($: Engine, words: string): Promise<string> {
   // A session a launch started names it: the move it joins.
   const { launch, rest } = launchArg(words.trim());
@@ -8007,7 +8871,8 @@ async function continueHere($: Engine, words: string): Promise<string> {
   const takeover = parts.includes("--takeover");
   const thread = parts.find((p) => p !== "--takeover");
   if (!thread)
-    return "dc: name the laptop chat to continue here, as /dc continue me-k3.";
+    return "dc: name the window chat to continue here, as /dc continue me-k3.";
+  const background = backgroundHere($);
   const cwd = await $.session.cwd().catch(() => undefined);
   const commands = await windowCommands($);
   const posted = await postAsYou(
@@ -8027,13 +8892,14 @@ async function continueHere($: Engine, words: string): Promise<string> {
         ? ((await branchIn($, cwd).catch(() => undefined)) ?? null)
         : null,
       git: await windowGit($),
+      background: await background,
     },
     { command: "/dc continue", nothing: "nothing was continued" },
   );
   if (typeof posted === "string") return posted;
   const said = await mirrorOpened($, posted, "nothing was continued", commands);
   await briefWindow($, posted.body);
-  return said;
+  return launch === null ? withRename(said, posted) : said;
 }
 
 /**
@@ -8059,7 +8925,7 @@ async function addRow(
 
 /**
  * Tells the model where its replies are read (`LAPTOP_CHAT_INSTRUCTION`) as
- * its mirroring of laptop chat `thread` begins, as a row of its conversation.
+ * its mirroring of window chat `thread` begins, as a row of its conversation.
  * Where the row cannot be added, the person is told, since the model goes on
  * without it.
  */
@@ -8110,7 +8976,9 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
   if (typeof thread !== "string") return;
   // What it runs on now, which a resume may have changed (`--model`), so the
   // chat's head names it from the rejoin rather than its next turn, and the
-  // commands it has now.
+  // commands it has now. A revived background session says it is one again,
+  // so it can be revived once more when Claude Code parks it next.
+  const background = backgroundHere($);
   const commands = await windowCommands($);
   const posted = await postAsYou(
     $,
@@ -8121,8 +8989,9 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
       runsOn: await windowModel($),
       commands,
       git: await windowGit($),
+      background: await background,
     },
-    { command: "the laptop chat's rejoin", nothing: "it was not rejoined" },
+    { command: "the window chat's rejoin", nothing: "it was not rejoined" },
   );
   if (life !== sessionLife) return;
   if (typeof posted !== "string") {
@@ -9342,7 +10211,7 @@ export const register: Register = (on) => {
   // gets it whole. Between tool calls and on a prompt Claude Code gives a
   // hook's context to the model without drawing it, so it stays there; at a
   // stop it draws it, so the text goes in a row of its own (`handedAtStop`).
-  // A stop a hook carried on splits a mirrored laptop chat's turn at the
+  // A stop a hook carried on splits a mirrored window chat's turn at the
   // reply the window ended there (`carryOnAtStop`).
   on("classic.Stop", async ($, e, next) => {
     const ran = await next(e);
@@ -9374,13 +10243,36 @@ export const register: Register = (on) => {
     }
     return next(e);
   });
-  on("classic.PostToolUse", async ($, e, next) =>
-    toastHandOvers($, await next(e)),
-  );
+  // What holds a window chat's turn (see that section): a call of the main
+  // loop's is kept as it is about to run, and let go as it ends; a Bash
+  // command the page moved names its background task in its result.
+  on("classic.PreToolUse", async ($, e, next) => {
+    const ran = await next(e);
+    // Its input names no agent: a call of the main loop's is one its
+    // mirrored stream made (`mainCalls`).
+    if (
+      e.tool_use_id !== undefined &&
+      mainCalls.has(e.tool_use_id) &&
+      ran.deny === undefined
+    )
+      beginHold($, e.tool_use_id, e.tool, callArguments(e));
+    return ran;
+  });
+  on("classic.PostToolUse", async ($, e, next) => {
+    if (e.agent_id === undefined) {
+      keepMoved(e.tool_response);
+      endHold($, e.tool_use_id);
+    }
+    return toastHandOvers($, await next(e));
+  });
+  on("classic.PostToolUseFailure", async ($, e, next) => {
+    if (e.agent_id === undefined) endHold($, e.tool_use_id);
+    return next(e);
+  });
   on("classic.UserPromptSubmit", async ($, e, next) =>
     toastHandOvers($, await next(e)),
   );
-  // A window that mirrors a laptop chat is told again where its replies are
+  // A window that mirrors a window chat is told again where its replies are
   // read after each compaction, which Claude Code follows with a
   // SessionStart of source `compact`, after what the hook script gives. A
   // start or a resume mirrors nothing until its rejoin is answered, which
@@ -9448,7 +10340,7 @@ export const register: Register = (on) => {
       await $.command.register({
         name: "dc",
         description:
-          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), rename this machine (/dc machine MacBook Air 1), name this conversation (/dc name reviewer), mirror this window as a laptop chat you can drive from devcorner (/dc chat [title], /dc chat off, /dc continue me-k3), keep this machine reachable from devcorner's page with every window closed (/dc launcher on, /dc launcher off), send your words to another conversation of yours (/dc send me-h3 text), have another session of yours do something and answer here (/dc ask me-s4 run the tests), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), install devcorner's local agent, which runs devcorner's subagents on this laptop (/dc local-agent install), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
+          "devcorner: the project's picture (/dc), what this session is on and did lately (/dc now), what waits on you by work stream (/dc waits), your live sessions in every project (/dc sessions), sign this machine in or out (/dc login, /dc logout), rename this machine (/dc machine MacBook Air 1), name this conversation (/dc name reviewer), mirror this window as a window chat you can drive from devcorner (/dc chat [title], /dc chat off, /dc continue me-k3), keep this machine reachable from devcorner's page with every window closed (/dc launcher on, /dc launcher off), send your words to another conversation of yours (/dc send me-h3 text), have another session of yours do something and answer here (/dc ask me-s4 run the tests), copy a paste an agent wrote for you (/dc paste) or list them (/dc pastes), install devcorner's local agent, which runs devcorner's subagents on this laptop (/dc local-agent install), set up a repo devcorner does not know (/dc setup) or hide that offer (/dc hide), or ask it something (/dc board)",
         argumentHint:
           "[now | waits | sessions | login | logout | machine [<name>] | name [<name>] | chat [<title> | off] | continue <chat> [--takeover] | launcher [on | off] | send <to> <text> | ask <to> <task> | paste [<id>] | pastes | local-agent install | setup | hide | what to ask]",
       });
@@ -9477,7 +10369,7 @@ export const register: Register = (on) => {
     if (!(await draws($).catch(() => true))) {
       await markWaiting($, null, ++learnt);
     }
-    // A session that mirrored a laptop chat before a restart or a resume
+    // A session that mirrored a window chat before a restart or a resume
     // rejoins it; until then the row names none, as a reload left the
     // module mirroring nothing whatever the row kept.
     if (mirror === null) await update($, laptop, () => null).catch(() => {});
@@ -9509,7 +10401,7 @@ export const register: Register = (on) => {
 
   // What the engine says of each prompt as it is submitted: where it came
   // from, its slash command, whether the person saw it typed. The turn it
-  // begins reads it (`turnWords`), so a laptop chat keeps a prompt the
+  // begins reads it (`turnWords`), so a window chat keeps a prompt the
   // harness made as a short line, never as the person's words. Only seen,
   // never changed.
   on("prompt.submit", async ($, e, next) => {
@@ -9517,7 +10409,7 @@ export const register: Register = (on) => {
     // bytes only while the prompt is submitted, with the image files dragged
     // into the window, which come as their paths in the words; only for the
     // person's own words, typed here (`typedHere`), and only while this
-    // window mirrors a laptop chat, the one place they go: its turn sends
+    // window mirrors a window chat, the one place they go: its turn sends
     // them with those words (`begin.images`).
     const images: WindowImage[] = [];
     if (mirror !== null && typedHere(e)) {
@@ -9572,7 +10464,7 @@ export const register: Register = (on) => {
       /* stay silent */
     }
     void keepFresh($);
-    // This window's conversation, kept for an opening; and its laptop chat's
+    // This window's conversation, kept for an opening; and its window chat's
     // turn, begun there at once with its words. A wake's prompt is the
     // plugin's, never the person's words, so an opening's history leaves it
     // out and the chat keeps it as devcorner's line; a prompt the harness or
@@ -9580,9 +10472,17 @@ export const register: Register = (on) => {
     // session's message) is left out too, and the chat keeps its short line.
     const page = typedFromPage;
     typedFromPage = null;
+    // The note of a move to the background, submitted alone, is the page's
+    // doing, kept as the harness's line, never as the person's words.
+    const carried = carryingOn;
+    carryingOn = false;
     const typed = page === null && woke === null;
     const seen = typed ? seenFor(submitted, e.text, await $.clock.now()) : null;
-    const words = typed ? turnWords(e.text, seen) : null;
+    const words: TurnWords | null = !typed
+      ? null
+      : carried
+        ? { from: "harness", text: BACKGROUND_LINE }
+        : turnWords(e.text, seen);
     const from = page !== null ? "page" : woke !== null ? "wake" : words!.from;
     // Who started it, for devcorner's count of a chain of wakes (dc-t312):
     // words typed on the page are the person's too.
@@ -9608,6 +10508,8 @@ export const register: Register = (on) => {
       mirror.turn = e.turnId;
       mirror.part = 0;
       mirror.parts = [];
+      // Words waiting already came before this turn's reply, not during it.
+      waitedAtStart = new Set(pageWords.map((w) => w.key));
       beginPart($, mirror, e.turnId, {
         text: said,
         from,
@@ -9621,7 +10523,7 @@ export const register: Register = (on) => {
     return next(e);
   });
 
-  // The model's reply as it streams, for this window's laptop chat: each
+  // The model's reply as it streams, for this window's window chat: each
   // chunk passes on as it came, and its parts are posted in batches. A
   // subagent's steps are not the chat's.
   on("turn.step", async function* ($, e, next) {
@@ -9634,6 +10536,8 @@ export const register: Register = (on) => {
     // waited on was answered; and after a stop a stop hook carried on, that
     // the next part begins.
     if (mirror !== null) closeLooseAsks($, e.agentId ?? null);
+    // The main loop going on means its calls before ended: none holds it.
+    if (e.agentId === undefined) endHolds($);
     const going = mirrored();
     if (going !== null) nextPart($, going);
     for await (const chunk of next(e)) {
@@ -9664,12 +10568,14 @@ export const register: Register = (on) => {
     } catch {
       /* stay silent */
     }
-    // The reply, kept for an opening and, for this window's laptop chat,
+    // The reply, kept for an opening and, for this window's window chat,
     // posted as the turn's end; then the oldest of the page's messages that
     // waited for it is typed in, unless the person stopped it in the window,
-    // which holds them as they are. A Stop from the page holds none:
-    // devcorner dropped those that waited, so the words here now came after
-    // it.
+    // which holds them as they are. A Stop from the page holds none here:
+    // devcorner holds those that waited and hands the window none of them
+    // until the person says more or sends them now. A move to the background
+    // from the page holds none either: it ended the turn so they could go
+    // in, after its note.
     const answer = e.answer;
     keepExchange(exchanges, "window", answer);
     // A turn an API failure ended is told as failed, with its line after
@@ -9680,16 +10586,34 @@ export const register: Register = (on) => {
     if (mirror !== null && mirror.turn === e.turnId) {
       // The part under way ends with the turn.
       const ended = mirror.key;
-      if (e.isAborted === true && stoppedFromPage !== e.turnId) {
+      const moved =
+        backgroundedFromPage === e.turnId && e.isAborted === true
+          ? movedFromPage
+          : null;
+      if (
+        e.isAborted === true &&
+        stoppedFromPage !== e.turnId &&
+        backgroundedFromPage !== e.turnId
+      ) {
         pageHeld = new Set(pageWords.map((w) => w.key));
         stoppedInWindow = ended;
       }
       stoppedFromPage = null;
+      backgroundedFromPage = null;
+      if (moved === null) movedFromPage = null;
+      endHolds($);
       // What it asked and nobody answered closes with it, on the page too.
       expireAsks($, e.isAborted === true);
       // What a response cut short left open is closed.
       mirrorChunk($, mirror, { kind: "stop", stopReason: null, usage: null });
       mirror.beat?.cancel();
+      // The page's words that wait as this reply ends, and those its end
+      // post's answer names, were sent before it: they are typed in marked
+      // so (`sentBefore`).
+      markDuring(
+        pageWords.map((w) => w.key),
+        answer,
+      );
       // The turn is over here before its end is posted: a turn that begins
       // while the post waits is the next one's, never this one's.
       const posting = mirrorPost($, {
@@ -9703,10 +10627,12 @@ export const register: Register = (on) => {
                     : `${answer.trimEnd()}\n\n${failure}`,
                 outcome: "failed",
               }
-            : {
-                text: answer,
-                outcome: e.isAborted === true ? "stopped" : "done",
-              },
+            : moved !== null
+              ? { text: withMovedLine(answer, moved.labels), outcome: "done" }
+              : {
+                  text: answer,
+                  outcome: e.isAborted === true ? "stopped" : "done",
+                },
       });
       mirror.turn = null;
       mirror.key = null;
@@ -9719,6 +10645,9 @@ export const register: Register = (on) => {
       )
         reopenAsks($);
       await posting;
+      // Its end and every join before it posted, devcorner names no word
+      // the window joined as waiting.
+      if (mirror?.unsent.length === 0) joinedFromPage.clear();
       void typePageWords($);
     }
     // The idle asking reads Status first, which keeps the row and the marker
@@ -9728,7 +10657,7 @@ export const register: Register = (on) => {
     return next(e);
   });
 
-  // Asks in a laptop chat (see "Asks in a laptop chat" above). Each tool
+  // Asks in a window chat (see "Asks in a window chat" above). Each tool
   // call is kept while it runs and the window mirrors a chat, a background
   // agent's between turns too, so a permission ask is told by its call, and
   // closes as the call ends: answered in the window, unless the page's
@@ -9759,7 +10688,8 @@ export const register: Register = (on) => {
         by: page === allowed ? "page" : "window",
         said: allowed ? "Allowed" : page === false ? "Denied" : "",
       });
-      return ran;
+      // The page's words that wait reach the turn here, at its next step.
+      return await joinPageWords($, e.agentId, ran);
     } finally {
       const at = callsUnderWay.indexOf(call);
       if (at !== -1) callsUnderWay.splice(at, 1);
@@ -9776,7 +10706,9 @@ export const register: Register = (on) => {
   // hook's. It waits for it inside `$` calls (`holdForPage`), so its own
   // time stays short of its budget however long the dialog waits; only where
   // holds fail does it wait on the clock, and then the page answers within
-  // that budget.
+  // that budget. A background agent's dialog waits on this hook instead, so
+  // a subagent's ask is the window's alone and the hook returns as it opens
+  // it.
   on("classic.PermissionRequest", async ($, e, next) => {
     if (mirror === null || WINDOW_ONLY_TOOLS.has(e.tool_name)) return next(e);
     const settled = await next(e);
@@ -9796,6 +10728,7 @@ export const register: Register = (on) => {
       (alike.length === 1 ? alike[0] : undefined);
     if (call !== undefined) call.asked = true;
     const id = call?.id ?? `ask-${++askCount}`;
+    const windowOnly = agent !== null;
     const page = openAsk(
       $,
       id,
@@ -9803,10 +10736,14 @@ export const register: Register = (on) => {
         kind: "permission",
         tool: e.tool_name,
         label: toolLabel(JSON.stringify(e.tool_input ?? null)),
+        windowOnly,
       },
       agent,
     );
     if (call === undefined && asks.has(id)) looseAsks.add(id);
+    // Its dialog shows once this returns; its call's end, or its agent's
+    // next step, closes it on the page as answered in the window.
+    if (windowOnly) return settled;
     // An answer another post took settles it at once; the hold's request
     // still out then ends by itself.
     await Promise.race([page, holdForPage($, id)]);
@@ -10067,7 +11004,7 @@ export const register: Register = (on) => {
       return { text: await muteHere($, change, arg.slice(change.length)) };
     }
     if (arg === "mutes") return { text: await muteHere($, "mutes", "") };
-    // This window as a laptop chat in devcorner, or off.
+    // This window as a window chat in devcorner, or off.
     if (/^chat(?:\s|$)/.test(arg)) {
       return { text: await chatHere($, arg.slice("chat".length)) };
     }
