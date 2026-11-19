@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.72.0 — 2026-11-19
+
+- The how-we-work skill says that a dispatch with no places answers with its plan, where each step would run, and sends nothing: show it to your person as it came, confirm it with its plan id and agreed only on their yes, and never confirm a plan they did not see. It needs the devcorner that asks, which comes before it.
+
 ## 0.71.0 — 2026-11-19
 
 - A window chat's words sent from the page while a short reply streams go in as soon as that reply ends. When the reply ended while the window was still telling devcorner of its last words, the window picked the waiting message up from that late answer rather than from the turn's end, and Claude Code held it back for up to about a minute, the page saying "Waiting for the window" all the while. The turn's end now types it, so it goes in at once, and it is marked as sent while the reply was being written, as words sent during a reply are.
