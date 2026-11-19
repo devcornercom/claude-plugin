@@ -2,6 +2,19 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.71.0 — 2026-11-19
+
+- A window chat's words sent from the page while a short reply streams go in as soon as that reply ends. When the reply ended while the window was still telling devcorner of its last words, the window picked the waiting message up from that late answer rather than from the turn's end, and Claude Code held it back for up to about a minute, the page saying "Waiting for the window" all the while. The turn's end now types it, so it goes in at once, and it is marked as sent while the reply was being written, as words sent during a reply are.
+
+## 0.70.0 — 2026-11-19
+
+- A window chat's page follows its window into a worktree. When Claude Code moves a session into `.claude/worktrees/<name>` on its first edit, after the chat opened, the page and `show` kept the folder and "branch main" it opened in beside the worktree's commit and files. Each turn's end, and a restart's rejoin, now says the folder and branch the window works in, so they match the commit, and a turn's end on a detached head shows no branch; a window that stays in its checkout looks as before. It needs the devcorner that keeps them, which comes before it.
+- A Revive from a window chat's page whose background session still runs on the laptop is said back as still running, not as a failure, so the page gives `claude attach <id>` as the step that opens it and offers no Try again, which would be refused the same way. It needs the devcorner that knows the word, which comes before it; an older one shows it as a failed revive.
+
+## 0.69.0 — 2026-11-19
+
+- A write or an edit in Claude Code's own memory folder (`.claude/projects/<project>/memory/`) is told, beside the tool's result, the line devcorner gives every session at start among its ways of working: "devcorner: Save what every session should know in devcorner `memory`, at the narrowest scope that fits. What is only true on one machine or in one folder stays out of it." The plugin says it itself, so it needs no token and nothing of the path is sent; that tool call asks devcorner for nothing, and anything waiting is handed over at the next one.
+
 ## 0.68.0 — 2026-11-19
 
 - A window chat's page shows each command the window runs in the background while it runs, as a line under the thread: `Background command "Run the dev server" running`. Its end's line, `Background command "…" completed`, takes its place. One that ends while a turn runs, or that Claude stops, leaves the list at once. This covers a command Claude started in the background, one moved there with Ctrl+B, and one moved there from the page. Before, the page showed nothing until the command ended. It needs the devcorner that keeps the list, which comes before it.

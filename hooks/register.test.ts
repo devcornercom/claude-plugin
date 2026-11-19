@@ -1314,6 +1314,8 @@ function world(
     waitBodies: [] as Record<string, unknown>[],
     /** What each Status read sent. */
     statusBodies: [] as Record<string, unknown>[],
+    /** The conversation's folder, which Claude Code moves into a worktree of its own on a first edit. */
+    cwd: "/work/shop",
     /** The branch `git branch --show-current` prints in the folder (dc-t334); empty on a detached head. */
     branch: "main",
     /** What `git log -1` and `git status --porcelain` print in the folder; null for a folder that is no repo. */
@@ -1720,7 +1722,7 @@ function world(
     };
   });
   on("session.id", async () => ({ value: "conversation-1" }));
-  on("session.cwd", async () => ({ value: "/work/shop" }));
+  on("session.cwd", async () => ({ value: seen.cwd }));
   on("session.surfaces", async () => ({
     value: seen.surfaces === 0 ? [] : (["terminal"] as const),
   }));
@@ -9890,6 +9892,38 @@ describe("a window chat's mirror", () => {
     expect(seen.submitted).toEqual([]);
   });
 
+  test("words an answer still on its way at a turn's end brings are typed by that end, never by the answer", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push("held", "held");
+    seen.chunks = [{ kind: "text", index: 0, text: "On it." }];
+    await stream($, { turnId: "t1" });
+    await clock.advance(MIRROR_BATCH_MS);
+    await flush(clock);
+    const docs = { key: "w1", text: "and the docs" };
+    const completing = $.turn.complete({ ...done("t1"), answer: "On it." });
+    await flush(clock);
+    // The batch's answer lands as the window's turn ends, the turn already
+    // over here: what it names waits for the end to type it.
+    seen.heldChats.shift()!({ status: 200, body: { ok: true, words: [docs] } });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ end: { outcome: "done" } });
+    expect(seen.submitted).toEqual([]);
+    seen.heldChats.shift()!({ status: 200, body: { ok: true, words: [docs] } });
+    await completing;
+    await flush(clock);
+    expect(seen.submitted).toEqual([
+      sentBefore({ at: null }, "and the docs", "On it."),
+    ]);
+    await $.turn.start({ text: seen.submitted[0]!, turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { from: "page", took: ["w1"] },
+    });
+  });
+
   test("a turn's end goes before the next turn's beginning that a post queued earlier builds", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     seen.chatAnswers.push("held");
@@ -10089,10 +10123,12 @@ describe("a window chat's mirror", () => {
     });
   });
 
-  test("an opening and a turn's end say where the window's folder stands in git; a folder that is no repo says none", async ($, on) => {
+  test("an opening and a turn's end say where the window works and where its folder stands in git; a folder that is no repo says none", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     expect(seen.chats[0]).toMatchObject({
       hook_event_name: "ChatOpen",
+      folder: "/work/shop",
+      branch: "main",
       git: {
         head: "4f2a9c1",
         subject: "Add the pending store test",
@@ -10104,11 +10140,17 @@ describe("a window chat's mirror", () => {
     await flush(clock);
     // A beginning says nothing of it: only the end, where the turn left it.
     expect(parts(seen)[0]).not.toHaveProperty("git");
+    expect(parts(seen)[0]).not.toHaveProperty("folder");
+    // The turn's first edit moved the session into a worktree of its own.
+    seen.cwd = "/work/shop/.claude/worktrees/fix-cart";
+    seen.branch = "worktree-fix-cart";
     seen.git = { log: "9b1d2e3\u0000Commit the store test\n", status: "" };
     await $.turn.complete({ ...done("t1"), answer: "Committed." });
     await flush(clock);
     expect(parts(seen).at(-1)).toMatchObject({
       end: { text: "Committed." },
+      folder: "/work/shop/.claude/worktrees/fix-cart",
+      branch: "worktree-fix-cart",
       git: {
         head: "9b1d2e3",
         subject: "Commit the store test",
@@ -10116,9 +10158,18 @@ describe("a window chat's mirror", () => {
         paths: [],
       },
     });
+    // A detached head is on no branch, said as such.
+    seen.branch = "";
+    await $.turn.start({ text: "check out its commit", turnId: "t2" });
+    await $.turn.complete({ ...done("t2"), answer: "Detached." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      end: { text: "Detached." },
+      branch: null,
+    });
     seen.git = null;
-    await $.turn.start({ text: "and now?", turnId: "t2" });
-    await $.turn.complete({ ...done("t2"), answer: "No repo here." });
+    await $.turn.start({ text: "and now?", turnId: "t3" });
+    await $.turn.complete({ ...done("t3"), answer: "No repo here." });
     await flush(clock);
     expect(parts(seen).at(-1)).toMatchObject({
       end: { text: "No repo here." },
@@ -11832,7 +11883,7 @@ describe("a revive: devcorner's page brings a chat's parked background session b
     expect(w.seen.chats.at(-1)).toMatchObject({
       hook_event_name: "LaunchDone",
       launch: "12",
-      problem: "failed",
+      problem: "running",
       words: expect.stringMatching(/still runs on this machine/),
     });
     expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
@@ -11849,7 +11900,7 @@ describe("a revive: devcorner's page brings a chat's parked background session b
     expect(w.seen.chats.at(-1)).toMatchObject({
       hook_event_name: "LaunchDone",
       launch: "14",
-      problem: "failed",
+      problem: "running",
       words: expect.stringMatching(/still runs on this machine/),
     });
     expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
