@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.68.0 — 2026-11-19
+
+- A window chat's page shows each command the window runs in the background while it runs, as a line under the thread: `Background command "Run the dev server" running`. Its end's line, `Background command "…" completed`, takes its place. One that ends while a turn runs, or that Claude stops, leaves the list at once. This covers a command Claude started in the background, one moved there with Ctrl+B, and one moved there from the page. Before, the page showed nothing until the command ended. It needs the devcorner that keeps the list, which comes before it.
+
 ## 0.67.0 — 2026-11-18
 
 - A window chat's words sent from the page while the window works reach the turn under way, as words typed into Claude Code mid-turn do: at its next tool result they are added to that result, marked as your own words from the page, and the page shows them added while it answered. A slash command, and anything sent after it, still waits for the turn to end. Words that reach the window only after the turn ended (sent while it wrote its final answer) are typed in marked as sent before that reply, with the time you sent them and the reply's opening quoted, so a "yes" is never read as approving what the reply proposed. Files sent mid-turn are fetched at once, ready to join. A Stop from the page now keeps the words waiting until you say more or press Send now. Words typed in after Run in background are not marked: its line already says the turn was ended so they could reach Claude.

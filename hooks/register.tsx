@@ -5363,6 +5363,8 @@ interface Mirror {
   tasksSent: string;
   /** This window's own commands as devcorner last took them (`windowCommands`, as JSON), so a post sends them only when they changed; null before it took any. */
   commandsSent: string | null;
+  /** The background commands that run as devcorner last took them (`backgroundRunning`, as JSON), so a post sends them only when they changed; null before it took any, when the next post sends them, none too. */
+  runningSent: string | null;
   /** The last turn whose beginning devcorner took (its post answered), which a terminate from the page stops; null before any. */
   taken: string | null;
   batch?: Timer;
@@ -6431,8 +6433,16 @@ async function saysOfWindow(
   runsOn?: WindowModel;
   git?: WindowGit | null;
   commands?: WindowCommand[];
+  running?: WindowRunning[];
 }> {
-  if (!payload.begin && !payload.end) return {};
+  // Any post says the background commands that run, once they changed: a
+  // command goes to the background mid-turn, and its end begins a turn. A
+  // mirror's first post says them even when none runs, so a list a window
+  // of this chat sent before a restart is not left standing.
+  const running = [...backgroundRunning.values()];
+  const runningChanged = JSON.stringify(running) !== m.runningSent;
+  const ran = runningChanged ? { running } : {};
+  if (!payload.begin && !payload.end) return ran;
   const [runsOn, git, commands] = await Promise.all([
     windowModel($),
     payload.end ? windowGit($) : undefined,
@@ -6444,6 +6454,7 @@ async function saysOfWindow(
     runsOn,
     ...(git === undefined ? {} : { git }),
     ...(changed ? { commands } : {}),
+    ...ran,
   };
 }
 
@@ -6499,6 +6510,8 @@ async function postMirror(
     if (res.status !== 200) return false;
     if (says.commands !== undefined)
       m.commandsSent = JSON.stringify(says.commands);
+    if (says.running !== undefined)
+      m.runningSent = JSON.stringify(says.running);
     if (payload.begin !== null && payload.of !== null) m.taken = payload.of;
     // A stop aborts the window's turn its post was a part of, while it runs,
     // whichever of its parts the page stopped. A turn begun for asks has no
@@ -7416,6 +7429,102 @@ async function backgroundFromPage(
   });
 }
 
+/** A command of the main loop's that runs in the background, as a window chat's page shows it while it runs: its task's id and one short label. */
+export interface WindowRunning {
+  id: string;
+  label: string;
+}
+
+/**
+ * The background commands of this window's main loop that still run, by
+ * their task ids, in the order they went there: each Bash call whose result
+ * names its background task (started there, or moved there by Ctrl+B or
+ * from the page) until its task's notification comes or a call of the main
+ * loop says it ended (`endedBy`). Every post of the window chat says them
+ * once they changed (`saysOfWindow`).
+ */
+const backgroundRunning = new Map<string, WindowRunning>();
+
+/**
+ * The background command a Bash call's result says it runs as, labelled as
+ * Claude Code's own notification names it: by its description, else its
+ * command's first line, with no paths, as `taskLine` cuts that one; null for
+ * any other call or result.
+ */
+export function runningOf(
+  tool: unknown,
+  input: unknown,
+  response: unknown,
+): WindowRunning | null {
+  if (tool !== "Bash") return null;
+  const result = response as { backgroundTaskId?: unknown } | null;
+  if (
+    result === null ||
+    typeof result !== "object" ||
+    typeof result.backgroundTaskId !== "string" ||
+    result.backgroundTaskId === ""
+  )
+    return null;
+  const args = (input ?? {}) as { description?: unknown; command?: unknown };
+  const named =
+    typeof args.description === "string" && args.description.trim() !== ""
+      ? args.description
+      : typeof args.command === "string"
+        ? args.command
+        : "";
+  return {
+    id: result.backgroundTaskId,
+    label: withoutPaths(named.split("\n")[0]!).trim().slice(0, MAX_LABEL),
+  };
+}
+
+/** What a background task's status says once it runs no more, as `TaskOutput` and the notification give it. */
+const TASK_ENDED = new Set(["completed", "failed", "killed"]);
+
+/**
+ * The background task a call of the main loop says runs no more, before
+ * or without its notification: one `TaskStop` (`KillShell`, `KillBash`
+ * before it) stopped, or one whose output `TaskOutput` (`BashOutput`) read
+ * at its end; null for any other call or result.
+ */
+export function endedBy(
+  tool: unknown,
+  input: unknown,
+  response: unknown,
+): string | null {
+  const args = (input ?? {}) as { task_id?: unknown; shell_id?: unknown };
+  const asked =
+    typeof args.task_id === "string" && args.task_id !== ""
+      ? args.task_id
+      : typeof args.shell_id === "string" && args.shell_id !== ""
+        ? args.shell_id
+        : null;
+  if (tool === "TaskStop" || tool === "KillShell" || tool === "KillBash")
+    return asked;
+  if (tool !== "TaskOutput" && tool !== "BashOutput") return null;
+  const result = (response ?? {}) as {
+    task?: { status?: unknown };
+    status?: unknown;
+  };
+  const status =
+    typeof result.task === "object" && result.task !== null
+      ? result.task.status
+      : result.status;
+  return typeof status === "string" && TASK_ENDED.has(status) ? asked : null;
+}
+
+/** The ids of the background tasks a prompt's notifications say ended, each `<task-id>` inside a `<task-notification>`. */
+export function endedTasks(text: string): string[] {
+  const ended: string[] = [];
+  for (const block of text.matchAll(
+    /<task-notification>([\s\S]*?)(?:<\/task-notification>|$)/g,
+  )) {
+    const id = tagWords(block[1]!, "task-id");
+    if (id) ended.push(id);
+  }
+  return ended;
+}
+
 /** Keeps the background task a command the page moved runs on as, as its result names it. */
 function keepMoved(response: unknown): void {
   const result = response as {
@@ -8235,6 +8344,7 @@ async function mirrorOpened(
     posted: 0,
     tasksSent: "[]",
     commandsSent: commands === undefined ? null : JSON.stringify(commands),
+    runningSent: null,
     taken: null,
     sending: Promise.resolve(),
     unsent: [],
@@ -10261,6 +10371,10 @@ export const register: Register = (on) => {
   on("classic.PostToolUse", async ($, e, next) => {
     if (e.agent_id === undefined) {
       keepMoved(e.tool_response);
+      const running = runningOf(e.tool_name, e.tool_input, e.tool_response);
+      if (running !== null) backgroundRunning.set(running.id, running);
+      const ended = endedBy(e.tool_name, e.tool_input, e.tool_response);
+      if (ended !== null) backgroundRunning.delete(ended);
       endHold($, e.tool_use_id);
     }
     return toastHandOvers($, await next(e));
@@ -10438,6 +10552,11 @@ export const register: Register = (on) => {
       e.command?.name === commandFromPage.name
     )
       typedFromPage = commandFromPage.typed;
+    // A background command's notification says it runs no more, whether it
+    // joins a turn under way or begins one; the window's next post tells
+    // the page.
+    if (e.origin?.kind === "task-notification")
+      for (const id of endedTasks(e.text)) backgroundRunning.delete(id);
     noteSubmitted(submitted, {
       text: e.text,
       origin: e.origin ?? null,
@@ -10472,6 +10591,9 @@ export const register: Register = (on) => {
     // session's message) is left out too, and the chat keeps its short line.
     const page = typedFromPage;
     typedFromPage = null;
+    // A background command's end begins a turn with its notification: it
+    // runs no more, which this turn's beginning tells the page.
+    for (const id of endedTasks(e.text)) backgroundRunning.delete(id);
     // The note of a move to the background, submitted alone, is the page's
     // doing, kept as the harness's line, never as the person's words.
     const carried = carryingOn;

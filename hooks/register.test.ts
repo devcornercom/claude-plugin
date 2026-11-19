@@ -101,6 +101,9 @@ import {
   keepTasks,
   seenFor,
   turnWords,
+  runningOf,
+  endedBy,
+  endedTasks,
   pageCommandIn,
   commandOutcome,
   commandRefused,
@@ -7945,6 +7948,68 @@ describe("a window chat's mirror", () => {
     ...over,
   });
 
+  test("a Bash call in the background runs until its notification names its task, labelled as that notification names it", () => {
+    expect(
+      runningOf(
+        "Bash",
+        { command: "sleep 60", description: "Wait one minute" },
+        { backgroundTaskId: "bq2x8f1" },
+      ),
+    ).toEqual({ id: "bq2x8f1", label: "Wait one minute" });
+    // Moved there from the foreground, with no description: its command's
+    // first line, with no paths.
+    expect(
+      runningOf(
+        "Bash",
+        { command: "tail -f /var/log/app.log\nmore" },
+        { backgroundTaskId: "bg7", backgroundedByUser: true },
+      ),
+    ).toEqual({ id: "bg7", label: "tail -f …" });
+    expect(runningOf("Bash", { command: "ls" }, { stdout: "a" })).toBeNull();
+    expect(
+      runningOf("Read", { file_path: "a" }, { backgroundTaskId: "x" }),
+    ).toBeNull();
+    expect(endedTasks(NOTIFICATION)).toEqual(["bq2x8f1"]);
+    expect(
+      endedTasks(`${NOTIFICATION}\n${NOTIFICATION.replace("bq2x8f1", "bz9")}`),
+    ).toEqual(["bq2x8f1", "bz9"]);
+    expect(endedTasks("<task-id>loose</task-id> typed by the person")).toEqual(
+      [],
+    );
+  });
+
+  test("a call of the main loop that stops a background task, or reads its output at its end, says it runs no more", () => {
+    expect(endedBy("TaskStop", { task_id: "bg7" }, { task_id: "bg7" })).toBe(
+      "bg7",
+    );
+    expect(endedBy("KillShell", { shell_id: "bg7" }, {})).toBe("bg7");
+    expect(
+      endedBy(
+        "TaskOutput",
+        { task_id: "bg7", block: true, timeout: 1000 },
+        { retrieval_status: "success", task: { status: "completed" } },
+      ),
+    ).toBe("bg7");
+    expect(
+      endedBy(
+        "BashOutput",
+        { bash_id: "x", shell_id: "bg7" },
+        { status: "failed" },
+      ),
+    ).toBe("bg7");
+    // Still running, or read before its end: it runs on.
+    expect(
+      endedBy(
+        "TaskOutput",
+        { task_id: "bg7", block: false, timeout: 0 },
+        { retrieval_status: "not_ready", task: { status: "running" } },
+      ),
+    ).toBeNull();
+    expect(
+      endedBy("Bash", { task_id: "bg7" }, { status: "completed" }),
+    ).toBeNull();
+  });
+
   test("a prompt the harness made is one short line with no ids, paths or output; the person's own words stay theirs", () => {
     const task = turnWords(NOTIFICATION, null);
     expect(task).toEqual({
@@ -10927,6 +10992,66 @@ describe("a window chat's mirror", () => {
       turn: "t2",
       begin: { text: "and add a health check", from: "page", took: ["w1"] },
     });
+    // The mirror's first post said none ran; the command runs on in the
+    // background, which the posts since it moved said once, and its
+    // notification's turn says it runs no more.
+    const said = parts(seen).filter((post) => "running" in post);
+    expect(said.map((post) => post.running)).toEqual([
+      [],
+      [{ id: "bg7", label: "pnpm dev" }],
+    ]);
+    await $.turn.complete({ ...done("t2"), answer: "Added it." });
+    await flush(clock);
+    await $.turn.start({
+      text: NOTIFICATION.replace("bq2x8f1", "bg7"),
+      turnId: "t3",
+    });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ turn: "t3", running: [] });
+  });
+
+  test("a background command that ends mid-turn leaves the page's list at once, by its notification joining the turn or a call that says it ended", async ($, on) => {
+    // No settings hook answers beneath.
+    on("classic.PostToolUse", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "start both", turnId: "t1" });
+    await flush(clock);
+    for (const [id, command] of [
+      ["bg1", "pnpm dev"],
+      ["bg2", "pnpm test --watch"],
+    ] as const)
+      await $.classic.PostToolUse({
+        tool_name: "Bash",
+        tool_input: { command, run_in_background: true },
+        tool_response: { backgroundTaskId: id },
+        tool_use_id: `toolu_${id}`,
+      });
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(
+      parts(seen)
+        .filter((post) => "running" in post)
+        .at(-1)?.running,
+    ).toEqual([
+      { id: "bg1", label: "pnpm dev" },
+      { id: "bg2", label: "pnpm test --watch" },
+    ]);
+    // The first one's notification comes while the turn runs.
+    await $.prompt.submit({
+      text: NOTIFICATION.replace("bq2x8f1", "bg1"),
+      origin: { kind: "task-notification" },
+      wait: false,
+    } as never);
+    // The second one is stopped by a call of the turn.
+    await $.classic.PostToolUse({
+      tool_name: "TaskStop",
+      tool_input: { task_id: "bg2" },
+      tool_response: { task_id: "bg2" },
+      tool_use_id: "toolu_stop",
+    });
+    await $.turn.complete({ ...done("t1"), answer: "Both done." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ turn: "t1", running: [] });
   });
 
   test("with no words waiting, the note alone tells the model to carry on, kept on the page as the harness's line", async ($, on) => {
