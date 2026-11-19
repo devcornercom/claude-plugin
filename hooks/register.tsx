@@ -4440,7 +4440,12 @@ function askDevcorner($: Engine, text: string): void {
       wokeAt = await $.clock.now();
       // The person's own words: its turn is theirs, not a wake's.
       wakingFor = null;
-      await $.prompt.submit({ text, asUser: true });
+      const entered = await $.prompt.submit({ text, asUser: true });
+      // Dropped (a Stop in the window stands) it begins no turn either.
+      if (entered.drop !== undefined) {
+        wokeAt = null;
+        $.ui.toast(`dc: could not ask devcorner: ${entered.drop}`);
+      }
     } catch (error) {
       wokeAt = null;
       const why = error instanceof Error ? error.message : String(error);
@@ -4564,10 +4569,21 @@ async function ask($: Engine, given?: Read): Promise<void> {
       wokeAt = now;
       wakingFor = step.wake;
       $.ui.toast(wakeToast(woken));
-      // A wake refused starts no turn: the next turn is not the wake's.
-      $.prompt.submit({ text: wakePrompt(woken) }).catch(() => {
-        wakingFor = null;
-      });
+      // A wake refused starts no turn: the next turn is not the wake's. One
+      // Claude Code drops (a Stop in the window stands) never begins one, so
+      // the held request opens again at the next ask, a window chat's page
+      // heard meanwhile; the message waits for the next prompt's hook.
+      $.prompt.submit({ text: wakePrompt(woken) }).then(
+        (entered) => {
+          if (entered.drop === undefined || wakingFor !== step.wake) return;
+          wakingFor = null;
+          wokeAt = null;
+          $.ui.toast(`dc: Claude Code refused the wake: ${entered.drop}`);
+        },
+        () => {
+          wakingFor = null;
+        },
+      );
       // The poll, not the held request, until the turn begins: the held
       // request would hand back at once a message that came meanwhile.
       askIn($, WAITING_MS);
@@ -7483,9 +7499,10 @@ export interface WindowRunning {
  * The background commands of this window's main loop that still run, by
  * their task ids, in the order they went there: each Bash call whose result
  * names its background task (started there, or moved there by Ctrl+B or
- * from the page) until its task's notification comes or a call of the main
- * loop says it ended (`endedBy`). Every post of the window chat says them
- * once they changed (`saysOfWindow`).
+ * from the page) until its task's notification comes, a call of the main
+ * loop says it ended (`endedBy`), or a stop of the main loop no longer
+ * counts it in flight (`endedAtStop`). Every post of the window chat says
+ * them once they changed (`saysOfWindow`).
  */
 const backgroundRunning = new Map<string, WindowRunning>();
 
@@ -7567,6 +7584,30 @@ export function endedTasks(text: string): string[] {
     if (id) ended.push(id);
   }
   return ended;
+}
+
+/**
+ * The background tasks of `running` that a stop's own list of the work
+ * still in flight (`background_tasks`) leaves out, or names as ended: each
+ * ended, by any means.
+ * A kill from Claude Code's tasks dialog sends no notification and no call
+ * of the main loop's, so this is the first the window hears of it. None when
+ * the stop carries no list (a Claude Code before it).
+ */
+export function endedAtStop(
+  running: Iterable<string>,
+  tasks: unknown,
+): string[] {
+  if (!Array.isArray(tasks)) return [];
+  const live = new Set(
+    tasks.flatMap((task: unknown) => {
+      const one = task as { id?: unknown; status?: unknown } | null;
+      return typeof one?.id === "string" && !TASK_ENDED.has(String(one.status))
+        ? [one.id]
+        : [];
+    }),
+  );
+  return [...running].filter((id) => !live.has(id));
 }
 
 /** Keeps the background task a command the page moved runs on as, as its result names it. */
@@ -7871,7 +7912,7 @@ async function typePageWords($: Engine): Promise<void> {
     carryingOn = true;
     wokeAt = await $.clock.now();
     wakingFor = null;
-    await $.prompt.submit({ text: backgroundNote(moved, false) }).catch(() => {
+    await submitFromPage($, { text: backgroundNote(moved, false) }, () => {
       carryingOn = false;
       movedFromPage ??= moved;
       wokeAt = null;
@@ -7937,22 +7978,50 @@ async function typePageWords($: Engine): Promise<void> {
   typedFromPage = typed;
   wokeAt = await $.clock.now();
   wakingFor = null;
-  await $.prompt
-    .submit({
+  await submitFromPage(
+    $,
+    {
       text:
         moved === null
           ? typed.text
           : `${backgroundNote(moved, true)}\n\n${typed.text}`,
       asUser: true,
-    })
-    .catch(() => {
+    },
+    () => {
       pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
       if (during !== null && !replyDuring.has(message.key))
         replyDuring.set(message.key, during);
       if (typedFromPage === typed) typedFromPage = null;
       movedFromPage ??= moved;
       wokeAt = null;
-    });
+    },
+  );
+}
+
+/**
+ * Submits the prompt that types the page's words, or a move's note; when
+ * Claude Code does not take it, `putBack` gives back what it took. Refused
+ * that way, `$.prompt.submit` rejects; but a Stop pressed in the window (Esc,
+ * or Ctrl+C at an idle prompt) makes it resolve `{ drop }` for every prompt a
+ * plugin submits until the person types there, and so do the host's limits.
+ * Typed again at once, the words would be dropped again, so they wait as
+ * after a turn stopped in the window (`pageHeld`): words the person says
+ * since on the page try again, a turn they begin in the window lets them go,
+ * and the window says why.
+ */
+async function submitFromPage(
+  $: Engine,
+  prompt: { text: string; asUser?: true },
+  putBack: () => void,
+): Promise<void> {
+  const entered = await $.prompt.submit(prompt).catch(() => null);
+  if (entered !== null && entered.drop === undefined) return;
+  putBack();
+  if (entered === null) return;
+  pageHeld = new Set(pageWords.map((w) => w.key));
+  $.ui.toast(
+    `dc: Claude Code refused your words from the page: ${entered.drop}`,
+  );
 }
 
 /**
@@ -10374,10 +10443,19 @@ export const register: Register = (on) => {
   // reply the window ended there (`carryOnAtStop`).
   on("classic.Stop", async ($, e, next) => {
     const ran = await next(e);
-    carryOnAtStop(
-      ran,
-      (e as { last_assistant_message?: unknown }).last_assistant_message,
-    );
+    const stop = e as {
+      last_assistant_message?: unknown;
+      background_tasks?: unknown;
+    };
+    // A background command killed with no word to the main loop (from
+    // Claude Code's tasks dialog) leaves the list here, so the turn's end
+    // tells the page.
+    for (const id of endedAtStop(
+      backgroundRunning.keys(),
+      stop.background_tasks,
+    ))
+      backgroundRunning.delete(id);
+    carryOnAtStop(ran, stop.last_assistant_message);
     return handedAtStop($, ran);
   });
   on("classic.SubagentStop", async ($, e, next) =>

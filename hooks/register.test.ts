@@ -103,6 +103,7 @@ import {
   turnWords,
   runningOf,
   endedBy,
+  endedAtStop,
   endedTasks,
   pageCommandIn,
   commandOutcome,
@@ -1306,6 +1307,10 @@ function world(
     asUser: [] as boolean[],
     /** A prompt the plugin submits is refused. */
     submitRefused: false,
+    /** Why Claude Code drops a prompt the plugin submits, as it does while a Stop in the window stands: the call resolves `{ drop }`, never rejects. */
+    submitDropped: null as string | null,
+    /** The prompts Claude Code dropped, in order. */
+    dropped: [] as string[],
     toasts: [] as string[],
     draft: "",
     answer: waiting(0, null) as Status | "down" | "updating" | "refused",
@@ -1731,6 +1736,10 @@ function world(
   }));
   on("prompt.submit", async (_$, e) => {
     if (seen.submitRefused) throw new Error("refused here");
+    if (seen.submitDropped !== null) {
+      seen.dropped.push(e.text);
+      return { drop: seen.submitDropped };
+    }
     seen.submitted.push(e.text);
     seen.asUser.push(e.origin.kind === "plugin" && e.origin.asUser === true);
     return { text: e.text };
@@ -9573,6 +9582,76 @@ describe("a window chat's mirror", () => {
     expect(seen.submitted).toEqual(["and the docs", "and the tests"]);
   });
 
+  test("words Claude Code drops while a Stop in the window stands wait, and the person's next words from the page type them", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { hold: true });
+    const stopped = "the session was stopped and nobody has sent input since";
+    const docs = { key: "w1", text: "and the docs" };
+    const chat = JSON.stringify({ chat: "me-k3" });
+    // The window is idle, a Stop pressed in it standing: Claude Code drops
+    // the prompt that types the page's words, resolving rather than
+    // rejecting.
+    seen.submitDropped = stopped;
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [docs] } };
+    seen.held.pop()!(chat);
+    await flush(clock);
+    expect(seen.dropped).toEqual(["and the docs"]);
+    expect(seen.toasts.at(-1)).toBe(
+      `dc: Claude Code refused your words from the page: ${stopped}`,
+    );
+    // Told again of the same words, the window does not type them into the
+    // refusal again.
+    await clock.advance(WAITING_MS);
+    seen.held.pop()!(chat);
+    await flush(clock);
+    expect(seen.dropped).toEqual(["and the docs"]);
+    // The Stop stands no more, and the person says more on the page: the
+    // first message goes in, as its own turn, never left behind.
+    seen.submitDropped = null;
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [docs, { key: "w2", text: "and the tests" }] },
+    };
+    await clock.advance(WAITING_MS);
+    seen.held.pop()!(chat);
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    await $.turn.start({ text: "and the docs", turnId: "t1" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      begin: { from: "page", took: ["w1"] },
+    });
+  });
+
+  test("a wake Claude Code drops opens the held request again, so the page's words still reach the window", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { hold: true });
+    const before = seen.waitBodies.length;
+    seen.submitDropped =
+      "the session was stopped and nobody has sent input since";
+    seen.answer = waiting(1, "dc-m3");
+    seen.held.pop()!(JSON.stringify({ wake: "dc-s7", id: "dc-m3" }));
+    await flush(clock);
+    expect(seen.dropped).toEqual([WAKE()]);
+    expect(seen.toasts.at(-1)).toBe(
+      `dc: Claude Code refused the wake: ${seen.submitDropped}`,
+    );
+    // The next ask holds again at once, well inside the time a wake's turn
+    // is given to begin (`WAKE_SETTLE_MS`), and does not wake again.
+    await clock.advance(WAITING_MS);
+    await flush(clock);
+    expect(seen.waitBodies.length).toBe(before + 1);
+    expect(seen.dropped).toEqual([WAKE()]);
+    // The page's words reach it there.
+    seen.submitDropped = null;
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "and the docs" }] },
+    };
+    seen.held.pop()!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+  });
+
   /** The window's commands as `$.command.list()` gives them, and its answers to `$.command.run`: each run kept, then answered, refused, or held until the test lets it go. */
   const commands = (on: On) => {
     const ran: { command: string; args: string }[] = [];
@@ -11103,6 +11182,54 @@ describe("a window chat's mirror", () => {
     await $.turn.complete({ ...done("t1"), answer: "Both done." });
     await flush(clock);
     expect(parts(seen).at(-1)).toMatchObject({ turn: "t1", running: [] });
+  });
+
+  test("a background command killed from Claude Code's tasks dialog, which says nothing to the main loop, leaves the page's list at the next stop that no longer counts it in flight", async ($, on) => {
+    expect(
+      endedAtStop(
+        ["bg1", "bg2"],
+        [{ id: "bg2", type: "shell", status: "running", description: "x" }],
+      ),
+    ).toEqual(["bg1"]);
+    expect(endedAtStop(["bg1"], [])).toEqual(["bg1"]);
+    expect(endedAtStop(["bg1"], [{ id: "bg1", status: "killed" }])).toEqual([
+      "bg1",
+    ]);
+    // A Claude Code that sends no list ends nothing.
+    expect(endedAtStop(["bg1"], undefined)).toEqual([]);
+    on("classic.PostToolUse", async () => ({}));
+    on("classic.Stop", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "start both", turnId: "t1" });
+    for (const [id, command] of [
+      ["bg1", "pnpm dev"],
+      ["bg2", "pnpm test --watch"],
+    ] as const)
+      await $.classic.PostToolUse({
+        tool_name: "Bash",
+        tool_input: { command, run_in_background: true },
+        tool_response: { backgroundTaskId: id },
+        tool_use_id: `toolu_${id}`,
+      });
+    // The person killed the first from the tasks dialog: the stop counts
+    // only the second in flight, and the turn's end says so.
+    await $.classic.Stop({
+      stop_hook_active: false,
+      background_tasks: [
+        {
+          id: "bg2",
+          type: "shell",
+          status: "running",
+          description: "pnpm test --watch",
+        },
+      ],
+    } as never);
+    await $.turn.complete({ ...done("t1"), answer: "Both started." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      running: [{ id: "bg2", label: "pnpm test --watch" }],
+    });
   });
 
   test("with no words waiting, the note alone tells the model to carry on, kept on the page as the harness's line", async ($, on) => {

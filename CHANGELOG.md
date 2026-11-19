@@ -2,6 +2,14 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.74.0 — 2026-11-19
+
+- A window chat's page drops a background command that was killed with no word to Claude: one you kill from Claude Code's tasks dialog. Claude Code sends no notification for it, so the page kept saying it ran. At the end of each turn the window now checks Claude Code's own list of work still in flight and drops every command that list leaves out. A command killed while no turn runs stays until the next turn ends; the page's remove (×) on its line takes it off at once.
+
+## 0.73.0 — 2026-11-19
+
+- A window chat's message from the page no longer gets stuck after a Stop in the window. Once you press Esc there (or Ctrl+C at an idle prompt), Claude Code refuses every prompt a plugin types in until you type in that window yourself, and it says so by dropping the prompt, not by an error. The plugin took the dropped message as typed: that message and every one after it waited, the page saying "Waiting for the window", until some turn began. Now a dropped message waits as after a turn stopped in the window, and the window's toast names the refusal. The next words you send from the page, or a turn you begin in the window, send it again. A wake Claude Code drops no longer stops the window from hearing the page for two minutes either.
+
 ## 0.72.0 — 2026-11-19
 
 - The how-we-work skill says that a dispatch with no places answers with its plan, where each step would run, and sends nothing: show it to your person as it came, confirm it with its plan id and agreed only on their yes, and never confirm a plan they did not see. It needs the devcorner that asks, which comes before it.
