@@ -2,6 +2,11 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.75.0 — 2026-11-20
+
+- A window chat's page now says when the window holds your words after a Stop pressed there. Claude Code takes nothing a plugin types in until you type in that window yourself, and only the window's toast said so: the page showed "Waiting for the window" with no word of why. The window now tells devcorner while it holds them and when it lets go, and the page's line under the box says to type in the window.
+- Each message from the page that a window's turn took, or joined to the turn under way, now carries how long the window held it, so devcorner keeps how long it waited and how much of that was in the window.
+
 ## 0.74.0 — 2026-11-19
 
 - A window chat's page drops a background command that was killed with no word to Claude: one you kill from Claude Code's tasks dialog. Claude Code sends no notification for it, so the page kept saying it ran. At the end of each turn the window now checks Claude Code's own list of work still in flight and drops every command that list leaves out. A command killed while no turn runs stays until the next turn ends; the page's remove (×) on its line takes it off at once.

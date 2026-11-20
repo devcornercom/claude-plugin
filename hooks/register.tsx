@@ -5410,6 +5410,8 @@ interface Mirror {
   runningSent: string | null;
   /** The last turn whose beginning devcorner took (its post answered), which a terminate from the page stops; null before any. */
   taken: string | null;
+  /** Whether a Stop in the window held the page's words as devcorner last took a post (`tellHolds`); null before any. */
+  holdsSent: boolean | null;
   batch?: Timer;
   /**
    * The posts in flight, one after another: each waits for the one before,
@@ -6283,6 +6285,8 @@ interface MirrorPayload {
   parts: MirrorPart[];
   /** The keys of the page's words joined to the turn since the post before (`Mirror.join`); empty for none. */
   join: string[];
+  /** How long the window held each of the page's messages its beginning took or it joined (`heldFor`), by key; empty for none. */
+  held: Record<string, number>;
   /**
    * The turn's number of its parts (1, 2, 3...), the last one given when it
    * carries none: devcorner keeps parts once by it, so a post sent again
@@ -6330,6 +6334,8 @@ async function mirrorPost(
     end?: { text: string; outcome: "done" | "stopped" | "failed" };
     whole?: MirrorPayload;
     retry?: boolean;
+    /** A look only to say the hold (`tellHolds`): none goes once a post before it said it. */
+    holds?: boolean;
   },
 ): Promise<void> {
   const m = mirror;
@@ -6343,13 +6349,16 @@ async function mirrorPost(
     const turn = what.look ? null : what.turn !== undefined ? what.turn : m.key;
     const parts = turn === null ? [] : m.parts.splice(0, MIRROR_POST_PARTS);
     if (parts.length > 0) m.posted += 1;
+    const begin = turn === null ? null : m.begin;
+    const join = turn === null ? [] : m.join.splice(0);
     const payload: MirrorPayload = {
       thread: m.thread,
       turn,
       of: turn === null ? null : m.turn,
-      begin: turn === null ? null : m.begin,
+      begin,
       parts,
-      join: turn === null ? [] : m.join.splice(0),
+      join,
+      held: heldFor([...(begin?.took ?? []), ...join]),
       post: turn === null ? 0 : m.posted,
       // An end goes with the turn's last parts.
       end:
@@ -6388,6 +6397,7 @@ async function mirrorPost(
     if (!what.retry && !fresh && m.unsent.length > 0) return;
     if (!(await sendUnsent($, m, what.retry === true))) return;
     if (ending.length > 0) return;
+    if (what.holds && m.holdsSent === (pageHeld !== null)) return;
     let payload = build();
     if (!carries(payload)) {
       await sendMirror($, m, payload);
@@ -6528,15 +6538,20 @@ async function postMirror(
   if (!held) return false;
   try {
     const says = await saysOfWindow($, m, payload);
+    const holds = pageHeld !== null;
     const res = await postEvent($, held.token, {
       hook_event_name: "ChatParts",
       thread: payload.thread,
       turn: payload.turn,
       ...(payload.begin ? { begin: payload.begin } : {}),
       ...(payload.join.length > 0 ? { join: payload.join } : {}),
+      ...(Object.keys(payload.held).length > 0 ? { held: payload.held } : {}),
       parts: payload.parts,
       post: payload.post,
       ...(payload.end ? { end: payload.end } : {}),
+      // Every post says whether a Stop in the window holds the page's words,
+      // so the page can tell its person to type there (`tellHolds`).
+      holds,
       ...says,
     });
     const body = JSON.parse(res.text) as {
@@ -6568,6 +6583,7 @@ async function postMirror(
       return true;
     }
     if (res.status !== 200) return false;
+    m.holdsSent = holds;
     if (says.commands !== undefined)
       m.commandsSent = JSON.stringify(says.commands);
     if (says.running !== undefined)
@@ -6591,11 +6607,15 @@ async function postMirror(
       await backgroundFromPage($, payload.of, body.background);
     if (Array.isArray(body.answers)) takeAnswers(body.answers);
     if (Array.isArray(body.words)) {
+      // Read first, so nothing comes between the words and what they set.
+      const now = await $.clock.now();
       // One the window took alone, or joined to its turn, is never taken
       // again, though an answer sent before devcorner heard of it names it.
       pageWords = pageWordsOf(body.words).filter(
         (w) => !takenAlone.has(w.key) && !joinedFromPage.has(w.key),
       );
+      for (const w of pageWords)
+        if (!pageHeardAt.has(w.key)) pageHeardAt.set(w.key, now);
       // devcorner answers a turn's end once it kept the reply: the words it
       // names were said before the person could read it whole.
       if (payload.end !== null && payload.of !== null)
@@ -6621,10 +6641,23 @@ async function postMirror(
       }
       if (pageWords.length > 0) void typePageWords($);
     }
+    tellHolds($);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Tells devcorner, with a look, that a Stop in the window began or stopped
+ * holding the page's words (`pageHeld`), when no post said it yet: the answer
+ * that sets the hold comes after its own post, and a prompt Claude Code
+ * drops sets it with no post at all.
+ */
+function tellHolds($: Engine): void {
+  const m = mirror;
+  if (m === null || m.holdsSent === (pageHeld !== null)) return;
+  void mirrorPost($, { look: true, holds: true }).catch(() => undefined);
 }
 
 /** The words of text blocks written one after another, as one step's or one reply's. */
@@ -6880,6 +6913,8 @@ function leaveMirror(): void {
   takenAlone.clear();
   joinedFromPage.clear();
   pageTextReady.clear();
+  pageHeardAt.clear();
+  windowHeld.clear();
   replyDuring.clear();
   waitedAtStart = new Set();
   pageHeld = null;
@@ -8022,6 +8057,7 @@ async function submitFromPage(
   $.ui.toast(
     `dc: Claude Code refused your words from the page: ${entered.drop}`,
   );
+  tellHolds($);
 }
 
 /**
@@ -8089,6 +8125,39 @@ const joinedFromPage = new Set<string>();
 
 /** The page's messages with files, fetched while a turn runs so they are ready to join it, by key: their words with the files' paths (`pageText`). */
 const pageTextReady = new Map<string, string>();
+
+/**
+ * When each of the page's messages first reached this window, by key, on its
+ * own clock: the answer that first named it. Its turn's beginning, or the
+ * post that joins it, tells devcorner how long the window held it
+ * (`windowHeld`), so a message that waited can be measured apart from its way
+ * here.
+ */
+const pageHeardAt = new Map<string, number>();
+/** How long the window held each of the page's messages a turn took or joined, by key, until a post tells devcorner (`heldFor`). */
+const windowHeld = new Map<string, number>();
+
+/** Notes the page's messages a turn took or joined now: how long the window held each since it reached it. */
+function heldUntil(keys: readonly string[], now: number): void {
+  for (const key of keys) {
+    const heard = pageHeardAt.get(key);
+    if (heard === undefined) continue;
+    pageHeardAt.delete(key);
+    windowHeld.set(key, Math.max(0, Math.round(now - heard)));
+  }
+}
+
+/** How long the window held each of `keys` (`heldUntil`), for the post that names them, each given once. */
+function heldFor(keys: readonly string[]): Record<string, number> {
+  const held: Record<string, number> = {};
+  for (const key of keys) {
+    const ms = windowHeld.get(key);
+    if (ms === undefined) continue;
+    windowHeld.delete(key);
+    held[key] = ms;
+  }
+  return held;
+}
 /** The keys of the messages whose files `readyPageFiles` is fetching. */
 const readying = new Set<string>();
 
@@ -8178,9 +8247,11 @@ async function joinPageWords<
   // A post that fails is kept and sent again by the mirror itself; the words
   // then join as the last answer left them.
   await mirrorPost($, {}).catch(() => undefined);
+  const now = await $.clock.now();
   const joining = ready();
   if (joining.length === 0) return ran;
   const keys = new Set(joining.map((one) => one.key));
+  heldUntil([...keys], now);
   pageWords = pageWords.filter((w) => !keys.has(w.key));
   for (const key of keys) {
     joinedFromPage.add(key);
@@ -8297,6 +8368,7 @@ function commandTurn(
     begin: { text: line, from: "page", took: [key], images: [] },
     parts: [],
     join: [],
+    held: heldFor([key]),
     post: 0,
     end: { text: end.text, tools: [], steps: [], outcome: end.outcome },
     tries: 0,
@@ -8340,6 +8412,7 @@ const SLASH_WORDS =
  */
 async function runPageCommand($: Engine, words: PageWords): Promise<void> {
   takenAlone.add(words.key);
+  heldUntil([words.key], await $.clock.now());
   const command = words.command;
   const line =
     command === null
@@ -8462,6 +8535,7 @@ async function mirrorOpened(
     commandsSent: commands === undefined ? null : JSON.stringify(commands),
     runningSent: null,
     taken: null,
+    holdsSent: null,
     sending: Promise.resolve(),
     unsent: [],
   };
@@ -10718,6 +10792,7 @@ export const register: Register = (on) => {
     // session's message) is left out too, and the chat keeps its short line.
     const page = typedFromPage;
     typedFromPage = null;
+    if (page !== null) heldUntil(page.keys, await $.clock.now());
     // A background command's end begins a turn with its notification: it
     // runs no more, which this turn's beginning tells the page.
     for (const id of endedTasks(e.text)) backgroundRunning.delete(id);

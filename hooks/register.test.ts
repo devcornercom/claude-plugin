@@ -9623,6 +9623,41 @@ describe("a window chat's mirror", () => {
     });
   });
 
+  test("the window tells devcorner while a Stop there holds the page's words, and how long it held each message its turn took", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { hold: true });
+    const docs = { key: "w1", text: "and the docs" };
+    const chat = JSON.stringify({ chat: "me-k3" });
+    seen.submitDropped =
+      "the session was stopped and nobody has sent input since";
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [docs] } };
+    seen.held.pop()!(chat);
+    await flush(clock);
+    expect(seen.dropped).toEqual(["and the docs"]);
+    // No post of its own follows a drop: a look says the window holds them.
+    expect(parts(seen).at(-1)).toMatchObject({ turn: null, holds: true });
+    const said = parts(seen).length;
+    // The person says more on the page once the Stop stands no more: the
+    // window lets go, says so, and types the first message.
+    seen.submitDropped = null;
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [docs, { key: "w2", text: "and the tests" }] },
+    };
+    await clock.advance(WAITING_MS);
+    seen.held.pop()!(chat);
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    expect(parts(seen).slice(said).at(-1)).toMatchObject({ holds: false });
+    // Its turn's beginning says how long the window held it since it first
+    // had it, on its own clock.
+    await $.turn.start({ text: "and the docs", turnId: "t1" });
+    await flush(clock);
+    const begun = parts(seen).at(-1) as { held?: Record<string, number> };
+    expect(begun).toMatchObject({ turn: "t1", begin: { took: ["w1"] } });
+    expect(Object.keys(begun.held ?? {})).toEqual(["w1"]);
+    expect(begun.held!.w1).toBeGreaterThanOrEqual(WAITING_MS);
+  });
+
   test("a wake Claude Code drops opens the held request again, so the page's words still reach the window", async ($, on) => {
     const { clock, seen } = await mirrored($, on, { hold: true });
     const before = seen.waitBodies.length;
