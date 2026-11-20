@@ -37,6 +37,14 @@ const laptop = atom({ plugin: "devcorner", key: "laptop" } as const, null);
 const EVERY_MS = 30_000;
 const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
 
+/**
+ * This plugin's version, its manifest's (test/plugin-version.test.ts holds
+ * the two the same): each Status says it until devcorner says it back,
+ * so devcorner shows which windows run a plugin behind the one
+ * on disk, and a reload's new copy confirms the version it loaded.
+ */
+export const PLUGIN_VERSION = "0.78.0";
+
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
 /** And while it waits on nobody: its person may still write to it. */
@@ -1649,6 +1657,8 @@ export function sessionsText(s: Status): string {
     const facts = [
       ...otherFacts(o),
       ...(o.ticket ? [`on ${o.ticket.id}`] : []),
+      // The plugin its window runs; a devcorner before it says none.
+      ...(o.plugin ? [oneLine(o.plugin)] : []),
       ...(o.reach ? [oneLine(o.reach)] : []),
     ].join(" · ");
     // Where it runs (dc-t627): its cloud routine, else its conversation's
@@ -1676,7 +1686,7 @@ export function sessionsText(s: Status): string {
 function windowLines(windows: StatusWindow[]): string[] {
   const width = widest(windows.map((w) => w.id));
   return windows.map((w, i) => {
-    const facts = [w.repo, w.state, w.reach]
+    const facts = [w.repo, w.state, w.plugin, w.reach]
       .filter((fact) => fact)
       .map((fact) => oneLine(fact!))
       .join(" · ");
@@ -1769,6 +1779,7 @@ export type Held =
   | { kind: "claim" }
   | { kind: "chat"; chat: string }
   | { kind: "launch"; launch: string }
+  | { kind: "reload" }
   | { kind: "empty" }
   | { kind: "failed" }
   | { kind: "updating"; after: number };
@@ -1795,6 +1806,9 @@ export function readHeld(text: string): Held {
     // the launch's number alone, taken with LaunchTake.
     if (typeof o.launch === "string")
       return { kind: "launch", launch: o.launch };
+    // Its person asked this window to reload its plugin: a Status
+    // says the ask, which `reloadWhenIdle` takes.
+    if (typeof o.reload === "string") return { kind: "reload" };
     return { kind: "empty" };
   } catch {
     return { kind: "failed" };
@@ -4018,6 +4032,250 @@ async function claimFromCall(
   }
 }
 
+// Reloading onto the plugin on disk. After a promotion a window
+// keeps the plugin it loaded until Claude Code's reload runs in it. So once
+// the window is idle (`reloadIdle`) it reloads by itself when its plugin is
+// behind: the plugin's folder holds a newer version than the one loaded (a
+// checkout pulled), or devcorner names a newer one than both
+// (`Status.shippedPlugin`), which it first asks Claude Code to fetch with the
+// marketplace's update. Its person may also ask it to reload now
+// (`Status.reload`, when it was asked), brought at once by the held
+// request's `{reload}`. Claude Code tears this copy down, whose `await`
+// never returns, and loads the new one, which says its version with its
+// next Status. What a reload was for is kept in the plugin's store by
+// conversation before it runs, so the new copy confirms the ask its load
+// answers, and a version that did not load is never tried again; what is
+// kept of a conversation long over is let go of as a window starts
+// (`sweepReloadKept`).
+
+/** The conversation whose Status devcorner said this plugin's version back for, since this window's last start. */
+let pluginTaken: string | null = null;
+
+/** The ask this copy tried to reload for and could not: never tried again. */
+let reloadTried: number | null = null;
+
+/** A reload's check under way, so two Status reads never run two. */
+let reloadChecking = false;
+
+/** The marketplace this plugin is installed from, whose update fetches a newer version. */
+const MARKETPLACE_UPDATE = "marketplace update devcorner";
+
+const reloadKey = (session: string) => `reload:${session}`;
+const BEHIND_PREFIX = "reloadBehind:";
+const behindKey = (session: string) => `${BEHIND_PREFIX}${session}`;
+
+/** How long a conversation's tried version is kept: past it, the conversation is long over. */
+const BEHIND_KEPT_MS = 7 * 24 * 60 * 60_000;
+
+/** The version a conversation's last reload by itself was for (`behindKey`), as kept with when; null for none. */
+function behindTried(kept: unknown): { version: string; at: number } | null {
+  const o = kept as { version?: unknown; at?: unknown } | null;
+  return o !== null &&
+    typeof o === "object" &&
+    isVersion(o.version) &&
+    typeof o.at === "number"
+    ? { version: o.version, at: o.at }
+    : null;
+}
+
+/**
+ * Lets go of the versions tried by conversations not heard for
+ * `BEHIND_KEPT_MS`: one is kept only while its target stays newer than the
+ * plugin loaded, which a version Claude Code never fetched does for good.
+ */
+async function sweepReloadKept($: Engine): Promise<void> {
+  try {
+    const now = await $.clock.now();
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(BEHIND_PREFIX)) continue;
+      const tried = behindTried(await $.store.get(key));
+      if (tried === null || now - tried.at > BEHIND_KEPT_MS)
+        await $.store.delete(key);
+    }
+  } catch {
+    // Kept for the next start: nothing depends on the sweep.
+  }
+}
+
+/** How long the folder's version read last stands, so an idle window's Status every few seconds reads the manifest once a minute at most. */
+const DISK_READ_MS = 60_000;
+
+/** The folder's version as last read (`versionOnDisk`), and when. */
+let diskRead: { at: number; version: string | null } | null = null;
+
+/** A plugin version as a manifest says it, "0.77.0". */
+const isVersion = (v: unknown): v is string =>
+  typeof v === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(v);
+
+/** Orders two plugin versions: positive when `a` is newer; null when either is not one. */
+function versionOrder(a: unknown, b: unknown): number | null {
+  const parts = (v: unknown) =>
+    isVersion(v) ? v.split(".").map(Number) : null;
+  const x = parts(a);
+  const y = parts(b);
+  if (x === null || y === null) return null;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return 0;
+}
+
+/** Whether `version` is newer than the plugin this copy loaded. */
+const newerThanLoaded = (version: string | null) =>
+  (versionOrder(version, PLUGIN_VERSION) ?? 0) > 0;
+
+/**
+ * The version the plugin's folder (`$.plugin.root`) holds, its manifest's,
+ * read again once `DISK_READ_MS` passed; null where it cannot be read.
+ */
+async function versionOnDisk($: Engine): Promise<string | null> {
+  const now = await $.clock.now();
+  if (diskRead !== null && now - diskRead.at < DISK_READ_MS)
+    return diskRead.version;
+  const version = await readVersionOnDisk($);
+  diskRead = { at: now, version };
+  return version;
+}
+
+async function readVersionOnDisk($: Engine): Promise<string | null> {
+  try {
+    const root: unknown = $.plugin.root;
+    if (typeof root !== "string" || root === "") return null;
+    const text = await $.fs.read(`${root}/.claude-plugin/plugin.json`);
+    const version = (JSON.parse(String(text)) as { version?: unknown }).version;
+    return isVersion(version) ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Idle, as a wake waits for: no turn, no background command open, nothing
+ * typed in the prompt box, and nothing under way that a reload would cut
+ * off: a wake or the page's words submitted whose turn has not begun, a
+ * command from the page, words of the page waiting to be typed, or an ask
+ * of a window chat still open.
+ */
+async function reloadIdle($: Engine): Promise<boolean> {
+  if (
+    (await read($, turn)) !== null ||
+    backgroundRunning.size > 0 ||
+    wokeAt !== null ||
+    typedFromPage !== null ||
+    commandFromPage !== null ||
+    pageWords.length > 0 ||
+    asks.size > 0
+  )
+    return false;
+  const draft = await $.prompt.read().catch(() => ({ text: "x" }));
+  return draft.text.trim() === "";
+}
+
+/** The reload ask this conversation's last copy reloaded for, kept in the plugin's store; null for none. */
+async function reloadedFor($: Engine, session: string): Promise<number | null> {
+  const kept = await $.store.get(reloadKey(session)).catch(() => undefined);
+  return typeof kept === "number" ? kept : null;
+}
+
+/**
+ * devcorner took this copy's version and the reload ask its load answered:
+ * the ask is forgotten, and the person told the window runs the plugin it
+ * loaded, unless devcorner still says it waits (a newer ask, which the next
+ * idle moment takes).
+ */
+async function reloadConfirmed(
+  $: Engine,
+  session: string,
+  s: Status,
+): Promise<void> {
+  const answered = await reloadedFor($, session);
+  await $.store.delete(reloadKey(session)).catch(() => {});
+  if (answered !== null && typeof s.reload !== "number")
+    $.ui.toast(
+      `dc: reloaded devcorner's plugin, now ${PLUGIN_VERSION}, as asked`,
+    );
+}
+
+/**
+ * After a Status, once the window is idle and the hook or hold that read it
+ * has returned: reloads when its person asked (an ask tried once a
+ * conversation), or when its plugin is behind (each newer version tried
+ * once a conversation). A version devcorner names that the folder does not
+ * hold is fetched first; one Claude Code would not fetch is said with the
+ * command to run, and no reload follows unless asked. A reload refused is
+ * said with what to type.
+ */
+function reloadWhenIdle($: Engine, s: Status): void {
+  const asked = typeof s.reload === "number" ? s.reload : null;
+  const named = typeof s.shippedPlugin === "string" ? s.shippedPlugin : null;
+  if (asked === null && named === null) return;
+  $.clock.after(0, async () => {
+    if (reloadChecking) return;
+    reloadChecking = true;
+    let session: string | null = null;
+    try {
+      // A turn's end reads Status again, and takes it then.
+      if (!(await reloadIdle($))) return;
+      session = await $.session.id();
+      const ask =
+        asked !== null &&
+        asked !== reloadTried &&
+        (await reloadedFor($, session)) !== asked
+          ? asked
+          : null;
+      const disk = await versionOnDisk($);
+      const target = [disk, named]
+        .filter(newerThanLoaded)
+        .sort((a, b) => versionOrder(b, a)!)[0];
+      const kept = await $.store.get(behindKey(session)).catch(() => null);
+      const tried = behindTried(kept)?.version ?? null;
+      if (target === undefined && kept != null)
+        await $.store.delete(behindKey(session)).catch(() => {});
+      const behind = target !== undefined && tried !== target ? target : null;
+      if (ask === null && behind === null) return;
+      const markTried = async (version: string) =>
+        $.store.set(behindKey(session!), { version, at: await $.clock.now() });
+      // Only devcorner names it: the folder needs it fetched first.
+      if (behind !== null && behind !== disk) {
+        try {
+          await $.command.run({ command: "plugin", args: MARKETPLACE_UPDATE });
+        } catch (error) {
+          $.ui.toast(
+            `dc: devcorner's plugin ${behind} is out, and Claude Code did not fetch it here (${commandRefused(error)}): run /plugin ${MARKETPLACE_UPDATE}, then /reload-plugins`,
+          );
+          if (ask === null) {
+            await markTried(behind);
+            return;
+          }
+        }
+      }
+      // The fetch takes seconds: a turn, a wake or words begun meanwhile are
+      // never cut off, and the next idle Status tries again.
+      if (!(await reloadIdle($))) return;
+      if (behind !== null) await markTried(behind);
+      if (ask !== null) {
+        reloadTried = ask;
+        await $.store.set(reloadKey(session), ask);
+      }
+      await $.command.run({ command: "reload-plugins" });
+      // Claude Code tears this copy down, so this runs only where the reload
+      // left it loaded (it reloads only modules that changed on disk): it
+      // reads Status now, which says its version and the ask as a new copy's
+      // first would, so the ask never waits on a copy that never comes, nor
+      // on an idle window's next event.
+      pluginTaken = null;
+      await refresh($, true);
+    } catch (error) {
+      // Not reloaded: no new copy answers this ask.
+      if (session !== null)
+        await $.store.delete(reloadKey(session)).catch(() => {});
+      $.ui.toast(
+        `dc: this window could not reload devcorner's plugin (${commandRefused(error)}): type /reload-plugins`,
+      );
+    } finally {
+      reloadChecking = false;
+    }
+  });
+}
+
 /**
  * What a Status read asks devcorner for besides the row's own, which it
  * reads only when asked: the repo's picture for /dc and /dc waits (dc-t218,
@@ -4070,6 +4328,10 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     // checks it and ties the window to it when that had drifted.
     const stated = await claimOf($);
     const guessed = stated !== null && takenFromCall(sessionId, stated);
+    // This plugin's version, said until devcorner says it back for this
+    // conversation, and the reload ask this copy's load answers.
+    const saysPlugin = pluginTaken !== sessionId;
+    const reloaded = saysPlugin ? await reloadedFor($, sessionId) : null;
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -4084,6 +4346,8 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
         ...(moved ? { branch } : {}),
         ...(stated !== null ? { claim: stated } : {}),
         ...(guessed ? { claim_from: "call" } : {}),
+        ...(saysPlugin ? { plugin: PLUGIN_VERSION } : {}),
+        ...(reloaded !== null ? { reloaded } : {}),
         ...(asks.picture ? { expanded: true } : {}),
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
@@ -4130,6 +4394,10 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     // again, as when a store could not take it, or devcorner is older.
     if (moved && body.branch === branch) branchTaken = { key, branch };
     if (stated !== null) await heardClaim($, stated, body);
+    if (saysPlugin && body.plugin === PLUGIN_VERSION) {
+      pluginTaken = sessionId;
+      if (reloaded !== null) await reloadConfirmed($, sessionId, body);
+    }
     return {
       status: { ...body, repo: body.repo ?? repo },
       down: false,
@@ -4170,6 +4438,7 @@ async function refresh(
     await markWaiting($, pendingOf(got.status), seq);
     const s = got.status;
     if (s) {
+      reloadWhenIdle($, s);
       await update($, status, () => s);
       // A token that works: whatever the row said of signing in is over, and
       // a sign-in under way here, whose token another conversation took,
@@ -4329,10 +4598,12 @@ async function hold($: Engine): Promise<void> {
         $.ui.toast(noticeToast(held.id));
         continue;
       }
-      if (held.kind === "claim") {
+      if (held.kind === "claim" || held.kind === "reload") {
         // devcorner asks for the session this window runs as (dc-t588): a
         // fresh Status states it, and the row shows what it works as now.
-        // Held again at once.
+        // Or its person asked it to reload its plugin, which that
+        // Status says and the window does while idle. Held again at once,
+        // unless the reload tore this copy down.
         quick = 0;
         await refresh($, true);
         if (mine !== epoch) return;
@@ -8326,6 +8597,8 @@ const PAGE_BUILTINS: ReadonlySet<string> = new Set([
   "context",
   "model",
   "effort",
+  "reload-plugins",
+  "restart",
 ]);
 
 /**
@@ -8460,15 +8733,169 @@ async function runPageCommand($: Engine, words: PageWords): Promise<void> {
       ? words.text.trim()
       : slashLine(command.name, command.args);
   const from = mirror;
+  // A reload or a restart from the page is said before it runs: this copy
+  // never sees it end, and the new one rejoins the chat.
+  const reload =
+    command !== null && RELOADS_FROM_PAGE.has(command.name)
+      ? await reloadFromPage($, command.name)
+      : null;
   const end =
     command === null
       ? { text: SLASH_WORDS, outcome: "failed" as const }
-      : await runInWindow($, words.key, command, line);
+      : (reload?.end ?? (await runInWindow($, words.key, command, line)));
   // Its prompt was submitted: the turn it begins takes the line.
   if (end === null) return;
   if (mirror !== null && mirror === from)
     await mirrorPost($, { whole: commandTurn(mirror, words.key, line, end) });
+  if (reload !== null && reload.run !== null) {
+    // Only once devcorner heard the line: a new copy would find it waiting
+    // and reload or restart again.
+    if (mirror !== null && mirror === from && mirror.unsent.length === 0) {
+      if (reload.run === "restart") restartNow($, mirror.thread, line);
+      else reloadNow($, `the page's ${line}`);
+    } else
+      $.ui.toast(
+        `dc: devcorner did not hear the window's answer to the page's ${line}, so nothing was reloaded: send it again, or type /reload-plugins`,
+      );
+    return;
+  }
   void typePageWords($);
+}
+
+/**
+ * The commands a window chat's page sends that reload the window's plugins:
+ * `/reload-plugins`, and `/restart`, which a plugin cannot run: a
+ * background session is restarted as itself by another launcher of its
+ * machine (`restartNow`), and any other window reloads its plugins.
+ * src/hub/laptop-commands.ts offers them among `PAGE_BUILTINS`.
+ */
+const RELOADS_FROM_PAGE: ReadonlySet<string> = new Set([
+  "reload-plugins",
+  "restart",
+]);
+
+/**
+ * What the page is told of a reload or a restart it sent, before it runs,
+ * and which runs once devcorner heard that: for a background session's
+ * `/restart`, that another launcher of the machine restarts it as itself
+ * (`restart`); otherwise that the window reloads its plugins and rejoins the
+ * chat (`reload`), and for `/restart` that a restart of the whole session is
+ * typed in the window; or, where Claude Code here has no reload, what to
+ * type in the window instead (none).
+ */
+async function reloadFromPage(
+  $: Engine,
+  name: string,
+): Promise<{
+  end: { text: string; outcome: "done" | "failed" };
+  run: "reload" | "restart" | null;
+}> {
+  const listed = await $.command.list().catch(() => null);
+  if (!listed?.some((one) => one.name === "reload-plugins"))
+    return {
+      end: {
+        text: `Not run in the window: Claude Code there offers no /reload-plugins. Type /${name === "restart" ? "restart" : "reload-plugins"} in the window.`,
+        outcome: "failed",
+      },
+      run: null,
+    };
+  const reloading = `Reloading the window's plugins: devcorner's loads the version on disk (it ran ${PLUGIN_VERSION}), and the window rejoins this chat on it.`;
+  if (name !== "restart")
+    return { end: { text: reloading, outcome: "done" }, run: "reload" };
+  if ((await backgroundHere($)) === true)
+    return {
+      end: {
+        text: "Restarting this background session as itself: another devcorner window or the launcher of this machine runs claude respawn once it is quiet, and it rejoins this chat with its whole context on the plugin on disk. Where none can, the window reloads its plugins instead.",
+        outcome: "done",
+      },
+      run: "restart",
+    };
+  return {
+    end: {
+      text: `${reloading} A plugin cannot restart its own session: to restart it whole, type /restart in the window.`,
+      outcome: "done",
+    },
+    run: "reload",
+  };
+}
+
+/**
+ * How long a window waits after devcorner opened its restart before it takes
+ * the restart for not done: the time a launcher has to take it
+ * (`LAUNCH_TAKE_MS`) and to run `claude respawn` (`LAUNCH_START_MS`), and a
+ * margin.
+ */
+export const RESTART_WAIT_MS = 75_000;
+
+/**
+ * Asks devcorner to restart this background session as itself
+ * (`ChatRestart`): a revive of its own chat, which another launcher of the
+ * machine runs with `claude respawn` (`reviveLaunch`), never this window,
+ * whose process the restart ends. Where no launcher can take it, or
+ * devcorner refuses, the window reloads its plugins instead, and a toast
+ * says why and the command to run.
+ */
+function restartNow($: Engine, thread: string, line: string): void {
+  $.clock.after(0, async () => {
+    const asked = await postAsYou(
+      $,
+      { hook_event_name: "ChatRestart", thread },
+      { command: `the page's ${line}`, nothing: "nothing was restarted" },
+    );
+    const body = (typeof asked === "string" ? {} : (asked.body ?? {})) as {
+      state?: unknown;
+      words?: unknown;
+      problem?: unknown;
+      error?: unknown;
+    };
+    if (
+      typeof asked !== "string" &&
+      asked.status === 200 &&
+      body.state === "opening"
+    ) {
+      // A restart ends this process, so a window still running once the
+      // launchers had their time was not restarted: no launcher took it, the
+      // session was busy, or `claude respawn` failed. The chat's page says
+      // which.
+      $.clock.after(RESTART_WAIT_MS, async () => {
+        if (mirror === null || mirror.thread !== thread) return;
+        $.ui.toast(
+          `dc: devcorner did not restart this session after the page's ${line}: its chat's page says why, so the window reloads its plugins instead: run claude respawn ${await $.session.id()} on the laptop to restart it whole`,
+        );
+        reloadNow($, `the page's ${line}`);
+      });
+      return;
+    }
+    const why =
+      typeof asked === "string"
+        ? asked
+        : body.problem === "asleep" || body.problem === "no-launcher"
+          ? "no other devcorner window or launcher of this machine was heard lately"
+          : ([body.error, body.words].find(
+              (one): one is string => typeof one === "string" && one !== "",
+            ) ?? `devcorner answered ${asked.status}`);
+    $.ui.toast(
+      `dc: the page's ${line} found no launcher here to restart this session (${why}), so the window reloads its plugins instead: run claude respawn ${await $.session.id()} on the laptop to restart it whole`,
+    );
+    reloadNow($, `the page's ${line}`);
+  });
+}
+
+/**
+ * Runs Claude Code's reload once the hook that asked has returned: this
+ * copy is torn down and never sees it end. One Claude Code refuses is said
+ * in the window, with what to type.
+ */
+function reloadNow($: Engine, asked: string): void {
+  $.clock.after(0, async () => {
+    try {
+      await $.command.run({ command: "reload-plugins" });
+    } catch (error) {
+      $.ui.toast(
+        `dc: ${asked} did not run (${commandRefused(error)}): type /reload-plugins`,
+      );
+    }
+  });
 }
 
 /**
@@ -8871,9 +9298,10 @@ async function takeLaunch($: Engine, launch: string): Promise<void> {
     name?: unknown;
     prompt?: unknown;
     respawn?: unknown;
+    restart?: unknown;
   };
   if (typeof body.respawn === "string" && body.respawn !== "") {
-    await reviveLaunch($, launch, body.respawn);
+    await reviveLaunch($, launch, body.respawn, body.restart === true);
     return;
   }
   // A launch's prompt joins its chat: one with none (a revive a devcorner
@@ -8970,18 +9398,41 @@ async function parkedHere(
   $: Engine,
   id: string,
 ): Promise<"parked" | "runs" | "unknown"> {
-  const run = (argv: string[]) =>
-    $.process.run(argv, { timeoutMs: AGENTS_READ_MS }).catch(() => null);
-  const listed = await run(["claude", "agents", "--json", "--all"]);
-  const agents =
-    listed === null || listed.exitCode !== 0
-      ? null
-      : agentsListed(listed.stdout);
+  const agents = await agentsHere($);
   if (agents === null) return "unknown";
   const life = listedLife(agents, id);
   if (typeof life === "string") return life;
-  const alive = await run(["kill", "-0", String(life.pid)]);
+  const alive = await $.process
+    .run(["kill", "-0", String(life.pid)], { timeoutMs: AGENTS_READ_MS })
+    .catch(() => null);
   return alive === null ? "unknown" : alive.exitCode === 0 ? "runs" : "parked";
+}
+
+/** What `claude agents --json --all` lists on this machine; null when it could not be read. */
+async function agentsHere($: Engine): Promise<ListedAgent[] | null> {
+  const listed = await $.process
+    .run(["claude", "agents", "--json", "--all"], { timeoutMs: AGENTS_READ_MS })
+    .catch(() => null);
+  return listed === null || listed.exitCode !== 0
+    ? null
+    : agentsListed(listed.stdout);
+}
+
+/** The status `claude agents --json` gives a background session in a turn, as 2.1.327 lists one. */
+const BUSY_STATUS = "busy";
+
+/**
+ * Whether background session `id` (the one whose id begins with it) is in a
+ * turn now, as `claude agents --json --all` lists it: a restart its own
+ * window asked waits for a quiet moment, so one in a turn is left as it is.
+ */
+function listedBusy(agents: ListedAgent[], id: string): boolean {
+  return (
+    agents.find(
+      (one) =>
+        typeof one.sessionId === "string" && one.sessionId.startsWith(id),
+    )?.status === BUSY_STATUS
+  );
 }
 
 /** A Claude Code session id as devcorner names one to revive: hex digits alone, never a word `claude respawn` would read as a flag. */
@@ -8993,14 +9444,27 @@ const SESSION_ID = /^[0-9a-f]{6,40}$/i;
  * went is said to devcorner, as a launch's is. A session whose process
  * still runs is left as it is, said as `running`, whose fix on devcorner's
  * page is `claude attach <id>`; one whose state could not be read is left
- * too, said as `failed`.
+ * too, said as `failed`. A `restart`, which the session's own window asked
+ * at a quiet moment, restarts it while it runs, unless it is in a turn by
+ * now, said as `running` too.
  */
 async function reviveLaunch(
   $: Engine,
   launch: string,
   id: string,
+  restart: boolean,
 ): Promise<void> {
-  const parked = SESSION_ID.test(id) ? await parkedHere($, id) : null;
+  // A restart reads a session in no turn as `parked`: one it may restart.
+  const quiet = async (): Promise<"parked" | "runs" | "unknown"> => {
+    const agents = await agentsHere($);
+    if (agents === null) return "unknown";
+    return listedBusy(agents, id) ? "runs" : "parked";
+  };
+  const parked = !SESSION_ID.test(id)
+    ? null
+    : restart
+      ? await quiet()
+      : await parkedHere($, id);
   type Revived = Omit<LaunchOutcome, "problem"> & {
     problem: LaunchOutcome["problem"] | "running";
   };
@@ -9018,7 +9482,9 @@ async function reviveLaunch(
       : parked === "runs"
         ? left(
             "running",
-            `Background session ${id} still runs on this machine, so it is not parked and was not restarted: claude attach ${id} opens it.`,
+            restart
+              ? `Background session ${id} is in a turn now, so it was not restarted: send /restart again once it is quiet.`
+              : `Background session ${id} still runs on this machine, so it is not parked and was not restarted: claude attach ${id} opens it.`,
           )
         : parked === "unknown"
           ? left(
@@ -10734,6 +11200,9 @@ export const register: Register = (on) => {
     // With no token, delivery is off: said, and offered once (dc-t576).
     void offerDelivery($);
     forgetSession();
+    // A start, a reload's among them, says this plugin's version again.
+    pluginTaken = null;
+    void sweepReloadKept($);
     // A session's first reading is due, whatever an earlier one wrote.
     capacityCarried = null;
     capacityRefused = false;

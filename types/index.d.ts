@@ -127,6 +127,24 @@ export type Status = {
    * devcorner, which reads no claim.
    */
   claim?: StatusClaim | null;
+  /**
+   * This plugin's version as devcorner took it from this Status;
+   * null when it said none, or devcorner could not keep it now, and absent
+   * from an older devcorner: either way the next Status says it again.
+   */
+  plugin?: string | null;
+  /**
+   * When this window's person asked it to reload its plugin,
+   * which it does once idle; null when no ask waits, and absent from an
+   * older devcorner.
+   */
+  reload?: number | null;
+  /**
+   * The plugin version devcorner ships: a window that runs an
+   * older one fetches and reloads it by itself once idle. Absent from an
+   * older devcorner.
+   */
+  shippedPlugin?: string;
 };
 
 /**
@@ -267,6 +285,8 @@ export type StatusOther = {
   wakes?: boolean;
   /** That in devcorner's words: "wakes", or "no wake: an MCP connection's, read at its next devcorner call" (dc-t610); absent before it. */
   reach?: string;
+  /** The devcorner plugin its window runs, in devcorner's words: "plugin 0.75.0, behind 0.77.0"; null for no plugin window, and absent from an older devcorner. */
+  plugin?: string | null;
 };
 
 /** One of the person's other plugin windows heard from lately that works as no session, as devcorner names it (dc-t610). */
@@ -285,6 +305,8 @@ export type StatusWindow = {
   wakes: boolean;
   /** That in devcorner's words: "wakes". */
   reach: string;
+  /** The devcorner plugin it runs, in devcorner's words; null for none, and absent from an older devcorner. */
+  plugin?: string | null;
 };
 
 /**

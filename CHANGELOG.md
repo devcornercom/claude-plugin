@@ -2,6 +2,19 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.78.0 — 2026-11-20
+
+- A window that reloads on request with nothing newer on disk confirms the reload at once. Claude Code reloads only the plugin modules that changed, so the same copy stays loaded and its idle window sent no Status until its next event, which left devcorner showing "reload asked" for minutes. The copy that survives a reload now reads Status right away, which says its version and ends the ask.
+- A window chat's page offers `/reload-plugins` and `/restart` only to a window whose plugin is 0.77.0 or newer, which are the versions that run them. A window on an older plugin, or one that says no version, no longer sees them in the `/` list, and a message that names one is refused with what the page does offer.
+
+## 0.77.0 — 2026-11-20
+
+- The window tells devcorner which plugin version it runs, so devcorner can show which windows are behind.
+- A window whose plugin is behind reloads it by itself at its next idle moment: no turn running, no background command open, and nothing typed in the prompt box. Behind means the plugin's folder holds a newer version than the one loaded, or devcorner names a newer one. A version only devcorner names is fetched first with the marketplace's update; if Claude Code will not run it from the plugin, a toast says what Claude Code answered and the commands to type. Each newer version is tried once per conversation, so a reload that loads nothing newer is not repeated.
+- devcorner can ask a window to reload now, on its person's word. The window reloads once idle, and its new copy confirms with its version.
+- In a window chat, `/reload-plugins` from the page reloads the window's plugins. `/restart` from the page restarts a background session as itself: devcorner asks another devcorner window or the launcher on the same machine to run `claude respawn`, which it does unless the session is in a turn by then. Where no other launcher is live, or a restart devcorner opened is not carried out within about 75 seconds (no launcher took it, the session was busy, or `claude respawn` failed), the window reloads its plugins and a toast gives the `claude respawn` command, and the chat's page says why. A window of its own terminal reloads its plugins and says to type `/restart` there, since a plugin cannot restart its own session.
+- The reload by itself checks again that the window is idle right after the marketplace fetch, so words typed or a turn begun during the fetch are never cut off; it reads the plugin folder's manifest at most once a minute, and a window that starts lets go of the versions tried by conversations not heard from for a week.
+
 ## 0.76.0 — 2026-11-20
 
 - A subagent's permission ask now shows Allow and Deny on a window chat's page when that window's Claude Code runs as a background session (`claude --bg`, which `claude attach` reaches and no terminal window watches): answering on the page lets the agent go on, or stops the call when you deny it. Before, the page said to answer it in the window and there was no window, so the chat waited until someone attached on that machine. A chat in a terminal window is unchanged, its subagent's ask answered in the window alone since Claude Code draws that dialog only once the plugin's hook has returned, and a session whose kind could not be read is treated as a window.

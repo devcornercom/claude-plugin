@@ -132,6 +132,7 @@ import {
   holdOf,
   withMovedLine,
   MIRROR_BEAT_MS,
+  RESTART_WAIT_MS,
   askQuestions,
   pageAnswer,
   MIRROR_POST_PARTS,
@@ -174,6 +175,7 @@ import {
   tokenKey,
   updatingFor,
   whoText,
+  PLUGIN_VERSION,
 } from "./register";
 
 const base = {
@@ -1609,6 +1611,7 @@ function world(
       sent.hook_event_name === "ChatParts" ||
       sent.hook_event_name === "ChatClose" ||
       sent.hook_event_name === "ChatFile" ||
+      sent.hook_event_name === "ChatRestart" ||
       sent.hook_event_name === "LaunchTake" ||
       sent.hook_event_name === "LaunchDone"
     ) {
@@ -9874,6 +9877,180 @@ describe("a window chat's mirror", () => {
     expect(said("c3")).toHaveLength(1);
   });
 
+  test("/reload-plugins and /restart from the page are said first, then reload the window's plugins", async ($, on) => {
+    const ran: string[] = [];
+    on("command.list", async () => ({
+      value: [
+        { name: "reload-plugins", description: "", source: "builtin" },
+        { name: "restart", description: "", source: "builtin" },
+      ],
+    }));
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    const { clock, seen } = await mirrored($, on);
+    // An interactive window, not a background session.
+    seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        { sessionId: "conversation-1", kind: "interactive" },
+      ]),
+      stderr: "",
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "restart")] },
+    });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    // Claude Code's restart is never run: a plugin cannot.
+    expect(ran).toEqual(["reload-plugins"]);
+    const said = parts(seen).find((p) => p.turn === "page-command-c1");
+    expect(said).toMatchObject({
+      begin: { text: "/restart", took: ["c1"] },
+      end: { outcome: "done" },
+    });
+    expect(said!.end.text).toContain(
+      `devcorner's loads the version on disk (it ran ${PLUGIN_VERSION})`,
+    );
+    expect(said!.end.text).toContain("type /restart in the window");
+    expect(seen.chats.some((c) => c.hook_event_name === "ChatRestart")).toBe(
+      false,
+    );
+  });
+
+  test("/restart from the page in a background session asks devcorner to restart it as itself, once it heard the answer", async ($, on) => {
+    const ran: string[] = [];
+    on("command.list", async () => ({
+      value: [{ name: "reload-plugins", description: "", source: "builtin" }],
+    }));
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    const { clock, seen } = await mirrored($, on);
+    seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        { sessionId: "conversation-1", kind: "background" },
+      ]),
+      stderr: "",
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "restart")] },
+    });
+    // devcorner keeps the restart, which another launcher takes.
+    seen.chatAnswer = { status: 200, body: { ok: true, state: "opening" } };
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const said = parts(seen).find((p) => p.turn === "page-command-c1");
+    expect(said!.end).toMatchObject({ outcome: "done" });
+    expect(said!.end.text).toMatch(/^Restarting this background session/);
+    const asked = seen.chats.findIndex(
+      (c) => c.hook_event_name === "ChatRestart",
+    );
+    expect(seen.chats[asked]).toMatchObject({ thread: "me-k3" });
+    // Asked only after devcorner took the answer, so the restarted session
+    // never finds /restart waiting.
+    expect(
+      seen.chats.findIndex(
+        (c) =>
+          c.hook_event_name === "ChatParts" &&
+          JSON.stringify(c).includes("page-command-c1"),
+      ),
+    ).toBeLessThan(asked);
+    // This window restarts nothing itself, and reloads nothing.
+    expect(ran).toEqual([]);
+    expect(seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
+  });
+
+  test("/restart from the page in a background session no launcher can restart reloads its plugins, and says what to run", async ($, on) => {
+    const ran: string[] = [];
+    on("command.list", async () => ({
+      value: [{ name: "reload-plugins", description: "", source: "builtin" }],
+    }));
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    const { clock, seen } = await mirrored($, on);
+    seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        { sessionId: "conversation-1", kind: "background" },
+      ]),
+      stderr: "",
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "restart")] },
+    });
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, state: "unreachable", problem: "asleep", words: null },
+    };
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.chats.some((c) => c.hook_event_name === "ChatRestart")).toBe(
+      true,
+    );
+    expect(ran).toEqual(["reload-plugins"]);
+    expect(seen.toasts.at(-1)).toContain(
+      "no other devcorner window or launcher of this machine was heard lately",
+    );
+    expect(seen.toasts.at(-1)).toContain(
+      "run claude respawn conversation-1 on the laptop",
+    );
+  });
+
+  test("a /restart devcorner opened that no launcher then carries out reloads the window's plugins and says what to run", async ($, on) => {
+    const ran: string[] = [];
+    on("command.list", async () => ({
+      value: [{ name: "reload-plugins", description: "", source: "builtin" }],
+    }));
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    const { clock, seen } = await mirrored($, on);
+    seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        { sessionId: "conversation-1", kind: "background" },
+      ]),
+      stderr: "",
+    };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "restart")] },
+    });
+    seen.chatAnswer = { status: 200, body: { ok: true, state: "opening" } };
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    // A restart ends this window's process: while it runs, nothing is said.
+    expect(ran).toEqual([]);
+    await clock.advance(RESTART_WAIT_MS - 1);
+    await flush(clock);
+    expect(ran).toEqual([]);
+    // Still running once the launcher had its time: the restart did not
+    // happen (no launcher took it, the session was busy, or respawn failed).
+    await clock.advance(1);
+    await flush(clock);
+    expect(ran).toEqual(["reload-plugins"]);
+    expect(seen.toasts.at(-1)).toContain("did not restart this session");
+    expect(seen.toasts.at(-1)).toContain("claude respawn conversation-1");
+  });
+
   test("a skill from the page runs as the window's turn, which begins with the person's line", async ($, on) => {
     const window = commands(on);
     const { clock, seen } = await mirrored($, on);
@@ -12222,6 +12399,71 @@ describe("a revive: devcorner's page brings a chat's parked background session b
     expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
   });
 
+  test("a restart its own window asked restarts the running session while it is quiet, and leaves it in a turn", async ($, on) => {
+    const w = world(on, { hold: true });
+    w.seen.answer = {
+      ...base,
+      session: null,
+      conversation: {
+        id: "dc-h2",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 0,
+      },
+    };
+    await $.session.start(START);
+    await flush(w.clock);
+    await w.clock.advance(IDLE_MS);
+    await flush(w.clock);
+    const restart = {
+      status: 200,
+      body: {
+        ok: true,
+        repo: "acme/shop",
+        folder: null,
+        name: "78b29eb4",
+        prompt: "",
+        respawn: "78b29eb4",
+        restart: true,
+      },
+    };
+    // In a turn by now: left as it is.
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([INTERACTIVE, RESPAWNED]),
+      stderr: "",
+    };
+    w.seen.chatAnswers.push(restart);
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "21" }));
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      launch: "21",
+      problem: "running",
+      words: expect.stringMatching(/is in a turn now/),
+    });
+    expect(w.seen.runs.some((r) => r.argv.includes("respawn"))).toBe(false);
+    // Quiet: restarted though it runs.
+    w.seen.claudeRun = {
+      exitCode: 0,
+      stdout: JSON.stringify([INTERACTIVE, { ...RESPAWNED, status: "idle" }]),
+      stderr: "",
+    };
+    w.seen.chatAnswers.push(restart);
+    w.seen.held.at(-1)!(JSON.stringify({ launch: "22" }));
+    await flush(w.clock);
+    expect(w.seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "LaunchDone",
+      launch: "22",
+      problem: null,
+      bg: "78b29eb4",
+    });
+    expect(
+      w.seen.runs.filter((r) => r.argv[0] === "env").map((r) => r.argv),
+    ).toEqual([respawnArgv("78b29eb4")]);
+  });
+
   test("/dc chat says whether its window is a background session, and offers /rename by the chat's id", async ($, on) => {
     const w = world(on);
     await $.session.start(START);
@@ -12296,5 +12538,248 @@ describe("a revive: devcorner's page brings a chat's parked background session b
     w.seen.held.at(-1)!(JSON.stringify({ launch: "15" }));
     await flush(w.clock);
     expect(w.seen.runs.some((r) => r.argv.includes("--bg"))).toBe(false);
+  });
+});
+
+describe("reloading onto the plugin on disk", () => {
+  /** Claude Code's answers to `$.command.run`: each run kept, with its words; a reason by command refuses it. */
+  const reloads = (on: On) => {
+    const ran: string[] = [];
+    const refused: Record<string, string> = {};
+    on("command.run", async (_$, e) => {
+      ran.push(e.args ? `${e.command} ${e.args}` : e.command);
+      if (refused[e.command] !== undefined) throw new Error(refused[e.command]);
+      return {};
+    });
+    return { ran, refused };
+  };
+  /** A version newer than any this plugin will be. */
+  const NEWER = "99.0.0";
+  const RELOAD = "reload:conversation-1";
+
+  test("a Status says the plugin's version until devcorner says it back, and again after a start", async ($, on) => {
+    const { clock, seen } = world(on);
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION };
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.statusBodies[0]!.plugin).toBe(PLUGIN_VERSION);
+    expect(seen.statusBodies[0]!.reloaded).toBeUndefined();
+    await $.command.run({ command: "dc", args: "now" });
+    await flush(clock);
+    expect(seen.statusBodies.length).toBeGreaterThan(1);
+    expect(seen.statusBodies.at(-1)!.plugin).toBeUndefined();
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.statusBodies.at(-1)!.plugin).toBe(PLUGIN_VERSION);
+  });
+
+  test("an ask on the held request reloads the idle window once, and its new copy confirms it with its version", async ($, on) => {
+    const claude = reloads(on);
+    const { clock, seen, stored } = world(on, { hold: true });
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual([]);
+    seen.answer = { ...waiting(0, null), reload: 5 };
+    seen.held.shift()!('{"reload":"me-h1"}');
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+    expect(stored.get(RELOAD)).toBe(5);
+    // The new copy starts, says its version and the ask its load answers.
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION, reload: null };
+    await $.session.start(START);
+    await flush(clock);
+    const said = seen.statusBodies.find((b) => b.reloaded !== undefined)!;
+    expect(said).toMatchObject({ plugin: PLUGIN_VERSION, reloaded: 5 });
+    expect(stored.has(RELOAD)).toBe(false);
+    expect(seen.toasts).toContain(
+      `dc: reloaded devcorner's plugin, now ${PLUGIN_VERSION}, as asked`,
+    );
+    expect(claude.ran).toEqual(["reload-plugins"]);
+  });
+
+  test("a reload that leaves this copy loaded says the ask back at once, with no other event", async ($, on) => {
+    const claude = reloads(on);
+    const { clock, seen, stored } = world(on);
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION, reload: 6 };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+    // Nothing ran after the reload: the copy that survived read Status itself.
+    expect(seen.statusBodies.at(-1)).toMatchObject({
+      plugin: PLUGIN_VERSION,
+      reloaded: 6,
+    });
+    expect(stored.has(RELOAD)).toBe(false);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+  });
+
+  test("an ask read while a turn runs waits for the turn's end", async ($, on) => {
+    const claude = reloads(on);
+    const { clock, seen } = world(on);
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION, reload: 7 };
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual([]);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+  });
+
+  test("a reload Claude Code refuses is said with what to type, and that ask is not tried again", async ($, on) => {
+    const claude = reloads(on);
+    claude.refused["reload-plugins"] = "HooksError: command.run: not now";
+    const { clock, seen, stored } = world(on);
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION, reload: 9 };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+    expect(stored.has(RELOAD)).toBe(false);
+    expect(seen.toasts.at(-1)).toContain("type /reload-plugins");
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+  });
+
+  test("a window behind the version devcorner ships fetches it and reloads once idle, once for that version", async ($, on) => {
+    const claude = reloads(on);
+    const { clock, seen, stored } = world(on);
+    seen.answer = {
+      ...waiting(0, null),
+      plugin: PLUGIN_VERSION,
+      shippedPlugin: PLUGIN_VERSION,
+    };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual([]);
+    seen.answer = { ...waiting(0, null), shippedPlugin: NEWER };
+    // Never over what the person is typing.
+    seen.draft = "half a thought";
+    await $.command.run({ command: "dc", args: "now" });
+    await flush(clock);
+    expect(claude.ran).toEqual([]);
+    seen.draft = "";
+    await $.command.run({ command: "dc", args: "now" });
+    await flush(clock);
+    expect(claude.ran).toEqual([
+      "plugin marketplace update devcorner",
+      "reload-plugins",
+    ]);
+    expect(stored.get("reloadBehind:conversation-1")).toMatchObject({
+      version: NEWER,
+    });
+    // A copy the reload left behind does not try that version again.
+    await $.command.run({ command: "dc", args: "now" });
+    await flush(clock);
+    expect(claude.ran).toHaveLength(2);
+  });
+
+  test("a fetch Claude Code refuses is said with the command to run, and no reload follows", async ($, on) => {
+    const claude = reloads(on);
+    claude.refused.plugin = "plugin is interactive";
+    const { clock, seen } = world(on);
+    seen.answer = { ...waiting(0, null), shippedPlugin: NEWER };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual(["plugin marketplace update devcorner"]);
+    // Claude Code's own words go between the brackets.
+    expect(seen.toasts.at(-1)).toMatch(
+      new RegExp(
+        `^dc: devcorner's plugin ${NEWER} is out, and Claude Code did not fetch it here \\(.+\\): run /plugin marketplace update devcorner, then /reload-plugins$`,
+      ),
+    );
+  });
+
+  test("a window whose folder holds a newer plugin reloads once idle, with no fetch", async ($, on) => {
+    const claude = reloads(on);
+    const { clock, seen, stored } = world(on);
+    // The module's `$.plugin.root` is the folder under test, this file's parent.
+    const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+    seen.files.set(
+      `${root}/.claude-plugin/plugin.json`,
+      JSON.stringify({ name: "devcorner", version: NEWER }),
+    );
+    seen.answer = {
+      ...waiting(0, null),
+      plugin: PLUGIN_VERSION,
+      shippedPlugin: PLUGIN_VERSION,
+    };
+    await $.session.start(START);
+    await flush(clock);
+    expect(claude.ran).toEqual(["reload-plugins"]);
+    expect(stored.get("reloadBehind:conversation-1")).toMatchObject({
+      version: NEWER,
+    });
+  });
+
+  test("words typed while the fetch runs keep the reload for the next idle moment", async ($, on) => {
+    const ran: string[] = [];
+    let typed = false;
+    const box = { seen: null as { draft: string } | null };
+    on("command.run", async (_$, e) => {
+      ran.push(e.args ? `${e.command} ${e.args}` : e.command);
+      // The person types once, while the first fetch runs.
+      if (e.command === "plugin" && !typed) {
+        typed = true;
+        box.seen!.draft = "half a thought";
+      }
+      return {};
+    });
+    const { clock, seen, stored } = world(on);
+    box.seen = seen;
+    seen.answer = { ...waiting(0, null), shippedPlugin: NEWER };
+    await $.session.start(START);
+    await flush(clock);
+    expect(ran).toEqual(["plugin marketplace update devcorner"]);
+    expect(stored.has("reloadBehind:conversation-1")).toBe(false);
+    seen.draft = "";
+    await $.command.run({ command: "dc", args: "now" });
+    await flush(clock);
+    expect(ran).toEqual([
+      "plugin marketplace update devcorner",
+      "plugin marketplace update devcorner",
+      "reload-plugins",
+    ]);
+  });
+
+  test("a version tried by a conversation not heard for a week is let go of as a window starts", async ($, on) => {
+    const { clock, seen, stored } = world(on, {
+      store: {
+        // The test clock starts at 1_000_000: eight days before it.
+        "reloadBehind:old": { version: NEWER, at: 1_000_000 - 8 * 86_400_000 },
+        "reloadBehind:recent": { version: NEWER, at: 999_000 },
+        "reloadBehind:unreadable": NEWER,
+      },
+    });
+    seen.answer = { ...waiting(0, null), plugin: PLUGIN_VERSION };
+    await $.session.start(START);
+    await flush(clock);
+    expect(stored.has("reloadBehind:old")).toBe(false);
+    expect(stored.has("reloadBehind:unreadable")).toBe(false);
+    expect(stored.has("reloadBehind:recent")).toBe(true);
+  });
+
+  test("/dc sessions says the plugin each other window runs, as devcorner words it", () => {
+    const other: StatusOther = {
+      id: "acm-s4",
+      title: "Checkout",
+      page: null,
+      conversation: "me-h3",
+      name: null,
+      where: "reviewer",
+      repo: "acme/shop",
+      ticket: null,
+      state: "working",
+      wakes: true,
+      reach: "wakes",
+      plugin: "plugin 0.75.0, behind 0.77.0",
+    };
+    const text = sessionsText({
+      ...waiting(0, null),
+      others: { count: 1, items: [other], windows: [] },
+    });
+    expect(text).toContain("plugin 0.75.0, behind 0.77.0 · wakes");
   });
 });
