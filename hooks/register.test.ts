@@ -91,6 +91,11 @@ import {
   renameLine,
   stepParts,
   toolCall,
+  toolDetail,
+  toolOutput,
+  editDiff,
+  cutToolText,
+  MAX_TOOL_TEXT,
   lineLabel,
   shortToolNames,
   failureText,
@@ -7613,6 +7618,8 @@ describe("a window chat's mirror", () => {
         toolCallId: "toolu_1",
         toolName: "Bash",
         input: { label: "pnpm test" },
+        // What the call goes in with goes with it, as the terminal shows it.
+        detail: "pnpm test\n--watch",
       },
     ]);
     // Arguments that never parse leave the label empty, and the stop ends
@@ -7701,6 +7708,100 @@ describe("a window chat's mirror", () => {
       "select:",
     ])
       expect(shortToolNames(text)).toBe(text);
+  });
+
+  test("a call shows what it went in with: an edit's diff, a shell call's command, a read's or a write's file", () => {
+    expect(
+      toolDetail("Bash", '{"command":"pnpm test","description":"run"}'),
+    ).toBe("pnpm test");
+    expect(toolDetail("Read", '{"file_path":"/repo/src/date.ts"}')).toBe(
+      "/repo/src/date.ts",
+    );
+    expect(
+      toolDetail("Write", '{"file_path":"/repo/b.ts","content":"x"}'),
+    ).toBe("/repo/b.ts");
+    // An edit is the lines it changes, the text the two share at their start
+    // and their end left out.
+    expect(
+      toolDetail(
+        "Edit",
+        JSON.stringify({
+          file_path: "/repo/a.ts",
+          old_string: "one\ntwo\nthree\nfour",
+          new_string: "one\ntwo\nTHREE\nfour",
+        }),
+      ),
+    ).toBe("…\n-three\n+THREE\n…");
+    expect(
+      toolDetail(
+        "MultiEdit",
+        JSON.stringify({
+          file_path: "/repo/a.ts",
+          edits: [
+            { old_string: "a", new_string: "b" },
+            { old_string: "c", new_string: "d" },
+          ],
+        }),
+      ),
+    ).toBe("-a\n+b\n-c\n+d");
+    // What the terminal does not draw, and arguments that do not parse,
+    // show nothing.
+    expect(toolDetail("Grep", '{"pattern":"dc-"}')).toBeNull();
+    expect(toolDetail("Bash", "{")).toBeNull();
+    expect(
+      toolDetail("mcp__github__get_me", '{"command":"pnpm deploy"}'),
+    ).toBeNull();
+  });
+
+  test("a diff keeps the line a change is in, not the block around it", () => {
+    // What the two texts share at their start and end comes out: an `…`
+    // says lines are there, and the block between them is what changed.
+    expect(editDiff("a\nb", "a\nb\nc")).toBe("…\n+c");
+    expect(editDiff("a\nb", "b")).toBe("-a\n…");
+    // Text a change shares nowhere is all of it, removed and added.
+    expect(editDiff("a", "b")).toBe("-a\n+b");
+    expect(editDiff("", "new line")).toBe("+new line");
+    expect(editDiff("same\n", "same")).toBe("");
+  });
+
+  test("a call shows what it printed: a shell call's output and errors, a read's lines", () => {
+    expect(
+      toolOutput("Bash", {
+        stdout: "1 passed",
+        stderr: "",
+        interrupted: false,
+      }),
+    ).toBe("1 passed");
+    expect(toolOutput("Bash", { stdout: "out", stderr: "warn" })).toBe(
+      "out\nwarn",
+    );
+    expect(toolOutput("Bash", { stdout: "", stderr: "" })).toBeNull();
+    expect(
+      toolOutput("Read", { type: "text", file: { content: "1  one\n2  two" } }),
+    ).toBe("1  one\n2  two");
+    // A write's result is what the edit says it did, not lines to read; a
+    // tool's result is the model's.
+    expect(toolOutput("Edit", { filePath: "/repo/a.ts" })).toBeNull();
+    expect(toolOutput("Bash", null)).toBeNull();
+  });
+
+  test("what a call shows is cut at what the page keeps, its lines whole", () => {
+    const many = Array.from({ length: 500 }, (_, at) => `line ${at}`).join(
+      "\n",
+    );
+    const cut = cutToolText(many);
+    expect(cut.length).toBeLessThanOrEqual(MAX_TOOL_TEXT + 2);
+    expect(cut.endsWith("\n…")).toBe(true);
+    expect(
+      cut.split("\n").every((line) => line === "…" || /^line \d+$/.test(line)),
+    ).toBe(true);
+    // A text short enough stays as it came, its ends trimmed.
+    expect(cutToolText("  one\ntwo  ")).toBe("one\ntwo");
+    expect(cutToolText("   ")).toBe("");
+    // One line past the room is cut at a word, not in a character.
+    const words = cutToolText("word ".repeat(1_000));
+    expect(words.length).toBeLessThanOrEqual(MAX_TOOL_TEXT);
+    expect(words.endsWith("word")).toBe(true);
   });
 
   const OPENED = {

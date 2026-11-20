@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.80.0 — 2026-11-20
+
+- A window chat's page now shows what the window shows. Its reasoning, which is the window's own progress lines, goes with a turn's parts, so the page's head says the newest line while the window thinks instead of a bare "Thinking…", its first line cut to the row. Each tool call now sends what it went in with (an edit's change as a small diff, a shell call's command, a read's or a write's file) and what it printed when it returns (a command's output and errors, a read's lines), which the page draws under the step's line of calls, closed until the step is opened. Both are cut at what devcorner keeps of a call, and a tool the terminal draws nothing of, or a subagent's call, sends neither.
+
 ## 0.79.0 — 2026-11-20
 
 - A window chat's page message no longer goes missing while the window is idle. devcorner used to stop telling a window's held request that page words wait at the window's first post, whatever that post came to: one that failed, or one that carried none of them, left the store telling the window no more, so they reached it only at its next turn, which the person gave by typing there. The store now stops telling the window only at a post whose answer carried every word that waited, and only while no word was said since that post read the mark, so a post that did not carry them leaves the next held request told again. A look that fails is asked again by itself, up to three tries, since a look is what fetches those words, and a chat's opening asks one look of its own, since the window before it held the words it was handed in its memory alone. (A post whose answer the window never read still ends the telling, since the route says so before it returns; the look retry is what covers that case.)

@@ -43,7 +43,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.79.0";
+export const PLUGIN_VERSION = "0.80.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -5508,10 +5508,13 @@ function deliver<R extends { deny?: unknown; context?: readonly string[] }>(
 // (ChatParts), and the person's own words typed on devcorner's page come back
 // in the answer to a post, or on the held request (`{chat}`), to be typed in
 // here as theirs, never over a draft and never mid-turn. Stop on the page
-// aborts the turn. Tool output is never sent: a tool call goes by its short
+// aborts the turn. A tool call goes by its short
 // name and a short label, or, for one of devcorner's own tools, with its
 // short arguments, which devcorner reads what the call acts on from by the
-// project chat's rule. Nothing is mirrored until `/dc chat` in this window.
+// project chat's rule; its own arguments stay here, and what it went in with
+// (a command, a file, an edit's diff, `toolDetail`) and what it printed
+// (`keepOutput`) are sent. Nothing is mirrored until `/dc chat` in this
+// window.
 
 /**
  * What a window that mirrors a window chat is told of where its replies are
@@ -5550,10 +5553,18 @@ export type MirrorToolInput =
   | { label: string }
   | { args: Record<string, string | number> };
 
-/** A tool call as a turn's end keeps it for the reply's line: its short name and what its line carries. */
+/**
+ * A tool call as a turn's end keeps it for the reply's line: its short name,
+ * what its line carries, and what its page shows under the line when the
+ * step is opened: what it went in with and what it printed.
+ */
 export interface MirrorTool {
   name: string;
   input: MirrorToolInput;
+  /** An edit's diff, a shell call's command, a read's file (`toolDetail`); none for a call that shows none. */
+  detail?: string;
+  /** What it printed, as the window's terminal showed it (`toolOutput`); none while it works, and for a call that printed nothing. */
+  output?: string;
 }
 
 /** A live part as devcorner's page draws a reply: text, summarised reasoning, a tool by its name. */
@@ -5568,6 +5579,15 @@ export type MirrorPart =
       toolCallId: string;
       toolName: string;
       input: MirrorToolInput;
+      /** What the call went in with (`toolDetail`); none for a call that shows none. */
+      detail?: string;
+    }
+  | {
+      type: "tool-output-available";
+      toolCallId: string;
+      /** What the call printed, cut as the page keeps it (`toolOutput`). */
+      output: string;
+      isError: boolean;
     }
   | { type: "data-ask"; data: AskState }
   | { type: "data-hold"; data: HoldState }
@@ -6266,15 +6286,22 @@ function toolArgs(json: string): Record<string, unknown> | null {
  * MCP prefix (`mcp__github__get_me` is `get_me`), and, for one of
  * devcorner's own tools, its short arguments, from which devcorner names
  * what it acts on by the project chat's rule; for any other, whose
- * arguments never leave the machine, one short label (`lineLabel`).
+ * arguments stay here but whose own detail is sent (`toolDetail`), one
+ * short label (`lineLabel`).
  */
 export function toolCall(
   name: string,
   json: string,
-): { toolName: string; input: MirrorToolInput } {
+): { toolName: string; input: MirrorToolInput; detail?: string } {
   const toolName = shortToolName(name);
-  if (!DEVCORNER_TOOL.test(name))
-    return { toolName, input: { label: lineLabel(json) } };
+  if (!DEVCORNER_TOOL.test(name)) {
+    const detail = toolDetail(name, json);
+    return {
+      toolName,
+      input: { label: lineLabel(json) },
+      ...(detail === null ? {} : { detail }),
+    };
+  }
   const args: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(toolArgs(json) ?? {}))
     if (
@@ -6283,6 +6310,148 @@ export function toolCall(
     )
       args[key] = value;
   return { toolName, input: { args } };
+}
+
+/** The most a tool call's detail, and what it printed, holds as the page draws them: devcorner keeps no more (`MAX_CHAT_TOOL_DETAIL`). */
+export const MAX_TOOL_TEXT = 2_000;
+
+/** A text's lines with no empty last one, as a text ending at a newline gives it. */
+function toolLines(text: string): string[] {
+  const lines = text.split("\n");
+  return lines.at(-1) === "" ? lines.slice(0, -1) : lines;
+}
+
+/**
+ * A text kept to `MAX_TOOL_TEXT`, its first lines whole: a line past them is
+ * dropped, and the one it stops at is cut at a word, so a call that prints
+ * pages sends a page, not half a line.
+ */
+export function cutToolText(text: string): string {
+  const whole = text.trim();
+  if (whole.length <= MAX_TOOL_TEXT) return whole;
+  const kept: string[] = [];
+  let left = MAX_TOOL_TEXT;
+  for (const line of toolLines(whole)) {
+    if (line.length + 1 > left) break;
+    kept.push(line);
+    left -= line.length + 1;
+  }
+  if (kept.length === 0) {
+    const cut = whole.slice(0, MAX_TOOL_TEXT);
+    const at = cut.search(/\s\S*$/);
+    return at === -1 ? cut : cut.slice(0, at);
+  }
+  return `${kept.join("\n")}\n…`;
+}
+
+/**
+ * A small diff of one edit, as the window's terminal draws it: the lines the
+ * old and the new text share at their start and at their end kept as they
+ * are, and the block between them removed and added, an `…` where text is
+ * left out.
+ */
+export function editDiff(oldText: string, newText: string): string {
+  const before = toolLines(oldText);
+  const after = toolLines(newText);
+  let start = 0;
+  while (
+    start < before.length &&
+    start < after.length &&
+    before[start] === after[start]
+  )
+    start += 1;
+  let end = 0;
+  while (
+    end < before.length - start &&
+    end < after.length - start &&
+    before[before.length - 1 - end] === after[after.length - 1 - end]
+  )
+    end += 1;
+  const removed = before.slice(start, before.length - end);
+  const added = after.slice(start, after.length - end);
+  // Text that changed nothing is no diff.
+  if (removed.length === 0 && added.length === 0) return "";
+  return [
+    ...(start === 0 ? [] : ["…"]),
+    ...removed.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
+    ...(end === 0 ? [] : ["…"]),
+  ].join("\n");
+}
+
+/** The text of an argument, when it is one. */
+function argText(args: Record<string, unknown>, key: string): string | null {
+  const value = args[key];
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * What a tool call goes in with, as the window's own terminal shows it: an
+ * edit's change as a small diff (`editDiff`), a shell call's command, a
+ * read's or a write's file. Any other call shows nothing, since what it went
+ * in with is not what the terminal draws. Null for none.
+ */
+export function toolDetail(name: string, json: string): string | null {
+  const args = toolArgs(json);
+  if (args === null) return null;
+  switch (shortToolName(name)) {
+    case "Bash": {
+      const command = argText(args, "command");
+      return command === null ? null : cutToolText(command);
+    }
+    case "Read":
+    case "Write":
+    case "NotebookEdit": {
+      const path = argText(args, "file_path") ?? argText(args, "notebook_path");
+      return path === null ? null : cutToolText(path);
+    }
+    case "Edit": {
+      const before = argText(args, "old_string");
+      const after = argText(args, "new_string");
+      return before === null || after === null
+        ? null
+        : cutToolText(editDiff(before, after));
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(args.edits) ? args.edits : [];
+      const diff = edits.flatMap((raw) => {
+        const edit = raw as { old_string?: unknown; new_string?: unknown };
+        return typeof edit?.old_string === "string" &&
+          typeof edit.new_string === "string"
+          ? [editDiff(edit.old_string, edit.new_string)]
+          : [];
+      });
+      return diff.length === 0 ? null : cutToolText(diff.join("\n"));
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * What a tool call came back with, as the window's terminal shows it: what a
+ * shell call printed, its output and its errors, and the lines a read gave.
+ * Any other call shows nothing: its result is the model's to read, not the
+ * person's to scroll. Null for none, and for a call that printed nothing.
+ */
+export function toolOutput(name: string, response: unknown): string | null {
+  const result = response as {
+    stdout?: unknown;
+    stderr?: unknown;
+    file?: { content?: unknown } | null;
+  } | null;
+  if (result === null || typeof result !== "object") return null;
+  if (shortToolName(name) === "Bash") {
+    const parts = [result.stdout, result.stderr].filter(
+      (one): one is string => typeof one === "string" && one.trim() !== "",
+    );
+    return parts.length === 0 ? null : cutToolText(parts.join("\n"));
+  }
+  if (shortToolName(name) !== "Read") return null;
+  const content = result.file?.content;
+  return typeof content === "string" && content.trim() !== ""
+    ? cutToolText(content)
+    : null;
 }
 
 /**
@@ -6969,6 +7138,13 @@ function saidWords(said: readonly string[]): string {
 }
 
 /**
+ * The calls of the turn under way whose result has not come, by the engine's
+ * id of each, so its `classic.PostToolUse` fills the same call's output in
+ * the reply the turn's end keeps (`MirrorTool.output`).
+ */
+const callOutputs = new Map<string, MirrorTool>();
+
+/**
  * Keeps one part in the turn's steps, as the page folds the live turn
  * (`liveTurn`, src/apps/app/features/chat/lib/live-parts.ts), so the kept
  * reply draws its steps where the live one did: the text blocks since the
@@ -6996,7 +7172,13 @@ function mirrorChunk($: Engine, m: Mirror, chunk: TurnStepChunk): void {
   for (const part of parts) {
     keepStep(m, part);
     if (part.type === "tool-input-available") {
-      m.tools.push({ name: part.toolName, input: part.input });
+      const tool: MirrorTool = {
+        name: part.toolName,
+        input: part.input,
+        ...(part.detail === undefined ? {} : { detail: part.detail }),
+      };
+      m.tools.push(tool);
+      callOutputs.set(part.toolCallId, tool);
       mainCalls.add(part.toolCallId);
     }
   }
@@ -7206,6 +7388,7 @@ function leaveMirror(): void {
   for (const held of holds.values()) held.timer?.cancel();
   holds.clear();
   mainCalls.clear();
+  callOutputs.clear();
   backgroundedFromPage = null;
   movedFromPage = null;
   carryingOn = false;
@@ -7814,10 +7997,15 @@ function endHold($: Engine, id: string): void {
   if (held.told) sayHold($, { id, state: "over" });
 }
 
-/** Ends every hold, and forgets the main loop's calls: it went on to its next step, or its turn ended. */
+/**
+ * Ends every hold, and forgets the main loop's calls: it went on to its next
+ * step, or its turn ended. A call whose result has not come by then keeps no
+ * output to fill: nothing after the end posts it.
+ */
 function endHolds($: Engine): void {
   for (const id of [...holds.keys()]) endHold($, id);
   mainCalls.clear();
+  callOutputs.clear();
 }
 
 /**
@@ -7977,6 +8165,47 @@ export function endedAtStop(
     }),
   );
   return [...running].filter((id) => !live.has(id));
+}
+
+/**
+ * Keeps what a call of the main loop's printed, so its page shows it as it
+ * comes and its kept reply shows it once the turn ends: the part the page
+ * draws under the call (`tool-output-available`), and the call's own output
+ * in the reply its end carries (`MirrorTool.output`). A subagent's calls are
+ * not the chat's, and a call that printed nothing the page shows tells it
+ * nothing.
+ */
+function keepOutput(
+  $: Engine,
+  e: {
+    tool_name?: unknown;
+    tool_use_id?: unknown;
+    tool_response?: unknown;
+    error?: unknown;
+    agent_id?: unknown;
+  },
+  failed: boolean,
+): void {
+  const m = mirror;
+  const id = typeof e.tool_use_id === "string" ? e.tool_use_id : "";
+  if (m === null || e.agent_id !== undefined || id === "" || !mainCalls.has(id))
+    return;
+  const name = typeof e.tool_name === "string" ? e.tool_name : "";
+  const output = failed
+    ? cutToolText(typeof e.error === "string" ? e.error : "")
+    : toolOutput(name, e.tool_response);
+  mainCalls.delete(id);
+  const tool = callOutputs.get(id);
+  callOutputs.delete(id);
+  if (output === null || output === "") return;
+  if (tool !== undefined) tool.output = output;
+  m.parts.push({
+    type: "tool-output-available",
+    toolCallId: id,
+    output,
+    isError: failed,
+  });
+  mirrorSoon($);
 }
 
 /** Keeps the background task a command the page moved runs on as, as its result names it. */
@@ -11126,6 +11355,8 @@ export const register: Register = (on) => {
   });
   on("classic.PostToolUse", async ($, e, next) => {
     if (e.agent_id === undefined) {
+      // What the call printed, kept before the turn that follows tells the page.
+      keepOutput($, e, false);
       keepMoved(e.tool_response);
       const running = runningOf(e.tool_name, e.tool_input, e.tool_response);
       if (running !== null) backgroundRunning.set(running.id, running);
@@ -11136,7 +11367,11 @@ export const register: Register = (on) => {
     return toastHandOvers($, await next(e));
   });
   on("classic.PostToolUseFailure", async ($, e, next) => {
-    if (e.agent_id === undefined) endHold($, e.tool_use_id);
+    if (e.agent_id === undefined) {
+      // A call that failed came back with what it refused with.
+      keepOutput($, e, true);
+      endHold($, e.tool_use_id);
+    }
     return next(e);
   });
   on("classic.UserPromptSubmit", async ($, e, next) =>
