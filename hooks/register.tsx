@@ -5335,7 +5335,7 @@ export interface AskQuestion {
   multi: boolean;
 }
 
-/** What this window waits on its person for: a tool by its name and label (never its input whole), and whether only the window can answer it (a subagent's, since a background agent's dialog waits on the hook), or the model's questions. */
+/** What this window waits on its person for: a tool by its name and label (never its input whole), and whether only the window can answer it (a subagent's in a window, since a background agent's dialog there waits on the hook), or the model's questions. */
 export type Ask =
   | { kind: "permission"; tool: string; label: string; windowOnly: boolean }
   | { kind: "question"; questions: AskQuestion[] };
@@ -5359,6 +5359,13 @@ interface MirrorStep {
 interface Mirror {
   /** The chat, as the person is shown it (me-k3). */
   thread: string;
+  /**
+   * Whether Claude Code runs this session in the background (`claude --bg`),
+   * as its chat's opening or rejoin read it (`backgroundHere`, `ChatOpen`'s
+   * `background`); null when it could not be read. Nobody watches a window
+   * in a background session, so there a subagent's ask waits for the page.
+   */
+  background: boolean | null;
   /** The window's turn under way, by its id; null between turns. */
   turn: string | null;
   /**
@@ -6942,15 +6949,22 @@ function stopMirror($: Engine, why: string | null): void {
 // PermissionRequest hook beside its dialog and takes the first answer of the
 // two, so the page's answer to a permission is the hook's; a tool.call hook
 // on AskUserQuestion that answers while its dialog is open closes the dialog.
-// A background agent's permission is the exception: Claude Code draws its
-// dialog only once every PermissionRequest hook has returned, so a hook that
-// waited on the page kept the window blank for as long as it waited (2 min
-// 42 s on 2.1.326). Such an ask goes to the page as one answered in the
-// window alone (`windowOnly`), and the hook returns at once. Every
-// subagent's ask is: nothing the plugin hears says for sure whether an
-// agent runs in the background (its definition may force it, Ctrl+B may
-// move it there mid-run), and a dialog held for the page is the window left
-// blank, while one the page cannot answer is only the page's loss.
+// A background agent's permission in a window is the exception: Claude Code
+// draws its dialog only once every PermissionRequest hook has returned, so a
+// hook that waited on the page kept the window blank for as long as it
+// waited (2 min 42 s on 2.1.326). Such an ask goes to the page as one
+// answered in the window alone (`windowOnly`), and the hook returns at once.
+// Every subagent's ask in a window is: nothing the plugin hears says for sure
+// whether an agent runs in the background (its definition may force it,
+// Ctrl+B may move it there mid-run), and a dialog held for the page is the
+// window left blank, while one the page cannot answer is only the page's
+// loss. A background session (`claude --bg`) has no window anyone watches,
+// so there the reason does not hold: its subagent's asks wait for the page as
+// the main loop's do (`Mirror.background`), but only up to
+// `BACKGROUND_ASK_HOLD_MS`: Claude Code draws that dialog once the hook
+// returns, so a `claude attach` viewer gets none while it waits. Past the
+// cap the hook returns, the dialog is the session's own, and the page is told
+// the ask is the window's alone (`giveAskToWindow`).
 // No hook is told when the person answered here, so a permission ask closes
 // once its tool call ends, or at its agent's next step when no call was found
 // for it, and the main loop's asks still open close as its turn ends.
@@ -6966,12 +6980,16 @@ function stopMirror($: Engine, why: string | null): void {
 // (`Wait`), which the page's answer ends with the `{chat}` frame, and then
 // posts a look that takes it (`holdForPage`): a hook's own time is bounded
 // (10 s) but time inside a `$` call is not, so the page may answer for as
-// long as the window's dialog waits. Only a tool's name and its label go,
-// never its input whole nor anything it read or wrote.
+// long as the window's dialog waits (a background session's subagent's ask,
+// which has no dialog until its hook returns, for `BACKGROUND_ASK_HOLD_MS`).
+// Only a tool's name and its label go, never its input whole nor anything it
+// read or wrote.
 
 /** Where holds fail, how soon a turn asks devcorner for the page's answer instead; each look after waits half as long again, up to `ASK_LOOK_MAX_MS`. */
 export const ASK_LOOK_MS = 1_500;
 export const ASK_LOOK_MAX_MS = 15_000;
+/** How long a background session's subagent's permission ask waits for the page before its hook returns and the session's own dialog takes it. Long, as the person is often away and the page is where they answer. */
+export const BACKGROUND_ASK_HOLD_MS = 30 * 60_000;
 /** The most questions, options of one, and characters of one option's label the page is sent, as devcorner keeps no more (src/agent/laptop-asks.ts): a question past them is answered in the window alone. */
 const ASK_MAX_QUESTIONS = 4;
 const ASK_MAX_OPTIONS = 4;
@@ -7140,7 +7158,12 @@ function askWhat(ask: Ask): string {
 function holdForPage($: Engine, id: string): Promise<void> {
   return holdWhile(
     $,
-    () => asks.get(id)?.taken === false,
+    () => {
+      const pending = asks.get(id);
+      return (
+        pending !== undefined && !pending.taken && !byWindowAlone(pending.ask)
+      );
+    },
     () => {
       askLookMs = ASK_LOOK_MS;
       lookForAnswers($);
@@ -7176,6 +7199,24 @@ async function holdWhile(
       return;
     }
   }
+}
+
+/**
+ * Turns an ask still waiting on the page into the window's alone, as its hold
+ * ran out (`BACKGROUND_ASK_HOLD_MS`): the page is told, so it drops its buttons
+ * for an answer that can no longer land, and the hook's wait ends.
+ */
+function giveAskToWindow($: Engine, id: string): void {
+  const pending = asks.get(id);
+  if (
+    pending === undefined ||
+    pending.taken ||
+    pending.ask.kind !== "permission"
+  )
+    return;
+  pending.ask = { ...pending.ask, windowOnly: true };
+  sayAsk($, { id, state: "open", ask: pending.ask });
+  pending.done(null);
 }
 
 /** Closes an ask still open, saying how to the page: answered (where, and in a few words), or with no answer. */
@@ -8500,6 +8541,7 @@ async function mirrorOpened(
   posted: { status: number; body: unknown },
   nothing: string,
   commands: WindowCommand[] | undefined,
+  background: boolean | null,
 ): Promise<string> {
   const body = (posted.body ?? {}) as {
     chat?: { thread?: unknown; machineName?: unknown };
@@ -8517,6 +8559,7 @@ async function mirrorOpened(
   leaveMirror();
   mirror = {
     thread: body.chat.thread,
+    background,
     turn: null,
     key: null,
     part: 0,
@@ -8672,13 +8715,15 @@ export function agentsListed(printed: string): ListedAgent[] | null {
 
 /**
  * Whether `claude agents --json` lists the session `id` as a background
- * one (`kind` other than `interactive`): a window chat whose window is one
- * can be revived from its page once Claude Code parks it. Null when the
- * list does not name the session, or cannot be read.
+ * one (`kind` `background`; any other kind reads as a window, so a kind
+ * Claude Code adds later never holds a watched window's dialog blank): a
+ * window chat whose window is one can be revived from its page once Claude
+ * Code parks it, and a background session's subagent asks wait for the page.
+ * Null when the list does not name the session, or cannot be read.
  */
 export function backgroundOf(printed: string, id: string): boolean | null {
   const kind = agentsListed(printed)?.find((one) => one.sessionId === id)?.kind;
-  return typeof kind === "string" ? kind !== "interactive" : null;
+  return typeof kind === "string" ? kind === "background" : null;
 }
 
 /** How long `claude agents --json` may take as a chat opens, which waits on it. */
@@ -8688,7 +8733,8 @@ const AGENTS_READ_MS = 5_000;
  * Whether this window is a background session of the machine, as a chat's
  * opening tells devcorner (`ChatOpen`'s `background`), read from `claude
  * agents --json`; null when it cannot be read, which keeps what the same
- * session said before.
+ * session told devcorner before and leaves the mirror treating the session
+ * as a window (`Mirror.background`).
  */
 async function backgroundHere($: Engine): Promise<boolean | null> {
   try {
@@ -9142,6 +9188,7 @@ async function chatHere($: Engine, words: string): Promise<string> {
     posted,
     "no window chat was opened",
     commands,
+    await background,
   );
   return launch === null ? withRename(said, posted) : said;
 }
@@ -9198,7 +9245,13 @@ async function continueHere($: Engine, words: string): Promise<string> {
     { command: "/dc continue", nothing: "nothing was continued" },
   );
   if (typeof posted === "string") return posted;
-  const said = await mirrorOpened($, posted, "nothing was continued", commands);
+  const said = await mirrorOpened(
+    $,
+    posted,
+    "nothing was continued",
+    commands,
+    await background,
+  );
   await briefWindow($, posted.body);
   return launch === null ? withRename(said, posted) : said;
 }
@@ -9299,7 +9352,13 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
   if (typeof posted !== "string") {
     if (posted.status === 200) {
       if (mirror === null)
-        await mirrorOpened($, posted, "it was not rejoined", commands);
+        await mirrorOpened(
+          $,
+          posted,
+          "it was not rejoined",
+          commands,
+          await background,
+        );
       return;
     }
     const code = (posted.body as { code?: unknown } | null)?.code;
@@ -11042,11 +11101,15 @@ export const register: Register = (on) => {
   // hook's. It waits for it inside `$` calls (`holdForPage`), so its own
   // time stays short of its budget however long the dialog waits; only where
   // holds fail does it wait on the clock, and then the page answers within
-  // that budget. A background agent's dialog waits on this hook instead, so
-  // a subagent's ask is the window's alone and the hook returns as it opens
-  // it.
+  // that budget. A background agent's dialog in a window waits on this hook
+  // instead, so there a subagent's ask is the window's alone and the hook
+  // returns as it opens it; a background session has no window to keep
+  // blank, so there the ask waits for the page as the main loop's does.
   on("classic.PermissionRequest", async ($, e, next) => {
     if (mirror === null || WINDOW_ONLY_TOOLS.has(e.tool_name)) return next(e);
+    // The session this window runs, read before anything waits: an ask
+    // opened here belongs to it, whatever chat the mirror moves to.
+    const background = mirror.background;
     const settled = await next(e);
     if (settled.decision !== undefined) return settled;
     // Its call: of the same tool and agent, with the same input, or the one
@@ -11064,7 +11127,7 @@ export const register: Register = (on) => {
       (alike.length === 1 ? alike[0] : undefined);
     if (call !== undefined) call.asked = true;
     const id = call?.id ?? `ask-${++askCount}`;
-    const windowOnly = agent !== null;
+    const windowOnly = agent !== null && background !== true;
     const page = openAsk(
       $,
       id,
@@ -11081,9 +11144,17 @@ export const register: Register = (on) => {
     // next step, closes it on the page as answered in the window.
     if (windowOnly) return settled;
     // An answer another post took settles it at once; the hold's request
-    // still out then ends by itself.
+    // still out then ends by itself. A subagent's ask waits at most
+    // `BACKGROUND_ASK_HOLD_MS`: its dialog is drawn only once this returns.
+    const cap =
+      agent === null
+        ? undefined
+        : $.clock.after(BACKGROUND_ASK_HOLD_MS, () => giveAskToWindow($, id));
     await Promise.race([page, holdForPage($, id)]);
+    // Holds that fail hand the looking to the clock, so the ask may still
+    // wait here: the cap stands until it is answered or closed.
     const answer = await page;
+    cap?.cancel();
     if (answer === null) return settled;
     if (!("allow" in answer)) {
       closeAsk($, id, "expired");

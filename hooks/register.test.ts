@@ -124,6 +124,7 @@ import {
   CARRIED_ON_LINE,
   LAPTOP_CHAT_INSTRUCTION,
   ASK_LOOK_MS,
+  BACKGROUND_ASK_HOLD_MS,
   BACKGROUND_ASK_LINE,
   BACKGROUND_LINE,
   HOLD_AFTER_MS,
@@ -7720,13 +7721,33 @@ describe("a window chat's mirror", () => {
       /* read to its end */
     }
   };
-  /** A world with this window's window chat open. */
+  /**
+   * A world with this window's window chat open, its session a background one
+   * (`claude --bg`) or a window as `background` says, and one `claude agents
+   * --json` never lists unless told.
+   */
   const mirrored = async (
     $: Parameters<TestBody>[0],
     on: On,
-    options: { hold?: boolean; home?: string; tools?: boolean } = {},
+    options: {
+      hold?: boolean;
+      home?: string;
+      tools?: boolean;
+      background?: boolean;
+    } = {},
   ) => {
     const w = world(on, options);
+    if (options.background !== undefined)
+      w.seen.claudeRun = {
+        exitCode: 0,
+        stdout: JSON.stringify([
+          {
+            kind: options.background ? "background" : "interactive",
+            sessionId: "conversation-1",
+          },
+        ]),
+        stderr: "",
+      };
     await $.session.start(START);
     await flush(w.clock);
     w.seen.chatAnswers.push(OPENED);
@@ -10887,7 +10908,8 @@ describe("a window chat's mirror", () => {
   test("a foreground subagent's permission ask is the window's alone too, while the main loop's turn runs: the hook returns at once", async ($, on) => {
     on("tool.call", () => new Promise(() => undefined) as never);
     on("classic.PermissionRequest", async () => ({}));
-    const { clock, seen } = await mirrored($, on);
+    // `claude agents --json` lists this session as a window of the machine.
+    const { clock, seen } = await mirrored($, on, { background: false });
     await $.turn.start({ text: "test it", turnId: "t1" });
     await flush(clock);
     $.tool
@@ -10915,6 +10937,108 @@ describe("a window chat's mirror", () => {
       },
     ]);
     expect(turnsTold(seen).filter((t) => "begin" in t)).toHaveLength(1);
+  });
+
+  test("a subagent's ask in a background session waits for the page, since no window is watched there", async ($, on) => {
+    let ran!: (result: { result: string }) => void;
+    on("tool.call", () => new Promise((resolve) => (ran = resolve)) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on, { background: true });
+    // The main loop's turn ended; its background agent goes on.
+    await $.turn.start({ text: "build it in the background", turnId: "t1" });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const call = $.tool.call({
+      tool: "Bash",
+      command: "rm -rf dist && pnpm build",
+      agentId: "a1",
+    });
+    await flush(clock);
+    // The hook waits on the page: nobody watches a window in a background
+    // session, so the person answers it there.
+    const hook = $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "rm -rf dist && pnpm build" },
+      agent_id: "a1",
+    } as never);
+    await flush(clock);
+    const [opened] = asksTold(seen);
+    expect(opened).toMatchObject({
+      state: "open",
+      ask: {
+        kind: "permission",
+        tool: "Bash",
+        label: "rm -rf dist && pnpm build",
+        windowOnly: false,
+      },
+    });
+    // Asked in a turn of its own, as any background agent's ask after the
+    // main loop's turn ended.
+    expect(turnsTold(seen).at(-1)!.begin).toMatchObject({
+      from: "harness",
+      text: BACKGROUND_ASK_LINE,
+    });
+    // While it waits, the turn asks devcorner for the page's answer every
+    // ASK_LOOK_MS, and the answer settles the hook's dialog.
+    const before = parts(seen).length;
+    seen.chatAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        answers: [{ id: opened!.id, answer: { allow: true } }],
+      },
+    };
+    await clock.advance(ASK_LOOK_MS);
+    await flush(clock);
+    expect(parts(seen).length).toBeGreaterThan(before);
+    expect(await hook).toMatchObject({ decision: { behavior: "allow" } });
+    // Claude Code says not whose answer it took: the call's end tells, as
+    // for the main loop's ask.
+    seen.chatAnswer = { status: 200, body: { ok: true } };
+    ran({ result: "ok" });
+    await call;
+    await flush(clock);
+    expect(asksTold(seen).at(-1)).toEqual({
+      id: opened!.id,
+      state: "answered",
+      by: "page",
+      said: "Allowed",
+    });
+  });
+
+  test("a background session's subagent ask the page never answers turns window-only at the cap, and the hook returns", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PermissionRequest", async () => ({}));
+    const { clock, seen } = await mirrored($, on, { background: true });
+    await $.turn.start({ text: "build it in the background", turnId: "t1" });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    await flush(clock);
+    const hook = $.classic.PermissionRequest({
+      tool_name: "Bash",
+      tool_input: { command: "pnpm build" },
+      agent_id: "a1",
+    } as never);
+    let settledAt: unknown = "pending";
+    void hook.then((r) => (settledAt = r));
+    await flush(clock);
+    const [opened] = asksTold(seen);
+    expect(opened).toMatchObject({ ask: { windowOnly: false } });
+    // The page never answers: the hook still waits just short of the cap.
+    await clock.advance(BACKGROUND_ASK_HOLD_MS - 1_000);
+    await flush(clock);
+    expect(settledAt).toBe("pending");
+    await clock.advance(1_000);
+    await flush(clock);
+    // Past it the hook returns with no decision, so the session's own
+    // dialog takes the ask, and the page is told it is the window's alone.
+    expect(await hook).not.toHaveProperty("decision");
+    expect(asksTold(seen).at(-1)).toMatchObject({
+      id: opened!.id,
+      state: "open",
+      ask: { kind: "permission", tool: "Bash", windowOnly: true },
+    });
   });
 
   test("two background agents asking at once share one turn of asks, which ends as the last ask closes", async ($, on) => {
@@ -11927,6 +12051,13 @@ describe("a revive: devcorner's page brings a chat's parked background session b
     expect(backgroundOf(listed, PARKED.sessionId)).toBe(true);
     expect(backgroundOf(listed, INTERACTIVE.sessionId)).toBe(false);
     expect(backgroundOf(listed, "c3")).toBeNull();
+    // A kind Claude Code adds later reads as a window.
+    expect(
+      backgroundOf(
+        JSON.stringify([{ ...PARKED, kind: "daemon" }]),
+        PARKED.sessionId,
+      ),
+    ).toBe(false);
     expect(backgroundOf("not json", PARKED.sessionId)).toBeNull();
   });
 

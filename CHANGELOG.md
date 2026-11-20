@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.76.0 — 2026-11-20
+
+- A subagent's permission ask now shows Allow and Deny on a window chat's page when that window's Claude Code runs as a background session (`claude --bg`, which `claude attach` reaches and no terminal window watches): answering on the page lets the agent go on, or stops the call when you deny it. Before, the page said to answer it in the window and there was no window, so the chat waited until someone attached on that machine. A chat in a terminal window is unchanged, its subagent's ask answered in the window alone since Claude Code draws that dialog only once the plugin's hook has returned, and a session whose kind could not be read is treated as a window.
+
 ## 0.75.0 — 2026-11-20
 
 - A window chat's page now says when the window holds your words after a Stop pressed there. Claude Code takes nothing a plugin types in until you type in that window yourself, and only the window's toast said so: the page showed "Waiting for the window" with no word of why. The window now tells devcorner while it holds them and when it lets go, and the page's line under the box says to type in the window.
