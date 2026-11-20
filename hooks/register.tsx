@@ -43,7 +43,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.78.0";
+export const PLUGIN_VERSION = "0.79.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -5698,6 +5698,8 @@ interface Mirror {
   sending: Promise<void>;
   /** The posts that carry something and did not reach devcorner yet, in order: each goes, as it was, before anything after it. */
   unsent: MirrorPayload[];
+  /** How many of a look's own retries failed since it was asked; 0 for a look just asked (`mirrorPost` bounds them with `MIRROR_TRIES`). */
+  lookTries: number;
   /** The next try of `unsent`, while one is due. */
   retry?: Timer;
   beat?: Timer;
@@ -6582,7 +6584,7 @@ interface MirrorPayload {
   tries: number;
 }
 
-/** Whether a post carries what devcorner must take: a beginning, parts or an end. A look or a beat carries none, and a failed one is not sent again. */
+/** Whether a post carries what devcorner must take: a beginning, parts or an end. A look or a beat carries none, and a failed one is not kept; a look is asked again by itself, bounded (`mirrorPost`). */
 const carries = (payload: MirrorPayload) =>
   payload.begin !== null ||
   payload.parts.length > 0 ||
@@ -6678,7 +6680,27 @@ async function mirrorPost(
     if (what.holds && m.holdsSent === (pageHeld !== null)) return;
     let payload = build();
     if (!carries(payload)) {
-      await sendMirror($, m, payload);
+      // A look that failed is asked again by itself: it is what fetches the
+      // page's words a held request was told of, so a post that failed after
+      // devcorner took it would otherwise leave them waiting until the
+      // window's next turn. Only a look a hold was told to make (a `{chat}`
+      // frame, `tellHolds`) or such a look's own retry: a beat or a batch
+      // that carries nothing is not sent again, as before, and never starts
+      // the count over. Bounded like a post of a turn already over
+      // (`MIRROR_TRIES`).
+      if (what.look && !what.retry) m.lookTries = 0;
+      if (await sendMirror($, m, payload)) m.lookTries = 0;
+      else if (
+        mirror === m &&
+        (what.look === true || what.retry === true) &&
+        m.lookTries < MIRROR_TRIES
+      ) {
+        m.lookTries += 1;
+        m.retry ??= $.clock.after(MIRROR_RETRY_MS, () => {
+          m.retry = undefined;
+          if (mirror === m) void mirrorPost($, { retry: true });
+        });
+      }
       return;
     }
     // Parts past one post's most go in the posts after it.
@@ -9008,6 +9030,7 @@ async function mirrorOpened(
     holdsSent: null,
     sending: Promise.resolve(),
     unsent: [],
+    lookTries: 0,
   };
   void $.session
     .id()
@@ -9020,6 +9043,13 @@ async function mirrorOpened(
     reconnecting: false,
   })).catch(() => undefined);
   if (began) await instructWindow($, id);
+  // One look, whether or not the opening's answer named any words. devcorner
+  // hands a chat's words in the answer of every post until a turn of the
+  // window takes them, and a window's opening is often the first post after
+  // the words were handed to a copy that is gone (a reload, a restart, a chat
+  // moved from another window): that post's answer cleared their mark, so
+  // nothing else tells the copy that mirrors now of them.
+  void mirrorPost($, { look: true }).catch(() => undefined);
   return [
     `dc: ${body.started === true ? "This window is now" : "This window mirrors"} window chat ${id}${typeof body.url === "string" ? `: ${body.url}` : "."}`,
     typeof body.movedFrom === "string"

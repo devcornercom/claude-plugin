@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.79.0 — 2026-11-20
+
+- A window chat's page message no longer goes missing while the window is idle. devcorner used to stop telling a window's held request that page words wait at the window's first post, whatever that post came to: one that failed, or one that carried none of them, left the store telling the window no more, so they reached it only at its next turn, which the person gave by typing there. The store now stops telling the window only at a post whose answer carried every word that waited, and only while no word was said since that post read the mark, so a post that did not carry them leaves the next held request told again. A look that fails is asked again by itself, up to three tries, since a look is what fetches those words, and a chat's opening asks one look of its own, since the window before it held the words it was handed in its memory alone. (A post whose answer the window never read still ends the telling, since the route says so before it returns; the look retry is what covers that case.)
+
 ## 0.78.0 — 2026-11-20
 
 - A window that reloads on request with nothing newer on disk confirms the reload at once. Claude Code reloads only the plugin modules that changed, so the same copy stays loaded and its idle window sent no Status until its next event, which left devcorner showing "reload asked" for minutes. The copy that survives a reload now reads Status right away, which says its version and ends the ask.
@@ -17,7 +21,7 @@ The devcorner plugin for Claude Code. A new version comes with a release of devc
 
 ## 0.76.0 — 2026-11-20
 
-- A subagent's permission ask now shows Allow and Deny on a window chat's page when that window's Claude Code runs as a background session (`claude --bg`, which `claude attach` reaches and no terminal window watches): answering on the page lets the agent go on, or stops the call when you deny it. Before, the page said to answer it in the window and there was no window, so the chat waited until someone attached on that machine. A chat in a terminal window is unchanged, its subagent's ask answered in the window alone since Claude Code draws that dialog only once the plugin's hook has returned, and a session whose kind could not be read is treated as a window.
+- A subagent's permission ask now shows Allow and Deny on a window chat's page when that window's Claude Code runs as a background session (`claude --bg`, which `claude attach` reaches and no terminal window watches): answering on the page lets the agent go on, or stops the call when you deny it. The ask waits for the page for up to 30 minutes; after that the session's own dialog takes it and the page says to answer it there. Before, the page said to answer it in the window and there was no window, so the chat waited until someone attached on that machine. A chat in a terminal window is unchanged, its subagent's ask answered in the window alone since Claude Code draws that dialog only once the plugin's hook has returned, and a session whose kind could not be read is treated as a window.
 
 ## 0.75.0 — 2026-11-20
 

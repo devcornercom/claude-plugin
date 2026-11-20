@@ -7714,7 +7714,14 @@ describe("a window chat's mirror", () => {
     },
   };
   const STEP = { index: 0, model: "opus", messageCount: 1 } as const;
+  // The posts of a turn this window mirrored: a look names no turn, and is no
+  // part of one (one is asked as a chat opens, and by a `{chat}` frame).
   const parts = (seen: { chats: Record<string, unknown>[] }) =>
+    seen.chats.filter(
+      (c) => c.hook_event_name === "ChatParts" && c.turn !== null,
+    );
+  /** Every post this window's mirror made (`ChatParts`), the looks among them. */
+  const posts = (seen: { chats: Record<string, unknown>[] }) =>
     seen.chats.filter((c) => c.hook_event_name === "ChatParts");
   const stream = async (
     $: Parameters<TestBody>[0],
@@ -9459,6 +9466,91 @@ describe("a window chat's mirror", () => {
     expect(seen.waitBodies).toHaveLength(waits + QUICK_MAX);
   });
 
+  test("a look that failed is asked again by itself, and the words its answer carries are typed in", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    const looks = seen.chats.length;
+    // A frame tells the window its page's words wait; that look's post fails.
+    seen.chatAnswers.push("down");
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.chats).toHaveLength(looks + 1);
+    expect(seen.submitted).toEqual([]);
+    // The failure is tried again by itself, bounded, and the retry that goes
+    // types the words its answer names in.
+    seen.chatAnswers.push("down");
+    await clock.advance(MIRROR_RETRY_MS);
+    await flush(clock);
+    expect(seen.chats).toHaveLength(looks + 2);
+    expect(seen.submitted).toEqual([]);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "and the docs" }] },
+    };
+    await clock.advance(MIRROR_RETRY_MS);
+    await flush(clock);
+    expect(seen.chats).toHaveLength(looks + 3);
+    expect(seen.chats.at(-1)).toMatchObject({ turn: null, parts: [] });
+    expect(seen.submitted).toEqual(["and the docs"]);
+  });
+
+  test("a look that keeps failing is tried three times, then left to the hold that asks afresh", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    const looks = seen.chats.length;
+    seen.chatAnswer = { status: 500, body: {} };
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.chats).toHaveLength(looks + 1);
+    // Three of its own retries, each a post of its own, and then none: the
+    // hold a frame told opens again and asks a look afresh.
+    for (let i = 0; i < 3; i++) {
+      await clock.advance(MIRROR_RETRY_MS);
+      await flush(clock);
+      expect(seen.chats).toHaveLength(looks + 2 + i);
+    }
+    await clock.advance(MIRROR_RETRY_MS);
+    await flush(clock);
+    expect(seen.chats).toHaveLength(looks + 4);
+  });
+
+  test("a beat that carries nothing is not asked again by itself", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    const posts = seen.chats.length;
+    // devcorner is down: the beat's own post fails, and no retry of its own
+    // follows it (only a look a hold was told to make is asked again).
+    seen.chatAnswer = { status: 500, body: {} };
+    await clock.advance(MIRROR_BEAT_MS);
+    await flush(clock);
+    expect(seen.chats).toHaveLength(posts + 1);
+    await clock.advance(MIRROR_RETRY_MS);
+    await flush(clock);
+    expect(seen.chats).toHaveLength(posts + 1);
+  });
+
+  test("a chat's opening asks a look, which fetches the words the copy before it was handed", async ($, on) => {
+    const { clock, seen } = world(on, {
+      store: { "laptopChat:conversation-1": "me-k3" },
+    });
+    seen.chatAnswers.push(OPENED);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "and the docs" }] },
+    };
+    await $.session.start(START);
+    await flush(clock);
+    // The look the opening asked is what fetches them: a copy a reload left
+    // behind had them in memory only, and the post that handed them to it
+    // cleared their mark as it answered. A chat moved to a window or turned on
+    // again goes through the same opening (`mirrorOpened`).
+    expect(seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "ChatParts",
+      turn: null,
+      parts: [],
+    });
+    expect(seen.submitted).toEqual(["and the docs"]);
+  });
+
   test("a failed post goes again as it was, before the parts since, each numbered once in its turn", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     await $.turn.start({ text: "work", turnId: "t1" });
@@ -9658,8 +9750,8 @@ describe("a window chat's mirror", () => {
     await flush(clock);
     expect(seen.dropped).toEqual(["and the docs"]);
     // No post of its own follows a drop: a look says the window holds them.
-    expect(parts(seen).at(-1)).toMatchObject({ turn: null, holds: true });
-    const said = parts(seen).length;
+    expect(posts(seen).at(-1)).toMatchObject({ turn: null, holds: true });
+    const said = posts(seen).length;
     // The person says more on the page once the Stop stands no more: the
     // window lets go, says so, and types the first message.
     seen.submitDropped = null;
@@ -9671,7 +9763,7 @@ describe("a window chat's mirror", () => {
     seen.held.pop()!(chat);
     await flush(clock);
     expect(seen.submitted).toEqual(["and the docs"]);
-    expect(parts(seen).slice(said).at(-1)).toMatchObject({ holds: false });
+    expect(posts(seen).slice(said).at(-1)).toMatchObject({ holds: false });
     // Its turn's beginning says how long the window held it since it first
     // had it, on its own clock.
     await $.turn.start({ text: "and the docs", turnId: "t1" });
@@ -10389,11 +10481,22 @@ describe("a window chat's mirror", () => {
     ]);
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
-    expect(seen.chats).toHaveLength(2);
+    // The second rejoin is taken, and asks a look of its own: the page's
+    // words a copy a reload dropped are in no mark, and this is what fetches
+    // them for the copy that mirrors now.
+    expect(seen.chats).toHaveLength(3);
+    expect(seen.chats[1]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      rejoin: true,
+    });
+    expect(seen.chats.at(-1)).toMatchObject({
+      hook_event_name: "ChatParts",
+      turn: null,
+    });
     expect(stored.get("laptopChat:conversation-1")).toBe("me-k3");
     await $.turn.start({ text: "carry on", turnId: "t1" });
     await flush(clock);
-    expect(parts(seen)).toHaveLength(1);
+    expect(parts(seen).filter((c) => c.turn === "t1")).toHaveLength(1);
 
     // A chat turned off meanwhile is forgotten.
     seen.chatAnswers.push({
@@ -11461,7 +11564,7 @@ describe("a window chat's mirror", () => {
     // The mirror's first post said none ran; the command runs on in the
     // background, which the posts since it moved said once, and its
     // notification's turn says it runs no more.
-    const said = parts(seen).filter((post) => "running" in post);
+    const said = posts(seen).filter((post) => "running" in post);
     expect(said.map((post) => post.running)).toEqual([
       [],
       [{ id: "bg7", label: "pnpm dev" }],
@@ -12129,7 +12232,9 @@ describe("a laptop launch: devcorner's page starts a session on this machine", (
     });
     await $.command.run({ command: "dc", args: "chat --launch 7" } as never);
     await flush(w.clock);
-    expect(w.seen.chats.at(-1)).toMatchObject({
+    expect(
+      w.seen.chats.find((c) => c.hook_event_name === "ChatOpen"),
+    ).toMatchObject({
       hook_event_name: "ChatOpen",
       launch: "7",
       title: "",
@@ -12493,7 +12598,9 @@ describe("a revive: devcorner's page brings a chat's parked background session b
       args: "chat Fix the cart",
     } as never);
     await flush(w.clock);
-    expect(w.seen.chats.at(-1)).toMatchObject({
+    expect(
+      w.seen.chats.find((c) => c.hook_event_name === "ChatOpen"),
+    ).toMatchObject({
       hook_event_name: "ChatOpen",
       background: true,
     });
