@@ -2,6 +2,22 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.83.0 — 2026-11-21
+
+- An idle window's held request stays at 25 s, under the 30 s after which Claude Code's fetch gives up on it. A hold cut on the way after devcorner held it whole is held again at once rather than waiting the poll's five minutes; one that fails sooner still leaves the poll, as before.
+- A read on a timer asks for the session part alone: the session this window works as, its mail and whether its person asked it to reload. What waits, Next, what is moving and the OA are read when the turn ends or devcorner says something changed, not every 30 s while a turn runs.
+- The session this window stated is claimed once, until devcorner takes it, and again only when the held request says its tie changed.
+
+## 0.82.0 — 2026-11-21
+
+- A window chat no longer shows "online" for a window whose replies stop reaching it. Each copy of the plugin that loads in a window (a reload makes a new one) now names itself to devcorner when it opens or rejoins a chat, and devcorner counts only that copy's posts and held requests as the window being there. A copy a reload replaced, which used to keep holding requests for the old conversation and so kept the chat "online", is now refused and stops its timers and its mirroring.
+- After a plugin reload or a `/clear`, the same window takes its chat back by itself, with no `/dc continue --takeover`. The plugin keeps a key for the window that outlives a reload and a new conversation, and devcorner moves the chat to the window's new conversation when that key matches. If devcorner cannot be reached while the window comes back, the window remembers the chat until it is taken back, and the next reload or new conversation in it takes it back.
+- A turn's end no longer disappears when devcorner is briefly unreachable. Posting an ended turn now retries five times, waiting 5, 10, 20, 40 and 40 seconds, which covers the minute devcorner asks to be left alone after a deploy, where before it gave up after three tries 5 seconds apart. A turn begun while that end waits no longer sends it again every 30 seconds with its "still running" beat, outside that schedule. If the end still never arrives, the window's next held request says it no longer owes that turn, and devcorner ends it on the page as a reply that did not reach it, so the page stops showing "Thinking…". The window's own reply replaces that line if it arrives later.
+
+## 0.81.0 — 2026-11-20
+
+- A window chat's page words no longer reach the window out of the order they were said, nor twice. A prompt the plugin submitted, a wake or `/dc`'s ask, waited in Claude Code for its turn while the page's words were typed in behind it: the wake's turn then began with those words under its reply, and their own turn came later, drawn again as a new bubble carrying the "Sent from devcorner's page" line. The page's words now wait for any prompt the window already holds to begin its turn, and a turn that began for another prompt never takes them: only the turn that begins with their own prompt's words takes them. A word the window has given the model, typed or joined, is left out of every answer until that turn's end, so devcorner naming it waiting once more can never put it back and type it again. A prompt whose turn never begins holds later words no longer than the wait's own two minutes, wherever that hold is read, and two calls that find the words waiting at once type one message in, never two. On the page, a window's ask is drawn where it was asked, so the work that followed an answered question stands under its card.
+
 ## 0.80.0 — 2026-11-20
 
 - A window chat's page now shows what the window shows. Its reasoning, which is the window's own progress lines, goes with a turn's parts, so the page's head says the newest line while the window thinks instead of a bare "Thinking…", its first line cut to the row. Each tool call now sends what it went in with (an edit's change as a small diff, a shell call's command, a read's or a write's file) and what it printed when it returns (a command's output and errors, a read's lines), which the page draws under the step's line of calls, closed until the step is opened. Both are cut at what devcorner keeps of a call, and a tool the terminal draws nothing of, or a subagent's call, sends neither.

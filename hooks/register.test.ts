@@ -75,6 +75,7 @@ import {
   noticeToast,
   pendingOf,
   readHeld,
+  withLight,
   LAUNCHER_NAME,
   LAUNCHER_PIN,
   foldRemote,
@@ -125,6 +126,7 @@ import {
   type WindowTask,
   MAX_EXCHANGES,
   MIRROR_BATCH_MS,
+  MIRROR_END_TRIES,
   MIRROR_RETRY_MS,
   CARRIED_ON_LINE,
   LAPTOP_CHAT_INSTRUCTION,
@@ -928,7 +930,9 @@ test("devcorner's answer that it is updating is read with the wait it names, and
   expect(updatingFor({ status: 200, headers: {}, text: updating })).toBe(null);
 });
 
-test("the held request names a hold shorter than $.http.fetch is known to wait", () => {
+test("the held request stays under the fetch's 30 s", () => {
+  // Claude Code's $.http.fetch gives up on an answer not complete within
+  // 30 s, so a longer hold would be cut by the client every time.
   expect(HOLD_MS).toBeLessThan(30_000);
 });
 
@@ -1177,6 +1181,8 @@ describe("what a wake names (dc-t204)", () => {
 
 /** What a test answers a held request with to have it answered that devcorner is updating. */
 const HELD_UPDATING = "<updating>";
+/** What a test answers a held request with to have its fetch fail, as a client's own timeout does. */
+const HELD_FAILED = "<failed>";
 
 /** How devcorner answers for the minute after a deploy that changed its contract. */
 const UPDATING_ANSWER = {
@@ -1321,6 +1327,9 @@ function world(
     dropped: [] as string[],
     toasts: [] as string[],
     draft: "",
+    /** While true, a read of the prompt's words waits until the test lets it (`heldDraft`). */
+    holdDraft: false,
+    heldDraft: [] as (() => void)[],
     answer: waiting(0, null) as Status | "down" | "updating" | "refused",
     /** The held request is answered that devcorner is updating. */
     waitUpdating: false,
@@ -1645,6 +1654,7 @@ function world(
       const text = await new Promise<string>((resolve) =>
         seen.held.push(resolve),
       );
+      if (text === HELD_FAILED) return { deny: "unreachable" };
       if (text === HELD_UPDATING) return { value: UPDATING_ANSWER };
       return { value: { status: 200, ok: true, headers: {}, text } };
     }
@@ -1659,11 +1669,24 @@ function world(
     if (answer === "down") return { deny: "unreachable" };
     if (answer === "updating") return { value: UPDATING_ANSWER };
     if (answer === "refused") return answer401;
-    // devcorner says back a branch it took (dc-t334), unless a test says not.
+    // devcorner answers a light ask with the session part alone,
+    // and says back a branch it took (dc-t334), unless a test says not.
     const text = JSON.stringify(
-      typeof sent.branch === "string" && seen.takesBranch
-        ? { ...answer, branch: sent.branch }
-        : answer,
+      sent.light === true &&
+        typeof answer === "object" &&
+        typeof sent.branch !== "string" &&
+        sent.claim === undefined &&
+        sent.plugin === undefined
+        ? {
+            light: true,
+            repo: answer.repo,
+            session: answer.session,
+            conversation: answer.conversation,
+            reload: answer.reload,
+          }
+        : typeof sent.branch === "string" && seen.takesBranch
+          ? { ...answer, branch: sent.branch }
+          : answer,
     );
     return { value: { status: 200, ok: true, headers: {}, text } };
   });
@@ -1740,9 +1763,12 @@ function world(
   on("session.surfaces", async () => ({
     value: seen.surfaces === 0 ? [] : (["terminal"] as const),
   }));
-  on("prompt.read", async () => ({
-    value: { text: seen.draft, cursor: seen.draft.length },
-  }));
+  on("prompt.read", async () => {
+    if (seen.holdDraft) {
+      await new Promise<void>((resolve) => seen.heldDraft.push(resolve));
+    }
+    return { value: { text: seen.draft, cursor: seen.draft.length } };
+  });
   on("prompt.submit", async (_$, e) => {
     if (seen.submitRefused) throw new Error("refused here");
     if (seen.submitDropped !== null) {
@@ -2782,6 +2808,47 @@ const flush = async (clock: { settle: () => Promise<void> }) => {
 describe("the held request", () => {
   const wake = (id: string) => JSON.stringify({ wake: "dc-s7", id });
 
+  test("an idle stretch opens one held request at a time, with no status beside them", async ($, on) => {
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    expect(seen.waitBodies[0]).toMatchObject({ timeout: HOLD_MS });
+    const asked = seen.asks;
+    // Each hold ends at its own length with nothing to say, and the next opens
+    // at once: one request each, and no Status read while nothing happens.
+    for (let held = 0; held < 2; held++) {
+      await clock.advance(HOLD_MS);
+      seen.held.shift()!("{}");
+      await flush(clock);
+    }
+    expect(seen.waitBodies).toHaveLength(3);
+    expect(seen.asks).toBe(asked);
+  });
+
+  test("a hold cut after its whole length is held again at once; one that failed sooner leaves the poll", async ($, on) => {
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    // Held its whole length and then cut on the way: devcorner held it, so it
+    // holds again rather than wait the poll's five minutes.
+    await clock.advance(HOLD_MS);
+    seen.held.shift()!(HELD_FAILED);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(2);
+    // One that failed after 3 s, as a slow error does, is devcorner failing,
+    // however long it took: the poll has the conversation, and the held
+    // request waits.
+    const asked = seen.asks;
+    await clock.advance(3_000);
+    seen.held.shift()!(HELD_FAILED);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(2);
+    await clock.advance(IDLE_MS);
+    expect(seen.waitBodies).toHaveLength(2);
+    expect(seen.asks).toBeGreaterThan(asked);
+  });
+
   test("wakes through the held request, once for each message, passing the cursor", async ($, on) => {
     const { clock, seen } = world(on, { hold: true });
     await $.session.start(START);
@@ -3368,6 +3435,56 @@ describe("the marker the prompt hooks read (dc-t173)", () => {
     ).toBe(3);
     // A devcorner too old to count them cannot say.
     expect(pendingOf(waiting(0, null))).toBe(null);
+  });
+
+  test("a light read keeps the row's last picture and takes the session's news", () => {
+    const before: Status = {
+      ...waiting(0, null),
+      waiting: 7,
+      conversation: {
+        id: "dc-h3",
+        wakeMessages: 0,
+        wakeMessageId: null,
+        wakes: [],
+        pending: 2,
+      },
+    };
+    const merged = withLight(before, {
+      light: true,
+      repo: "a/b",
+      session: {
+        id: "dc-s7",
+        ticket: "dc-t1",
+        pending: 2,
+        waitingOnPerson: true,
+      },
+      conversation: null,
+      reload: 1_700_000_000_000,
+    });
+    // The session's own news, and the rest as the last full read gave it.
+    expect(merged).toMatchObject({
+      waiting: 7,
+      session: { id: "dc-s7", ticket: "dc-t1", pending: 2 },
+      conversation: null,
+      reload: 1_700_000_000_000,
+    });
+    // Nothing to merge into: a light read fills no row of its own.
+    expect(withLight(null, { light: true, repo: "a/b", session: null })).toBe(
+      null,
+    );
+  });
+
+  test("a turn's timer asks the light status, and a turn's end asks the whole picture", async ($, on) => {
+    const { clock, seen } = world(on, { home: "/home/ann", hold: true });
+    seen.answer = pending(0);
+    await $.session.start(START);
+    await clock.settle();
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await clock.advance(30_000);
+    expect(seen.statusBodies.at(-1)).toMatchObject({ light: true });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.statusBodies.at(-1)!.light).toBeUndefined();
   });
 
   test("is written at each Status, every 30 s while a turn runs, and as a wake arrives", async ($, on) => {
@@ -6527,6 +6644,60 @@ describe("the window states the session it runs as (dc-t588)", () => {
     });
   });
 
+  test("a claim devcorner took is stated no more", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    seen.answer = {
+      ...waiting(0, null, false),
+      claim: {
+        session: "acm-s4",
+        outcome: "kept",
+        was: null,
+        why: null,
+        final: false,
+      },
+    };
+    await now($, clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    // Taken: a Status states none, so a read on a timer checks no claim.
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+  });
+
+  test("the held request's claim frame states the claim again, so devcorner checks the tie", async ($, on) => {
+    const { clock, seen } = world(on, {
+      hold: true,
+      home: "/home/ann",
+      files: [[CLAIMS, "acm-s4\n"]],
+    });
+    const kept: Status = {
+      ...waiting(0, null, false),
+      claim: {
+        session: "acm-s4",
+        outcome: "kept",
+        was: null,
+        why: null,
+        final: false,
+      },
+    };
+    seen.answer = kept;
+    // A session's start reads Status once, which states the window's claim.
+    await $.session.start(START);
+    await flush(clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+    await now($, clock);
+    expect(lastClaim(seen)).toBeUndefined();
+    // The tie devcorner says changed is stated again, which asks it to
+    // check and repair it.
+    seen.held.shift()!(JSON.stringify({ claim: "conversation-1" }));
+    await flush(clock);
+    expect(lastClaim(seen)).toBe("acm-s4");
+  });
+
   test("the main conversation's start names this window as its harness, whatever the model passed (dc-t610)", async ($, on) => {
     const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
     await $.session.start(START);
@@ -9283,6 +9454,138 @@ describe("a window chat's mirror", () => {
     expect(seen.submitted).toEqual(["message w1", "message w2", "message w3"]);
   });
 
+  test("a turn begun for something else never takes the page's words: their own turn does", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    const docs = { key: "w1", text: "and the docs" };
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [docs] } };
+    await $.turn.start({ text: "work", turnId: "t0" });
+    await flush(clock);
+    // The window is idle and the page's words go in as the person's prompt.
+    await $.turn.complete(done("t0"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    // A turn of something else begins first, here a prompt the harness made:
+    // its turn is not the page's words' and takes none of them.
+    await $.turn.start({ text: WAKE(), turnId: "t1" });
+    await flush(clock);
+    const first = parts(seen).at(-1) as {
+      begin: { from: string; took: string[] };
+    };
+    expect(first).toMatchObject({ turn: "t1", begin: { took: [] } });
+    expect(first.begin.from).not.toBe("page");
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    // Their own turn takes them, and they are typed in once, where they were
+    // sent.
+    await $.turn.start({ text: "and the docs", turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { from: "page", took: ["w1"] },
+    });
+    expect(seen.submitted).toEqual(["and the docs"]);
+  });
+
+  test("an answer that still names the page's words after they were typed does not put them back: each goes in once", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    const docs = { key: "w1", text: "and the docs" };
+    // Every answer names the words waiting, as devcorner does until a post of
+    // the window carried them.
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [docs] } };
+    await $.turn.start({ text: "work", turnId: "t0" });
+    await flush(clock);
+    await $.turn.complete(done("t0"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    // Their own turn takes them, and this post's answer still names them.
+    await $.turn.start({ text: "and the docs", turnId: "t1" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      begin: { from: "page", took: ["w1"] },
+    });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+  });
+
+  test("a prompt submit heard for the page's words hands them to no turn but their own", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    const docs = { key: "w1", text: "and the docs" };
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [docs] } };
+    await $.turn.start({ text: "work", turnId: "t0" });
+    await flush(clock);
+    await $.turn.complete(done("t0"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["and the docs"]);
+    // The engine hears the page's prompt as it is submitted, as it does for
+    // the words the window holds: that alone is no turn's claim on them.
+    await $.prompt.submit({
+      text: "and the docs",
+      origin: { kind: "composer" },
+      wait: false,
+    } as never);
+    await $.turn.start({ text: WAKE(), turnId: "t1" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      begin: { took: [] },
+    });
+    expect(
+      (parts(seen).at(-1) as { begin: { from: string } }).begin.from,
+    ).not.toBe("page");
+  });
+
+  test("the page's words wait while a prompt the window holds has not begun its turn, and go once its settle ends", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "and the docs" }] },
+    };
+    await $.turn.start({ text: "work", turnId: "t0" });
+    await flush(clock);
+    // A /dc ask submits a prompt of its own, whose turn has not begun.
+    await $.command.run({ command: "dc", args: "what is next" } as never);
+    await flush(clock);
+    expect(seen.submitted).toEqual(["devcorner: what is next"]);
+    // The turn ends: the page's words take no place in the queue behind that
+    // prompt, where the words said after them would pass them.
+    await $.turn.complete(done("t0"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["devcorner: what is next"]);
+    // Its settle ends with no turn begun: they go then, after it.
+    await clock.advance(WAKE_SETTLE_MS);
+    await flush(clock);
+    expect(seen.submitted).toEqual(["devcorner: what is next", "and the docs"]);
+  });
+
+  test("the page's words whose own turn never begins hold later words no longer than the settle", async ($, on) => {
+    const { clock, seen } = await mirrored($, on);
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w1", text: "message w1" }] },
+    };
+    await $.turn.start({ text: "work", turnId: "t0" });
+    await flush(clock);
+    await $.turn.complete(done("t0"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w1"]);
+    // Their own turn never begins, and the page says more: the words after
+    // them wait for that turn up to its settle.
+    seen.chatAnswer = {
+      status: 200,
+      body: { ok: true, words: [{ key: "w2", text: "message w2" }] },
+    };
+    await $.turn.start({ text: WAKE(), turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w1"]);
+    await clock.advance(WAKE_SETTLE_MS);
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w1", "message w2"]);
+  });
+
   test("messages said mid-turn join it at its next main-loop tool result, up to a command, once, and devcorner is told", async ($, on) => {
     const { clock, seen } = await mirrored($, on, { tools: true });
     seen.chatAnswer = {
@@ -9594,6 +9897,53 @@ describe("a window chat's mirror", () => {
     expect(seen.submitted).toEqual(["and the docs"]);
   });
 
+  test("two calls that find the page's words at once type one in, and the next waits for its turn", async ($, on) => {
+    const { clock, seen } = await holding($, on);
+    const words = {
+      status: 200,
+      body: {
+        ok: true,
+        words: [
+          { key: "w9", text: "message w9" },
+          { key: "w10", text: "message w10" },
+        ],
+      },
+    };
+    // Two messages wait, and what the person drafts keeps them waiting: the
+    // answer sets the retry that comes due once the clock moves.
+    seen.draft = "half typed";
+    seen.chatAnswer = words;
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.submitted).toEqual([]);
+    // The retry comes due and waits on the draft's read, as a call may wait.
+    seen.holdDraft = true;
+    await clock.advance(WAITING_MS);
+    await flush(clock);
+    expect(seen.heldDraft).toHaveLength(1);
+    // The person stops drafting and the page says the words wait: a look's
+    // answer types the oldest in while the retry still waits.
+    seen.holdDraft = false;
+    seen.draft = "";
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w9"]);
+    // Released, the retry takes nothing: the next word waits for that turn's
+    // end, as any does.
+    seen.heldDraft.shift()!();
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w9"]);
+    await $.turn.start({ text: "message w9", turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t2",
+      begin: { text: "message w9", from: "page", took: ["w9"] },
+    });
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    expect(seen.submitted).toEqual(["message w9", "message w10"]);
+  });
+
   test("a look that keeps failing is tried three times, then left to the hold that asks afresh", async ($, on) => {
     const { clock, seen } = await holding($, on);
     const looks = seen.chats.length;
@@ -9611,6 +9961,26 @@ describe("a window chat's mirror", () => {
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
     expect(seen.chats).toHaveLength(looks + 4);
+  });
+
+  test("a chat's opening binds this copy and window, and its held request names this copy and the turn it still owes", async ($, on) => {
+    const { seen } = await holding($, on);
+    // The name is the loaded copy's own: the test file's import of the module
+    // is another copy, with another name. The hold and the posts repeat it.
+    expect(seen.chats[0]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      generation: expect.any(String),
+      windowKey: expect.any(String),
+    });
+    const copy = seen.chats[0]!.generation;
+    // The turn's end went, so the hold owes devcorner no turn: one devcorner
+    // still has under way ended here with its end lost on the way.
+    expect(seen.waitBodies.at(-1)).toMatchObject({
+      mirror: { generation: copy, turn: null },
+    });
+    expect(
+      seen.chats.filter((c) => c.hook_event_name === "ChatParts"),
+    ).toContainEqual(expect.objectContaining({ generation: copy }));
   });
 
   test("a beat that carries nothing is not asked again by itself", async ($, on) => {
@@ -9714,12 +10084,12 @@ describe("a window chat's mirror", () => {
     ]);
   });
 
-  test("a failed end goes again before what follows, then is given up after its retries", async ($, on) => {
+  test("a failed end goes again before what follows, each retry waiting longer, then is given up after its retries", async ($, on) => {
     const { clock, seen } = await mirrored($, on);
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     const down = { status: 503, body: {} };
-    seen.chatAnswers.push(down, down, down, down, down);
+    seen.chatAnswers.push(down, down, down, down, down, down, down);
     await $.turn.complete({ ...done("t1"), answer: "Done." });
     await flush(clock);
     const ends = () => parts(seen).filter((p) => p.end !== undefined);
@@ -9732,24 +10102,38 @@ describe("a window chat's mirror", () => {
     await flush(clock);
     expect(ends()).toHaveLength(3);
     expect(parts(seen).at(-1)).toMatchObject({ turn: "t1" });
+    // Each retry after a failed one waits twice as long, up to 40 s, so the
+    // minute devcorner is updating after a deploy does not use them up.
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
+    expect(ends()).toHaveLength(3);
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
-    // Its third retry failed: it is given up, and what waited behind it goes.
-    expect(ends()).toHaveLength(5);
+    expect(ends()).toHaveLength(4);
+    // The new turn's beats, every 30 s, send nothing behind the failed end:
+    // only its retries do.
+    for (const [i, wait] of [4, 8, 8].entries()) {
+      await clock.advance(wait * MIRROR_RETRY_MS);
+      await flush(clock);
+      expect(ends()).toHaveLength(5 + i);
+    }
+    // Its fifth retry failed: it is given up, and what waited behind it goes
+    // at the next retry.
+    expect(ends()).toHaveLength(MIRROR_END_TRIES + 2);
     expect(ends().at(-1)).toMatchObject({
       turn: "t1",
       end: { text: "Done.", outcome: "done" },
     });
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
-    expect(ends()).toHaveLength(5);
     expect(parts(seen).at(-1)).toMatchObject({
       turn: "t2",
       post: 0,
       begin: { text: "more", from: "window" },
     });
+    await clock.advance(8 * MIRROR_RETRY_MS);
+    await flush(clock);
+    expect(ends()).toHaveLength(MIRROR_END_TRIES + 2);
   });
 
   test("a turn stopped in the window holds the page's words waiting, until the person says more there", async ($, on) => {
@@ -11394,7 +11778,11 @@ describe("a window chat's mirror", () => {
     await $.turn.start({ text: "build it in the background", turnId: "t1" });
     await $.turn.complete(done("t1"));
     await flush(clock);
-    void $.tool.call({ tool: "Bash", command: "pnpm build", agentId: "a1" });
+    // The subagent's command still runs as the test ends, when the kit
+    // refuses the call.
+    $.tool
+      .call({ tool: "Bash", command: "pnpm build", agentId: "a1" })
+      .catch(() => undefined);
     await flush(clock);
     const hook = $.classic.PermissionRequest({
       tool_name: "Bash",

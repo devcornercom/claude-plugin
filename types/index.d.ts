@@ -148,6 +148,24 @@ export type Status = {
 };
 
 /**
+ * What a Status read on a timer answers: the session the
+ * conversation works as, with its mail, and the reload ask, never the repo's
+ * work. The plugin keeps the last full Status and takes these from a light
+ * one; devcorner answers one for a Status that says `light: true` and carries
+ * no news of its own (no branch that moved, no claim, no version).
+ */
+export type StatusLight = {
+  light: true;
+  repo: string;
+  /** The session the conversation works as, as a full Status gives it. */
+  session: StatusSession | null;
+  /** The conversation, when it works as no live session (dc-t312). */
+  conversation?: StatusConversation | null;
+  /** When this window's person asked it to reload its plugin (dc-t588). */
+  reload?: number | null;
+};
+
+/**
  * devcorner's word on the session a window stated it runs as (dc-t588):
  * `kept` when it works as it already, `repaired` when it does now, `refused`
  * with why.
@@ -485,6 +503,25 @@ declare module "claude-code" {
        * mirroring is off.
        */
       laptop: LaptopLine | null;
+      /**
+       * The copy of the plugin loaded last in this window (its
+       * `GENERATION`): a copy that finds another named here was replaced by
+       * a reload, and stops its timers.
+       */
+      generation: string | null;
+      /**
+       * This window's own key, made once by the first copy that needs it and
+       * kept across reloads and new conversations in it, by which a chat it
+       * mirrored is rejoined under a new conversation.
+       */
+      windowKey: string | null;
+      /**
+       * The chat this window's own memory named for a rejoin that has not
+       * settled yet (devcorner down around a reload or a /clear), which the
+       * next copy's or conversation's start rejoins; null once a rejoin
+       * took it or was refused with a code, and once another chat opened.
+       */
+      rejoining: string | null;
     };
   }
 }

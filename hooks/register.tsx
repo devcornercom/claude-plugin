@@ -16,6 +16,7 @@ import type {
   Status,
   StatusConversation,
   StatusInFlight,
+  StatusLight,
   StatusOvernight,
   StatusPaste,
   StatusOther,
@@ -33,6 +34,36 @@ const cursors = atom({ plugin: "devcorner", key: "cursors" } as const, []);
 const updating = atom({ plugin: "devcorner", key: "updating" } as const, null);
 const signIn = atom({ plugin: "devcorner", key: "signIn" } as const, null);
 const laptop = atom({ plugin: "devcorner", key: "laptop" } as const, null);
+const generation = atom(
+  { plugin: "devcorner", key: "generation" } as const,
+  null,
+);
+const windowKey = atom(
+  { plugin: "devcorner", key: "windowKey" } as const,
+  null,
+);
+const rejoining = atom(
+  { plugin: "devcorner", key: "rejoining" } as const,
+  null,
+);
+
+/** A key no other window or copy of the plugin has: a UUID where the runtime gives one. */
+function randomKey(): string {
+  const made = (globalThis as { crypto?: { randomUUID?: () => string } })
+    .crypto;
+  return (
+    made?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  );
+}
+
+/**
+ * This copy of the plugin: a new one each time the plugin loads in a window,
+ * a reload's too. A window chat is bound to the copy that opened or rejoined
+ * it, and devcorner counts no other copy's post or held request for it, so
+ * a copy a reload left running never keeps the chat online.
+ */
+const GENERATION = randomKey();
 
 const EVERY_MS = 30_000;
 const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
@@ -43,7 +74,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.80.0";
+export const PLUGIN_VERSION = "0.83.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -55,10 +86,11 @@ export const MAX_DOWN_MS = 10 * 60_000;
 /** After a held request fails, the poll has the conversation to itself this long. */
 export const WAIT_RETRY_MS = 5 * 60_000;
 /**
- * How long the held request asks devcorner to hold it. Claude Code documents
- * no timeout for $.http.fetch, and devcorner's own 50 s default is longer than
- * the 30 s that $.process.run is given, so the plugin names a shorter hold; the
- * server never holds longer than its own limit.
+ * How long the held request asks devcorner to hold it. Claude Code's
+ * $.http.fetch gives up on an answer not complete within 30 s (measured:
+ * aborted at 30,002 ms on 2.1.330), so the hold stays under it with 5 s to
+ * spare. devcorner's own longer limit (`WAIT_MS`, 50 s) is one no plugin's
+ * fetch can wait out: a longer hold would be cut by the client every time.
  */
 export const HOLD_MS = 25_000;
 /** A held request answered sooner than this is "quick": the server is not holding it. */
@@ -240,8 +272,17 @@ export function wakeWords(
  */
 type Woken = StatusSession | StatusConversation;
 
+/**
+ * What a read says of the session a conversation works as: a full Status, or
+ * the light one a read on a timer takes.
+ */
+type WokenStatus = {
+  session: StatusSession | null;
+  conversation?: StatusConversation | null;
+};
+
 /** What a wake goes by: the session, else the conversation with no session; null with neither. */
-export function wokenOf(s: Status): Woken | null {
+export function wokenOf(s: WokenStatus): Woken | null {
   return s.session ?? s.conversation ?? null;
 }
 
@@ -1751,7 +1792,7 @@ async function hideNudge($: Engine): Promise<string> {
  * hook did not hand it over: without it, every ask would wake again.
  */
 export function nextStep(
-  s: Status,
+  s: WokenStatus,
   wokeFor: string | null,
 ): { wake: string } | { after: number } | null {
   const woken = wokenOf(s);
@@ -1828,6 +1869,32 @@ function isStatus(v: unknown): v is Status {
   );
 }
 
+/** Whether devcorner's answer is a light status: the session part alone, for a read on a timer. */
+function isStatusLight(v: unknown): v is StatusLight {
+  return (
+    typeof v === "object" && v !== null && (v as StatusLight).light === true
+  );
+}
+
+/**
+ * A stored status with what a light read said: its session, its
+ * mail and the reload ask. Null for no stored status yet, which only a full
+ * read fills.
+ */
+export function withLight(
+  before: Status | null,
+  light: StatusLight,
+): Status | null {
+  if (before === null) return null;
+  return {
+    ...before,
+    repo: light.repo,
+    session: light.session,
+    conversation: light.conversation ?? null,
+    ...(light.reload !== undefined ? { reload: light.reload } : {}),
+  };
+}
+
 let lastAt = 0;
 
 /**
@@ -1837,6 +1904,8 @@ let lastAt = 0;
  */
 type Read = {
   status?: Status;
+  /** A light read's answer, which says the session part alone. */
+  light?: StatusLight;
   /** Why it found no status, for /dc to say; never the token. */
   problem?: string;
   /** Whether that problem may pass by itself: devcorner unreachable or failing. */
@@ -2138,7 +2207,7 @@ async function markerOf($: Engine): Promise<string | undefined> {
 }
 
 /** How many messages wait for the hooks, as a Status says it; null when it cannot say. */
-export function pendingOf(s: Status | undefined): number | null {
+export function pendingOf(s: WokenStatus | undefined): number | null {
   if (!s) return null;
   // A conversation that works as no session is handed its own mail alone
   // (dc-t312); an older devcorner hands it nothing.
@@ -3824,6 +3893,8 @@ async function keepClaim($: Engine, session: string | null): Promise<void> {
   try {
     const id = await $.session.id();
     claim = { id, session };
+    // A claim kept anew is one devcorner has yet to take.
+    claimTaken = undefined;
     if (fromCalls?.id === id) fromCalls.taken = null;
     const file = claimFile(id, await stateEnvOf($));
     if (!file) return;
@@ -3890,6 +3961,28 @@ function callsLearnt(id: string): NonNullable<typeof fromCalls> {
 /** Whether `stated`, the claim a Status carries, is one taken from a call (`claimFromCall`), which devcorner holds to more. */
 function takenFromCall(id: string, stated: string): boolean {
   return fromCalls?.id === id && fromCalls.taken === stated;
+}
+
+/**
+ * The claim devcorner has taken for this window, for which conversation: a
+ * claim it holds is no change, so a Status says it only once
+ * more after a restart and again when something asks the window to state it
+ * (`forgetClaimTaken`, at the held request's `{claim}` frame).
+ */
+let claimTaken: { id: string; session: string } | undefined;
+
+/** Whether devcorner has already taken `session` for the window `id`. */
+function claimTakenHere(id: string, session: string): boolean {
+  return claimTaken?.id === id && claimTaken.session === session;
+}
+
+/**
+ * Forgets the claim devcorner took, so the next Status says it again: the
+ * held request's `{claim}` frame says the window's tie changed, and only a
+ * stated claim asks devcorner to repair it.
+ */
+function forgetClaimTaken(): void {
+  claimTaken = undefined;
 }
 
 /**
@@ -4159,7 +4252,7 @@ async function reloadIdle($: Engine): Promise<boolean> {
     (await read($, turn)) !== null ||
     backgroundRunning.size > 0 ||
     wokeAt !== null ||
-    typedFromPage !== null ||
+    typedHolding(await $.clock.now()) ||
     commandFromPage !== null ||
     pageWords.length > 0 ||
     asks.size > 0
@@ -4286,8 +4379,14 @@ function reloadWhenIdle($: Engine, s: Status): void {
 type Asks = { picture?: boolean; now?: boolean; others?: boolean };
 
 // One call to devcorner, with what it came to; a problem is kept in the
-// read, never thrown.
-async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
+// read, never thrown. A light read asks for the session part
+// alone: a timer asks it, so what waits, Next, what moves and the night are
+// read only where something changed.
+async function fetchStatus(
+  $: Engine,
+  asks: Asks,
+  light = false,
+): Promise<Read> {
   const failed = (problem: string, down = false): Read => ({
     problem,
     down,
@@ -4325,8 +4424,14 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
       (branchTaken?.key !== key || branchTaken.branch !== branch);
     if (moved) branchSaying = saying = true;
     // The session this window runs as, as its start said (dc-t588): devcorner
-    // checks it and ties the window to it when that had drifted.
-    const stated = await claimOf($);
+    // checks it and ties the window to it when that had drifted. Said until
+    // devcorner takes it: a claim it holds is no change, so a
+    // status asked after it is read checks none.
+    const claiming = await claimOf($);
+    const stated =
+      claiming !== null && !claimTakenHere(sessionId, claiming)
+        ? claiming
+        : null;
     const guessed = stated !== null && takenFromCall(sessionId, stated);
     // This plugin's version, said until devcorner says it back for this
     // conversation, and the reload ask this copy's load answers.
@@ -4351,6 +4456,7 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
         ...(asks.picture ? { expanded: true } : {}),
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
+        ...(light ? { light: true } : {}),
       }),
     });
     if (res.status === 401 && held.from === "store") {
@@ -4385,6 +4491,9 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
       return failed(`devcorner at ${base} answered HTTP ${res.status}.`, true);
     }
     const body = JSON.parse(res.text);
+    if (isStatusLight(body)) {
+      return { light: body, down: false, retryIn: null };
+    }
     if (!isStatus(body)) {
       return failed(
         `devcorner at ${base} gave an answer this plugin does not understand; it may be older than the plugin.`,
@@ -4394,6 +4503,13 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
     // again, as when a store could not take it, or devcorner is older.
     if (moved && body.branch === branch) branchTaken = { key, branch };
     if (stated !== null) await heardClaim($, stated, body);
+    if (
+      stated !== null &&
+      body.claim?.session === stated &&
+      body.claim.outcome !== "refused"
+    ) {
+      claimTaken = { id: sessionId, session: stated };
+    }
     if (saysPlugin && body.plugin === PLUGIN_VERSION) {
       pluginTaken = sessionId;
       if (reloaded !== null) await reloadConfirmed($, sessionId, body);
@@ -4415,12 +4531,14 @@ async function fetchStatus($: Engine, asks: Asks): Promise<Read> {
  * not), and keeps what it says: the row, the updating line and the hooks'
  * marker. On failure the last good status stays. It asks for more than the
  * row's own only when `asks` says so (/dc, /dc now, /dc waits, /dc
- * sessions).
+ * sessions), and a `light` read asks for the session part alone, which a
+ * timer does: the row keeps the last full status's rest.
  */
 async function refresh(
   $: Engine,
   force = false,
   asks: Asks = {},
+  light = false,
 ): Promise<Read | undefined> {
   const now = await $.clock.now().catch(() => undefined);
   if (now === undefined || (!force && now - lastAt < EVERY_MS)) {
@@ -4428,14 +4546,27 @@ async function refresh(
   }
   lastAt = now;
   const seq = ++learnt;
-  const got = await fetchStatus($, asks);
+  const got = await fetchStatus($, asks, light);
   // A read that began before another and ended after it is older news: the
   // row and the marker keep the later one's. Its caller still goes by it.
   if (seq < shown) return got;
   shown = seq;
   try {
     await noteUpdating($, got.retryIn);
-    await markWaiting($, pendingOf(got.status), seq);
+    await markWaiting($, pendingOf(got.status ?? got.light), seq);
+    if (got.light) {
+      const kept = got.light;
+      await update($, status, (before) => withLight(before, kept));
+      if ((await read($, status)) !== null) {
+        // A reload is asked for at a full read's idle moment: a light one
+        // hears the ask at the held request's frame or at the next turn's end.
+        // A token that works: whatever the row said of signing in is over.
+        endFlow();
+        if ((await read($, signIn)) !== null) await setSignIn($, null);
+        $.ui.invalidate("ui.render");
+      }
+      return got;
+    }
     const s = got.status;
     if (s) {
       reloadWhenIdle($, s);
@@ -4486,6 +4617,8 @@ let askAfter = 0;
  * `/dc`'s ask; null once it has (`WAKE_SETTLE_MS`).
  */
 let wokeAt: number | null = null;
+/** The one timer that types the page's words once a prompt the window holds has begun its turn. */
+let typedWait: Timer | undefined;
 /**
  * The message a wake's prompt was submitted for, until its turn begins
  * (dc-t312): that turn is the wake's, and `Turn` says so. Null for any other
@@ -4502,6 +4635,7 @@ const settling = (now: number) =>
 
 /** A new or ended session starts clean: nothing of the last one carries over. */
 function forgetSession(): void {
+  claimTaken = undefined;
   quick = 0;
   holdFailures = 0;
   holdAfter = 0;
@@ -4509,6 +4643,8 @@ function forgetSession(): void {
   failures = 0;
   wokeAt = null;
   wakingFor = null;
+  typedWait?.cancel();
+  typedWait = undefined;
   lateLines.clear();
   sessionNo += 1;
 }
@@ -4526,6 +4662,7 @@ async function waitOnce($: Engine): Promise<Held> {
     const base = await baseOf($);
     const from = (await read($, woke)) ?? undefined;
     const each = await read($, cursors);
+    const said = mirrorSaid();
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -4542,6 +4679,9 @@ async function waitOnce($: Engine): Promise<Held> {
         // the machine its token is.
         launcher: true,
         revive: true,
+        // The window chat it mirrors, which only this copy keeps online, and
+        // the turn it still owes devcorner.
+        ...(said !== null ? { mirror: said } : {}),
         ...(from ? { cursor: from } : {}),
         // The newest woken for in each store (dc-t312): the held request
         // holds on two, each of which reads only its own ids.
@@ -4563,6 +4703,7 @@ async function hold($: Engine): Promise<void> {
   try {
     while (mine === epoch) {
       if ((await read($, turn)) !== null) return;
+      if (await superseded($)) return;
       const began = await $.clock.now();
       const held = await waitOnce($);
       if (mine !== epoch) return;
@@ -4582,6 +4723,16 @@ async function hold($: Engine): Promise<void> {
           held.kind !== "failed" && held.kind !== "updating",
         );
       if (mine !== epoch) return;
+      // A failed hold that ran its whole length was cut on the way (the
+      // client's fetch or a proxy between) after devcorner held it, not
+      // devcorner failing: held again at once, as an empty answer is. One that
+      // failed sooner is devcorner failing, and leaves the poll below.
+      if (held.kind === "failed" && now - began >= HOLD_MS) {
+        holdFailures = 0;
+        quick = 0;
+        holdAfter = now;
+        continue;
+      }
       // A chat frame given at once counts as an empty one does: devcorner
       // gives it to every hold until the window posts, so a window whose
       // look never goes would otherwise hold again and again at once.
@@ -4603,8 +4754,11 @@ async function hold($: Engine): Promise<void> {
         // fresh Status states it, and the row shows what it works as now.
         // Or its person asked it to reload its plugin, which that
         // Status says and the window does while idle. Held again at once,
-        // unless the reload tore this copy down.
+        // unless the reload tore this copy down. A changed tie is news even
+        // where the claim was taken, so it is stated again, which asks
+        // devcorner to check and repair it.
         quick = 0;
+        if (held.kind === "claim") forgetClaimTaken();
         await refresh($, true);
         if (mine !== epoch) return;
         continue;
@@ -4651,7 +4805,7 @@ async function hold($: Engine): Promise<void> {
         askAfter = now + held.after;
         await noteUpdating($, held.after);
         if (mine !== epoch) return;
-        askIn($, held.after);
+        askIn($, held.after, true);
         return;
       }
       // Failed, or answering at once: the poll has it for a while. A window
@@ -4670,11 +4824,11 @@ async function hold($: Engine): Promise<void> {
         // A down server is left alone as a failed ask leaves it.
         const wait = backoff(++failures);
         askAfter = now + wait;
-        askIn($, wait);
+        askIn($, wait, true);
       } else {
         const ms = await pollMs($);
         if (mine !== epoch) return;
-        askIn($, ms);
+        askIn($, ms, true);
       }
       return;
     }
@@ -4691,7 +4845,9 @@ async function hold($: Engine): Promise<void> {
 async function carryOn($: Engine, ms: number): Promise<void> {
   const now = await $.clock.now();
   if (!settling(now) && now >= holdAfter) void hold($);
-  else askIn($, ms);
+  // The held request is what it waits for: the poll in between asks the
+  // light status, since nothing changed while it waits.
+  else askIn($, ms, true);
 }
 
 /**
@@ -4725,16 +4881,78 @@ function askDevcorner($: Engine, text: string): void {
   });
 }
 
-/** Asks devcorner again in `ms`, in place of any ask already set. */
-function askIn($: Engine, ms: number): void {
+/**
+ * Asks devcorner again in `ms`, in place of any ask already set; a `light`
+ * ask reads the session part alone, as a timer does.
+ */
+function askIn($: Engine, ms: number, light = false): void {
   timer?.cancel();
-  timer = $.clock.after(ms, () => void ask($));
+  timer = $.clock.after(ms, () => void ask($, undefined, light));
 }
 
 function stopAsking(): void {
   epoch++;
   timer?.cancel();
   timer = undefined;
+}
+
+/**
+ * Whether a newer copy of the plugin loaded in this window since this one
+ * (`generation`, which each copy's start names itself in): Claude Code stops
+ * a copy's `$.clock.every` at a reload, but a `$.clock.after` loop runs on
+ * until the hooks in flight settle, so a copy a reload replaced would keep
+ * asking devcorner and holding requests for the window. Such a copy lets go
+ * of its asking, its fresh marker and its mirror, sending nothing more.
+ */
+async function superseded($: Engine): Promise<boolean> {
+  const newest = await read($, generation).catch(() => null);
+  if (newest === null || newest === GENERATION) return false;
+  stopAsking();
+  stopFresh();
+  if (mirror !== null) {
+    leaveMirror();
+    mirror = null;
+  }
+  return true;
+}
+
+/** This window's own key (`windowKey`), made by the first copy that needs it. */
+async function windowKeyOf($: Engine): Promise<string> {
+  const kept = await read($, windowKey).catch(() => null);
+  if (kept !== null) return kept;
+  const made = randomKey();
+  await update($, windowKey, (was) => was ?? made).catch(() => undefined);
+  return (await read($, windowKey).catch(() => null)) ?? made;
+}
+
+/**
+ * What a window chat's opening or rejoin binds the chat to: this copy of the
+ * plugin and this window's own key, so devcorner counts no other copy for
+ * it and takes the chat back when this window comes back under a new
+ * conversation.
+ */
+async function boundTo(
+  $: Engine,
+): Promise<{ generation: string; windowKey: string }> {
+  return { generation: GENERATION, windowKey: await windowKeyOf($) };
+}
+
+/**
+ * What a held request says of the window chat this window mirrors: this
+ * copy, and the turn it still owes devcorner, its turn under way or the
+ * first whose posts have not gone yet (its end among them). A turn devcorner
+ * still has under way that the window no longer owes ended here with its
+ * end lost on the way, which devcorner then says on the page.
+ */
+function mirrorSaid(): { generation: string; turn: string | null } | null {
+  if (mirror === null) return null;
+  return {
+    generation: GENERATION,
+    turn:
+      mirror.key ??
+      mirror.unsent.find((payload) => payload.turn !== null)?.turn ??
+      null,
+  };
 }
 
 // While a turn runs, nothing above asks devcorner, and the prompt hooks ask
@@ -4758,7 +4976,10 @@ async function keepFresh($: Engine): Promise<void> {
       // The timer paces it; refresh's own throttle would skip a tick. A
       // timer set as the turn ended finds it over and stops.
       if ((await read($, turn).catch(() => null)) === null) return;
-      await refresh($, true);
+      if (await superseded($)) return;
+      // A light read: a turn's timer keeps the marker and the
+      // session's line fresh, and the row's rest waits for the turn's end.
+      await refresh($, true, {}, true);
       await keepFresh($);
     })();
   });
@@ -4779,7 +5000,7 @@ async function startAsking($: Engine, given?: Read): Promise<void> {
     if (await draws($)) {
       stopAsking();
       const wait = askAfter - (await $.clock.now());
-      if (wait > 0) askIn($, wait);
+      if (wait > 0) askIn($, wait, true);
       else void ask($, given);
     }
   } catch {
@@ -4787,27 +5008,28 @@ async function startAsking($: Engine, given?: Read): Promise<void> {
   }
 }
 
-async function ask($: Engine, given?: Read): Promise<void> {
+async function ask($: Engine, given?: Read, light = false): Promise<void> {
   timer = undefined;
   try {
     // A running turn is handed its messages by the hooks; its end asks again.
     // (turn.start cancels the timer; this holds one already firing, or set by
     // a reload mid-turn.)
     if ((await read($, turn)) !== null) return;
+    if (await superseded($)) return;
     // This ask goes by its own read, never by another that ran beside it.
-    const got = given ?? (await refresh($, true));
-    const s = got?.status;
+    const got = given ?? (await refresh($, true, {}, light));
+    const s = got?.status ?? got?.light;
     if (!got || !s) {
       const retryIn = got?.retryIn ?? null;
       if (retryIn !== null) {
         // devcorner is updating: asked again when it said, with no failure
         // counted.
         askAfter = (await $.clock.now()) + retryIn;
-        askIn($, retryIn);
+        askIn($, retryIn, true);
       } else if (got?.down) {
         const wait = backoff(++failures);
         askAfter = (await $.clock.now()) + wait;
-        askIn($, wait);
+        askIn($, wait, true);
       }
       return;
     }
@@ -5726,12 +5948,46 @@ interface Mirror {
 }
 
 let mirror: Mirror | null = null;
+/** The chat this window mirrored as its last conversation ended, which its next one in this copy rejoins (`rejoinMirror`); null otherwise. */
+let endedMirror: string | null = null;
 /** Counts this module's session starts and ends, so a rejoin tried again after either is dropped. */
 let sessionLife = 0;
 /** This window's conversation since the plugin loaded in it, what an opening sends once. */
 const exchanges: { from: "person" | "window"; text: string }[] = [];
-/** The page's words the plugin typed in whose turn has not begun yet: their keys and words. */
-let typedFromPage: { keys: string[]; text: string } | null = null;
+/**
+ * The page's words the plugin typed in whose turn has not begun yet: their
+ * keys, their words, the prompt they were submitted as, and when. Only a turn
+ * that prompt began may take them (`takesTyped`): a wake's, a harness's or the
+ * person's turn that came first is not theirs, and taking it would draw their
+ * words under a reply that answers something else and hand them again as a
+ * turn of their own. Their hold is bounded as a wake's is (`typedHolding`), so
+ * a prompt whose turn never begins lets later words go after `WAKE_SETTLE_MS`
+ * rather than hold them for the window's life.
+ */
+let typedFromPage: TypedPageWords | null = null;
+interface TypedPageWords {
+  keys: string[];
+  text: string;
+  /** The words as submitted, the prompt its turn begins with; "" for a command until its prompt is handed over. */
+  prompt: string;
+  /** When the words were typed in (`WAKE_SETTLE_MS` bounds their hold). */
+  since: number;
+}
+
+/**
+ * Whether the turn a prompt began is the one the page's words were submitted
+ * as: the engine gives the turn the same text as its prompt, as it gives every
+ * prompt's own turn its words (`seenFor`). Any other turn leaves them for
+ * theirs (`typedFromPage`): the flag of a heard submit alone would hand them to
+ * any turn that began next, a folded prompt's included.
+ */
+function takesTyped(typed: TypedPageWords | null, text: string): boolean {
+  return typed !== null && typed.prompt !== "" && typed.prompt === text;
+}
+
+/** Whether the page's words a prompt the window holds still wait for its turn (`typedFromPage`), bounded as a wake's is (`WAKE_SETTLE_MS`). */
+const typedHolding = (now: number) =>
+  typedFromPage !== null && now - typedFromPage.since < WAKE_SETTLE_MS;
 /** A file the person's words from devcorner's page carry, which the window fetches (`ChatFile`) and names by path. */
 interface PageFile {
   id: string;
@@ -6715,11 +6971,25 @@ export function stepParts(
 /**
  * How long after a failed post, or a failed rejoin, it is tried again. A
  * post of the turn under way is tried until it goes; one of a turn already
- * over is given up once `MIRROR_TRIES` of its retries failed, and a rejoin
- * once it failed that many times in all.
+ * over is given up once `MIRROR_END_TRIES` of its retries failed, and a
+ * rejoin once it failed `MIRROR_TRIES` times in all.
  */
 export const MIRROR_RETRY_MS = 5_000;
 const MIRROR_TRIES = 3;
+/**
+ * How many retries a post of a turn already over is given before it is
+ * given up, each waiting twice the one before it (`mirrorRetryMs`): 5, 10,
+ * 20, 40 and 40 s, about two minutes in all, past the minute devcorner asks
+ * to be left alone while a deploy of it settles. A turn's end given up is
+ * not lost for good: the held request says the window no longer owes it,
+ * and devcorner says on the page that its reply did not come.
+ */
+export const MIRROR_END_TRIES = 5;
+
+/** How long until the next try of a post that failed: doubling with each of its retries that failed, up to 40 s. */
+function mirrorRetryMs(payload: MirrorPayload | undefined): number {
+  return MIRROR_RETRY_MS * 2 ** Math.min(payload?.tries ?? 0, 3);
+}
 /** The most parts one post carries, as devcorner keeps no more of one (`MAX_POST_PARTS`, src/mcp/laptop-chat.ts): more go in the posts after it. */
 export const MIRROR_POST_PARTS = 400;
 
@@ -6887,9 +7157,9 @@ async function mirrorPost(
 
 /**
  * Sends the posts that did not reach devcorner yet, in order, until one
- * fails, which is tried again in `MIRROR_RETRY_MS` with what gathered behind
+ * fails, which is tried again in `mirrorRetryMs` with what gathered behind
  * it: until it goes while its turn is under way, and given up once that turn
- * is over and `MIRROR_TRIES` of its retries failed. Only a retry counts, so
+ * is over and `MIRROR_END_TRIES` of its retries failed. Only a retry counts, so
  * the posts after it never spend its tries. Whether all went.
  */
 async function sendUnsent(
@@ -6907,7 +7177,7 @@ async function sendUnsent(
     if (
       retry &&
       (payload.of === null || payload.of !== m.turn) &&
-      ++payload.tries >= MIRROR_TRIES
+      ++payload.tries >= MIRROR_END_TRIES
     )
       m.unsent.shift();
     const waits =
@@ -6916,7 +7186,7 @@ async function sendUnsent(
       m.parts.length > 0 ||
       m.join.length > 0;
     if (waits && mirror === m)
-      m.retry ??= $.clock.after(MIRROR_RETRY_MS, () => {
+      m.retry ??= $.clock.after(mirrorRetryMs(m.unsent[0]), () => {
         m.retry = undefined;
         if (mirror === m) void mirrorPost($, { retry: true });
       });
@@ -7021,8 +7291,14 @@ async function postMirror(
       // Every post says whether a Stop in the window holds the page's words,
       // so the page can tell its person to type there (`tellHolds`).
       holds,
+      // The copy that posts: devcorner refuses one the chat is not bound to.
+      generation: GENERATION,
       ...says,
     });
+    // devcorner refused the post itself (its shape, its size): it would
+    // refuse it again, so it is not tried again and held ahead of the posts
+    // after it. A turn's end lost so is said on the page (`mirrorSaid`).
+    if (res.status === 400 || res.status === 413) return true;
     const body = JSON.parse(res.text) as {
       stop?: unknown;
       background?: unknown;
@@ -7032,8 +7308,20 @@ async function postMirror(
       error?: unknown;
     };
     if (res.status === 409 && typeof body.code === "string") {
+      // A copy a reload replaced stops quietly whatever devcorner refused,
+      // its row left as it is: the newer copy mirrors the chat in this same
+      // window, draws the row and keeps the chat for a restart. Its pending
+      // end's retry, refused once the newer copy took the chat back, would
+      // otherwise clear that row and say the window no longer mirrors.
+      if (await superseded($)) return true;
       if (mirror === m) {
         const under = m.turn;
+        // This copy is the window's newest, yet another copy holds the
+        // chat: said, and kept for a restart's rejoin.
+        if (body.code === "laptop-superseded") {
+          stopMirror($, typeof body.error === "string" ? body.error : null);
+          return true;
+        }
         stopMirror($, typeof body.error === "string" ? body.error : null);
         // A chat this window no longer holds is not rejoined after a restart.
         void $.session
@@ -7081,7 +7369,7 @@ async function postMirror(
       // One the window took alone, or joined to its turn, is never taken
       // again, though an answer sent before devcorner heard of it names it.
       pageWords = pageWordsOf(body.words).filter(
-        (w) => !takenAlone.has(w.key) && !joinedFromPage.has(w.key),
+        (w) => !takenAlone.has(w.key) && !handedFromPage.has(w.key),
       );
       for (const w of pageWords)
         if (!pageHeardAt.has(w.key)) pageHeardAt.set(w.key, now);
@@ -7278,6 +7566,11 @@ function mirrorBeat($: Engine): void {
   mirror.beat?.cancel();
   mirror.beat = $.clock.after(MIRROR_BEAT_MS, () => {
     if (mirror === null || mirror.turn === null) return;
+    // Behind a post that failed, a beat would only send that post again off
+    // its retry's backoff (`mirrorRetryMs`), as the turn's beginning waiting
+    // behind it counts as something to send (`mirrorPost`); the retry sends
+    // what gathered, and a post that goes says the turn runs.
+    if (mirror.unsent.length > 0) return mirrorBeat($);
     void mirrorPost($, {}).then(() => mirrorBeat($));
   });
 }
@@ -7383,6 +7676,8 @@ function mirrorTasks($: Engine): void {
 function leaveMirror(): void {
   mirror?.batch?.cancel();
   mirror?.beat?.cancel();
+  typedWait?.cancel();
+  typedWait = undefined;
   mirror?.retry?.cancel();
   dropAsks();
   for (const held of holds.values()) held.timer?.cancel();
@@ -7394,7 +7689,7 @@ function leaveMirror(): void {
   carryingOn = false;
   pageWords = [];
   takenAlone.clear();
-  joinedFromPage.clear();
+  handedFromPage.clear();
   pageTextReady.clear();
   pageHeardAt.clear();
   windowHeld.clear();
@@ -8415,6 +8710,7 @@ async function fetchPageFile(
       hook_event_name: "ChatFile",
       thread,
       file: file.id,
+      generation: GENERATION,
     });
     const body = JSON.parse(res.text) as { base64?: unknown; error?: unknown };
     if (res.status !== 200 || typeof body.base64 !== "string")
@@ -8477,18 +8773,39 @@ async function pageText(
  * alone when its turn comes (`runPageCommand`), never typed in. After a
  * move to the background from the page (`backgroundFromPage`), its note
  * (`backgroundNote`) goes first: before the next message's words, or alone
- * when none waits or a command is next, so the model carries on.
+ * when none waits or a command is next, so the model carries on. Words never
+ * go in behind a prompt the window is already holding for its turn (a wake, a
+ * command, `/dc`'s ask): that prompt's turn comes first, and words typed now
+ * would wait behind it while the words said after them joined it, out of the
+ * order they were said.
  */
 async function typePageWords($: Engine): Promise<void> {
   const waiting = () =>
     (pageWords.length > 0 || movedFromPage !== null) &&
     backgroundedFromPage === null &&
-    typedFromPage === null &&
     commandFromPage === null &&
     pageHeld === null &&
     endingTurn === null &&
     !fetchingPage;
   if (!waiting()) return;
+  // A prompt the window submitted has not begun its turn yet, or the page's
+  // words it typed in wait for theirs: it goes first. Each wait is bounded, so
+  // a turn that never begins lets the words go after `WAKE_SETTLE_MS` rather
+  // than hold them for the window's life.
+  const now = await $.clock.now();
+  const until = Math.max(
+    settling(now) ? wokeAt! + WAKE_SETTLE_MS : 0,
+    typedHolding(now) ? typedFromPage!.since + WAKE_SETTLE_MS : 0,
+  );
+  if (until > now) {
+    typedWait ??= $.clock.after(until - now, () => {
+      typedWait = undefined;
+      void typePageWords($);
+    });
+    return;
+  }
+  typedWait?.cancel();
+  typedWait = undefined;
   if ((await read($, turn)) !== null) return;
   const draft = await $.prompt.read().catch(() => ({ text: "x" }));
   if (draft.text.trim() !== "") {
@@ -8497,8 +8814,11 @@ async function typePageWords($: Engine): Promise<void> {
   }
   // Two calls may wait above at once (a post's answer and a turn's end both
   // type the words in): the check and the take go together, with no wait
-  // between, so only one takes them and the other submits nothing.
-  if (!waiting()) return;
+  // between, so only one takes them and the other submits nothing. The words
+  // the one before it typed in hold the next until their turn begins, as they
+  // do after the settle (`typedHolding`): a second call that passed the check
+  // before them must not take another message meanwhile.
+  if (!waiting() || typedHolding(now)) return;
   // After a move to the background from the page, the note goes with the
   // next words typed, or alone first when none waits or a command is next.
   if (
@@ -8534,33 +8854,35 @@ async function typePageWords($: Engine): Promise<void> {
     fetchingPage = true;
     try {
       text = await pageText($, from?.thread ?? "", message);
+      // A turn begun in the window meanwhile, or one whose end is being
+      // posted, which types them, words drafted meanwhile, or a stop that
+      // holds them, leaves them waiting as ever; a post's answer meanwhile
+      // named them again among those waiting. No other call takes a message
+      // while these are read (`fetchingPage`), so the oldest goes in first.
+      const running = (await read($, turn)) !== null;
+      const drafted =
+        !running &&
+        (await $.prompt.read().catch(() => ({ text: "x" }))).text.trim() !== "";
+      // Mirroring that stopped or moved to another chat meanwhile (`/dc chat
+      // off`, a takeover, a detach) dropped its chat's words (`leaveMirror`):
+      // these belong to a chat the window no longer mirrors. Words a chat
+      // opened since was given meanwhile found this fetch under way, so they
+      // are typed now.
+      if (mirror !== from) {
+        fetchingPage = false;
+        if (pageWords.length > 0) void typePageWords($);
+        return;
+      }
+      const since = pageWords.filter((w) => w.key !== message.key);
+      if (running || drafted || pageHeld !== null || endingTurn !== null) {
+        pageWords = [message, ...since];
+        if (drafted) $.clock.after(WAITING_MS, () => void typePageWords($));
+        return;
+      }
+      pageWords = since;
     } finally {
       fetchingPage = false;
     }
-    // A turn begun in the window meanwhile, or one whose end is being
-    // posted, which types them, words drafted meanwhile, or a stop that
-    // holds them, leaves them waiting as ever; a post's answer meanwhile
-    // named them again among those waiting.
-    const running = (await read($, turn)) !== null;
-    const drafted =
-      !running &&
-      (await $.prompt.read().catch(() => ({ text: "x" }))).text.trim() !== "";
-    // Mirroring that stopped or moved to another chat meanwhile (`/dc chat
-    // off`, a takeover, a detach) dropped its chat's words (`leaveMirror`):
-    // these belong to a chat the window no longer mirrors. Words a chat
-    // opened since was given meanwhile found this fetch under way, so they
-    // are typed now.
-    if (mirror !== from) {
-      if (pageWords.length > 0) void typePageWords($);
-      return;
-    }
-    const since = pageWords.filter((w) => w.key !== message.key);
-    if (running || drafted || pageHeld !== null || endingTurn !== null) {
-      pageWords = [message, ...since];
-      if (drafted) $.clock.after(WAITING_MS, () => void typePageWords($));
-      return;
-    }
-    pageWords = since;
   }
   replyDuring.delete(message.key);
   // The note of a move to the background goes before the words, never into
@@ -8569,31 +8891,28 @@ async function typePageWords($: Engine): Promise<void> {
   // before its reply (`sentBefore`).
   const moved = movedFromPage;
   movedFromPage = null;
-  const typed = {
+  const said = moved === null ? sentBefore(message, text, during) : text;
+  const typed: TypedPageWords = {
     keys: [message.key],
-    text: moved === null ? sentBefore(message, text, during) : text,
+    text: said,
+    prompt: moved === null ? said : `${backgroundNote(moved, true)}\n\n${said}`,
+    // The time the words were taken, read before the waits above: set before
+    // any wait between the take and here, so a second call finds them held.
+    since: now,
   };
   typedFromPage = typed;
-  wokeAt = await $.clock.now();
+  for (const key of typed.keys) handedFromPage.add(key);
+  wokeAt = typed.since;
   wakingFor = null;
-  await submitFromPage(
-    $,
-    {
-      text:
-        moved === null
-          ? typed.text
-          : `${backgroundNote(moved, true)}\n\n${typed.text}`,
-      asUser: true,
-    },
-    () => {
-      pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
-      if (during !== null && !replyDuring.has(message.key))
-        replyDuring.set(message.key, during);
-      if (typedFromPage === typed) typedFromPage = null;
-      movedFromPage ??= moved;
-      wokeAt = null;
-    },
-  );
+  await submitFromPage($, { text: typed.prompt, asUser: true }, () => {
+    pageWords = [message, ...pageWords.filter((w) => w.key !== message.key)];
+    for (const key of typed.keys) handedFromPage.delete(key);
+    if (during !== null && !replyDuring.has(message.key))
+      replyDuring.set(message.key, during);
+    if (typedFromPage === typed) typedFromPage = null;
+    movedFromPage ??= moved;
+    wokeAt = null;
+  });
 }
 
 /**
@@ -8679,12 +8998,14 @@ export const JOINED_FROM_PAGE =
   "Your person wrote this to you on devcorner's page of this chat while you were working: these are their own words, sent mid-turn. Take them into account now, as if they had typed them here:";
 
 /**
- * The keys of the page's words joined to the mirrored turn (`joinPageWords`):
- * devcorner's answers may still name them waiting until it took the post
- * that joined them, so they are left out of every answer until that turn's
- * end was posted.
+ * The keys of the page's words the window has handed the model, typed in as a
+ * prompt (`typePageWords`) or joined to a turn (`joinPageWords`): devcorner's
+ * answers may still name them waiting until the post that took them reaches
+ * it, so they are left out of every answer until the turn they are part of has
+ * ended and every post went. A word is handed once, never typed or joined
+ * again from an answer read before devcorner heard of it.
  */
-const joinedFromPage = new Set<string>();
+const handedFromPage = new Set<string>();
 
 /** The page's messages with files, fetched while a turn runs so they are ready to join it, by key: their words with the files' paths (`pageText`). */
 const pageTextReady = new Map<string, string>();
@@ -8786,14 +9107,14 @@ async function joinPageWords<
   )
     return ran;
   /** The words that may join now, in order; none while anything holds them. */
-  const ready = (): { key: string; text: string }[] => {
+  const ready = (now: number): { key: string; text: string }[] => {
     if (
       mirror !== m ||
       m.turn !== at ||
       pageHeld !== null ||
       stoppedFromPage === at ||
       backgroundedFromPage === at ||
-      typedFromPage !== null ||
+      typedHolding(now) ||
       commandFromPage !== null
     )
       return [];
@@ -8806,18 +9127,19 @@ async function joinPageWords<
     }
     return ones;
   };
-  if (ready().length === 0 || (await read($, turn)) !== at) return ran;
+  if (ready(await $.clock.now()).length === 0 || (await read($, turn)) !== at)
+    return ran;
   // A post that fails is kept and sent again by the mirror itself; the words
   // then join as the last answer left them.
   await mirrorPost($, {}).catch(() => undefined);
   const now = await $.clock.now();
-  const joining = ready();
+  const joining = ready(now);
   if (joining.length === 0) return ran;
   const keys = new Set(joining.map((one) => one.key));
   heldUntil([...keys], now);
   pageWords = pageWords.filter((w) => !keys.has(w.key));
   for (const key of keys) {
-    joinedFromPage.add(key);
+    handedFromPage.add(key);
     pageTextReady.delete(key);
     replyDuring.delete(key);
   }
@@ -8960,7 +9282,7 @@ const takenAlone = new Set<string>();
  */
 let commandFromPage: {
   name: string;
-  typed: { keys: string[]; text: string };
+  typed: TypedPageWords;
 } | null = null;
 
 /** What the page is told of words that begin with a slash but are no command devcorner marked. */
@@ -9164,7 +9486,12 @@ async function runInWindow(
   command: PageCommand,
   line: string,
 ): Promise<{ text: string; outcome: "done" | "failed" } | null> {
-  const typed = { keys: [key], text: line };
+  const typed: TypedPageWords = {
+    keys: [key],
+    text: line,
+    prompt: "",
+    since: await $.clock.now(),
+  };
   commandFromPage = { name: command.name, typed };
   try {
     const found = pageCommandIn(
@@ -9265,6 +9592,8 @@ async function mirrorOpened(
     .id()
     .then((id) => $.store.set(mirroredKey(id), body.chat!.thread))
     .catch(() => undefined);
+  // A rejoin the window's memory waited on is settled by any chat opened.
+  void update($, rejoining, () => null).catch(() => undefined);
   const id = body.chat.thread;
   void update($, laptop, () => ({
     thread: id,
@@ -9896,6 +10225,7 @@ async function chatHere($: Engine, words: string): Promise<string> {
       hook_event_name: "ChatOpen",
       title: arg,
       ...(launch !== null ? { launch } : {}),
+      ...(await boundTo($)),
       history: exchanges,
       runsOn: await windowModel($),
       commands,
@@ -9959,6 +10289,7 @@ async function continueHere($: Engine, words: string): Promise<string> {
       thread,
       takeover,
       ...(launch !== null ? { launch } : {}),
+      ...(await boundTo($)),
       runsOn: await windowModel($),
       commands,
       ...(await windowWhere($)),
@@ -10046,13 +10377,32 @@ async function briefWindow($: Engine, body: unknown): Promise<void> {
  * quietly: one moved, turned off or ended meanwhile (a refusal with its code)
  * stays where it is and is forgotten here. Any other failure, such as a
  * rejoin that came before devcorner heard this window's start, or devcorner
- * down, tries again a few times and keeps the chat for the next start.
+ * down, tries again a few times and keeps the chat for the next start: in
+ * the session's store, or for a chat the window's own memory named, in the
+ * window's `rejoining`, which outlives a reload and a new conversation.
  */
-async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
+async function rejoinMirror(
+  $: Engine,
+  life: number,
+  kept: string | null,
+  tries = 1,
+): Promise<void> {
   if (mirror !== null || life !== sessionLife) return;
+  // A copy a reload replaced never binds the chat back to itself: a retry
+  // of its rejoin still runs after the reload.
+  if (await superseded($)) return;
   const id = await $.session.id();
-  const thread = await $.store.get(mirroredKey(id));
-  if (typeof thread !== "string") return;
+  // The chat this session mirrored, or else the one this window mirrored
+  // under the conversation before (`kept`, from the row a reload or a new
+  // conversation left): devcorner takes the window back by its own key.
+  const saved = await $.store.get(mirroredKey(id));
+  const thread = typeof saved === "string" ? saved : kept;
+  if (thread === null) return;
+  const byWindow = typeof saved !== "string";
+  // The start clears the row, so the window's memory of the chat is kept
+  // apart until this rejoin settles: devcorner down around a reload or a
+  // /clear leaves it for the next copy's or conversation's start.
+  if (byWindow) await update($, rejoining, () => thread).catch(() => {});
   // What it runs on and where it works now, which a resume may have changed
   // (`--model`, a worktree), so the chat's head says them from the rejoin
   // rather than its next turn, and the commands it has now. A revived
@@ -10066,6 +10416,10 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
       hook_event_name: "ChatOpen",
       thread,
       rejoin: true,
+      ...(await boundTo($)),
+      // Named by this window's own memory, not this session's store: a chat
+      // an older plugin bound with no window key is still this window's.
+      ...(byWindow ? { windowKept: true } : {}),
       runsOn: await windowModel($),
       commands,
       ...(await windowWhere($)),
@@ -10073,7 +10427,8 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
     },
     { command: "the window chat's rejoin", nothing: "it was not rejoined" },
   );
-  if (life !== sessionLife) return;
+  // A copy a reload replaced meanwhile leaves the chat to the newer copy.
+  if (life !== sessionLife || (await superseded($))) return;
   if (typeof posted !== "string") {
     if (posted.status === 200) {
       if (mirror === null)
@@ -10088,13 +10443,14 @@ async function rejoinMirror($: Engine, life: number, tries = 1): Promise<void> {
     }
     const code = (posted.body as { code?: unknown } | null)?.code;
     if (posted.status === 409 && typeof code === "string") {
-      await $.store.delete(mirroredKey(id));
+      if (byWindow) await update($, rejoining, () => null).catch(() => {});
+      else await $.store.delete(mirroredKey(id));
       return;
     }
   }
   if (tries < MIRROR_TRIES)
     $.clock.after(MIRROR_RETRY_MS, () => {
-      void rejoinMirror($, life, tries + 1).catch(() => {});
+      void rejoinMirror($, life, kept, tries + 1).catch(() => {});
     });
 }
 
@@ -11477,11 +11833,24 @@ export const register: Register = (on) => {
     if (!(await draws($).catch(() => true))) {
       await markWaiting($, null, ++learnt);
     }
+    // This copy is the window's newest: a copy a reload replaced finds it
+    // named here and stops its timers (`superseded`).
+    await update($, generation, () => GENERATION).catch(() => {});
     // A session that mirrored a window chat before a restart or a resume
-    // rejoins it; until then the row names none, as a reload left the
-    // module mirroring nothing whatever the row kept.
+    // rejoins it, and so does this window under a new conversation, by the
+    // chat the row kept; until then the row names none, as a reload left
+    // the module mirroring nothing whatever the row kept, or by the chat
+    // an earlier start's rejoin did not settle (`rejoining`).
+    const kept =
+      mirror === null
+        ? (endedMirror ??
+          (await read($, laptop).catch(() => null))?.thread ??
+          (await read($, rejoining).catch(() => null)) ??
+          null)
+        : null;
+    endedMirror = null;
     if (mirror === null) await update($, laptop, () => null).catch(() => {});
-    void rejoinMirror($, ++sessionLife).catch(() => {});
+    void rejoinMirror($, ++sessionLife, kept).catch(() => {});
     // Where this window's repo is on the machine, for a launcher here.
     void noteFolder($).catch(() => {});
     // The status that refresh reads is the first ask, so it is read once.
@@ -11498,8 +11867,10 @@ export const register: Register = (on) => {
     stopFresh();
     forgetSession();
     // The chat waits for this session's return, or another window's
-    // /dc continue; devcorner calls the window gone after two minutes.
+    // /dc continue; devcorner calls the window gone after two minutes. A
+    // new conversation in this window (a /clear) rejoins it by itself.
     sessionLife++;
+    endedMirror = mirror?.thread ?? null;
     stopMirror($, null);
     exchanges.length = 0;
     // The task list was this session's: the next one keeps its own.
@@ -11539,13 +11910,16 @@ export const register: Register = (on) => {
     }
     // A command from the page that submits a prompt (a skill, a plugin's
     // command, an MCP prompt) begins its turn with it: that turn is the
-    // page's line.
+    // page's line, and this prompt is the one it was submitted as.
     if (
       commandFromPage !== null &&
       e.origin?.kind === "plugin" &&
       e.command?.name === commandFromPage.name
-    )
+    ) {
+      commandFromPage.typed.prompt = e.text;
+      commandFromPage.typed.since = await $.clock.now();
       typedFromPage = commandFromPage.typed;
+    }
     // A background command's notification says it runs no more, whether it
     // joins a turn under way or begins one; the window's next post tells
     // the page.
@@ -11583,8 +11957,12 @@ export const register: Register = (on) => {
     // out and the chat keeps it as devcorner's line; a prompt the harness or
     // another plugin made (a background task's end, a reminder, another
     // session's message) is left out too, and the chat keeps its short line.
-    const page = typedFromPage;
-    typedFromPage = null;
+    // Only the turn the page's words were submitted as takes them: a turn
+    // that began first, a wake's or the person's own, leaves them waiting for
+    // their own, since a page's bubble under another turn's reply, and the
+    // same words typed again later, is what this window must never draw.
+    const page = takesTyped(typedFromPage, e.text) ? typedFromPage : null;
+    if (page !== null) typedFromPage = null;
     if (page !== null) heldUntil(page.keys, await $.clock.now());
     // A background command's end begins a turn with its notification: it
     // runs no more, which this turn's beginning tells the page.
@@ -11769,8 +12147,17 @@ export const register: Register = (on) => {
           reopenAsks($);
         await posting;
         // Its end and every join before it posted, devcorner names no word
-        // the window joined as waiting.
-        if (mirror?.unsent.length === 0) joinedFromPage.clear();
+        // the window joined as waiting. A word typed in whose own turn has not
+        // begun is still that turn's to take, so it stays left out; past its
+        // hold's bound (`typedHolding`) it is as any word whose turn never
+        // began, and goes with the later words.
+        if (mirror?.unsent.length === 0) {
+          const pending = new Set(
+            typedHolding(await $.clock.now()) ? typedFromPage!.keys : [],
+          );
+          for (const key of [...handedFromPage])
+            if (!pending.has(key)) handedFromPage.delete(key);
+        }
       }
     } finally {
       // A later turn's end, begun while this one's post waited, holds on.
