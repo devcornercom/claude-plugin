@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.89.0 — 2026-11-21
+
+- A window chat no longer goes offline after its window reloads the plugin. When an idle window takes its chat back after a reload, or opens one with `/dc chat`, it stops its background helper, since a chat's state goes on devcorner's held request, and now holds that request at once. Before, nothing listened for the window until its next turn: after two minutes its chat showed offline, the page's words did not reach it, and nothing woke it.
+
 ## 0.88.0 — 2026-11-21
 
 - A devcorner call that names no session now goes as the session the window already works as, so a plugin reload no longer leaves a window looking signed out: its new connection holds no session, and before this its calls were refused as if none were open while its session was live and its mail still arrived. It is filled only with the session devcorner accepted for the window, only on a tool that takes one, and only when the call has no session: a start, a call that names its session (a typo included), a subagent's call and a window whose session devcorner has not taken are sent as they were made.

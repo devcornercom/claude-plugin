@@ -1275,6 +1275,8 @@ function world(
      * lines a test feeds it. Unless told, no node runs.
      */
     node?: string;
+    /** Awaited before `node --version` answers, so a test can act while the helper is still starting. */
+    beforeVersion?: () => Promise<void> | undefined;
   } = {},
 ) {
   const beforeNow = options.beforeNow;
@@ -1408,6 +1410,8 @@ function world(
     listenLines: [] as unknown[],
     /** Run as a helper starts, before its lines. */
     onListen: null as (() => void) | null,
+    /** Awaited after a helper's lines, so it runs on, its sockets open, until this settles; none ends it at once. */
+    listenRuns: null as Promise<void> | null,
     /** What a `claude` command prints (`claude --bg`, `claude agents`, `claude stop`), as the laptop launcher runs it. */
     claudeRun: {
       exitCode: 0,
@@ -1711,9 +1715,9 @@ function world(
     );
     return { value: { status: 200, ok: true, headers: {}, text } };
   });
-  // The window's helper: it prints the lines the test queued,
-  // then ends, as one that lost its sockets for good does. A child kept
-  // running past them is not one the test kit's stream holds.
+  // The window's helper: it prints the lines the test queued, then ends, as
+  // one that lost its sockets for good does, unless `listenRuns` keeps it
+  // running with its sockets open until the test settles it.
   on("process.spawn", async function* (_$, e) {
     seen.listens.push({
       argv: e.argv,
@@ -1723,11 +1727,13 @@ function world(
     seen.onListen?.();
     for (const line of seen.listenLines)
       yield { stream: "stdout" as const, text: `${JSON.stringify(line)}\n` };
+    if (seen.listenRuns !== null) await seen.listenRuns;
     return { value: { code: 0, signal: null } } as never;
   });
   on("process.run", async (_$, e) => {
     seen.runs.push({ argv: e.argv, stdin: e.init?.stdin, cwd: e.init?.cwd });
-    if (e.argv[1] === "--version" && options.node !== undefined)
+    if (e.argv[1] === "--version" && options.node !== undefined) {
+      await options.beforeVersion?.();
       return {
         value: {
           exitCode: 0,
@@ -1737,6 +1743,7 @@ function world(
           isStderrTruncated: false,
         },
       };
+    }
     if (e.argv[0] === "env" || e.argv[0] === "claude")
       return {
         value: {
@@ -11386,6 +11393,115 @@ describe("a window chat's mirror", () => {
     await clock.advance(MIRROR_RETRY_MS);
     await flush(clock);
     expect(seen.chats.filter((c) => c.rejoin === true)).toHaveLength(4);
+  });
+
+  test("a rejoin taken while the window's helper runs stops it and holds with the chat at once, past a hold put off before the helper ran", async ($, on) => {
+    const { clock, seen } = world(on, {
+      node: "v24.7.0",
+      hold: true,
+      store: { "laptopChat:conversation-1": "me-k3" },
+    });
+    // The rejoin is answered only later. The first helper ends at once, so
+    // the held request takes over; the second keeps its sockets open.
+    seen.chatAnswers.push("held");
+    let ended!: () => void;
+    seen.onListen = () => {
+      if (seen.listens.length < 2) {
+        seen.listenLines = [{ connected: 1 }, { end: "refused" }];
+        return;
+      }
+      seen.listenLines = [{ connected: 1 }];
+      seen.listenRuns = new Promise((done) => (ended = done));
+    };
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    // That hold, two minutes on, then quick empty answers until the poll
+    // has it: its next hold is put off past when a helper may start again.
+    await clock.advance(2 * 60_000);
+    seen.held.shift()!("{}");
+    await flush(clock);
+    for (let i = 0; i < QUICK_MAX; i++) {
+      seen.held.shift()!("{}");
+      await flush(clock);
+    }
+    expect(seen.held).toHaveLength(0);
+    const holds = seen.waitBodies.length;
+    await clock.advance(WAIT_RETRY_MS - 2 * 60_000);
+    await flush(clock);
+    expect(seen.listens).toHaveLength(2);
+    expect(seen.waitBodies).toHaveLength(holds);
+    // The rejoin is taken: the window holds with the chat, its helper
+    // stopped and none started again.
+    seen.heldChats.shift()!(OPENED);
+    await flush(clock);
+    expect(seen.chats[0]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      rejoin: true,
+    });
+    expect(seen.waitBodies).toHaveLength(holds + 1);
+    expect(seen.waitBodies.at(-1)).toMatchObject({
+      mirror: { generation: seen.chats[0]!.generation, turn: null },
+    });
+    expect(seen.listens).toHaveLength(2);
+    ended();
+  });
+
+  test("a rejoin taken while the window's helper is still starting holds once, the asking the stop left to it", async ($, on) => {
+    // The node's version read is what the helper waits on: until it answers
+    // the helper is its own, with no child started.
+    let release!: () => void;
+    const starting = new Promise<void>((done) => (release = done));
+    const { clock, seen } = world(on, {
+      node: "v24.7.0",
+      hold: true,
+      store: { "laptopChat:conversation-1": "me-k3" },
+      beforeVersion: () => starting,
+    });
+    seen.chatAnswers.push("held");
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.listens).toHaveLength(0);
+    // The rejoin is taken while that helper has no child: stopping it leaves
+    // its own asking to hold, so none is asked for beside it.
+    seen.heldChats.shift()!(OPENED);
+    await flush(clock);
+    expect(seen.chats[0]).toMatchObject({
+      hook_event_name: "ChatOpen",
+      rejoin: true,
+    });
+    release();
+    await flush(clock);
+    expect(seen.listens).toHaveLength(0);
+    expect(seen.waitBodies).toHaveLength(1);
+    expect(seen.waitBodies[0]).toMatchObject({
+      mirror: { generation: seen.chats[0]!.generation, turn: null },
+    });
+  });
+
+  test("a chat's mirroring clears a hold put off before it, so the poll's next ask holds", async ($, on) => {
+    // No node runs the helper: the window holds a request of its own.
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    // The hold fails at once while no chat is mirrored, so the next one is
+    // put off: the poll has the window until then.
+    seen.held.shift()!(HELD_FAILED);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    seen.chatAnswers.push(OPENED);
+    await $.command.run({ command: "dc", args: "chat" } as never);
+    await flush(clock);
+    expect(seen.chats[0]).toMatchObject({ hook_event_name: "ChatOpen" });
+    // The poll's next ask holds with the chat, though the put-off time has
+    // not come: the chat's hold is what keeps it online.
+    await clock.advance(DOWN_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(2);
+    expect(seen.waitBodies.at(-1)).toMatchObject({
+      mirror: { generation: seen.chats[0]!.generation, turn: null },
+    });
   });
 
   test("a rejoin says what the resumed window runs on, so the chat's head shows its model before its next turn", async ($, on) => {

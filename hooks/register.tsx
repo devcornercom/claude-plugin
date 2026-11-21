@@ -75,7 +75,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.88.0";
+export const PLUGIN_VERSION = "0.89.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -4689,10 +4689,16 @@ let sessionNo = 0;
 
 /**
  * The helper, while it runs or starts: how to stop it, the session it was
- * started for, and whether its sockets were lost since they last opened.
+ * started for, whether its sockets were lost since they last opened, and
+ * whether its child was started (`running`), from when the asking leaves
+ * the window to it (`listen` answered true).
  */
-let listener: { stop: () => void; session: number; lost?: boolean } | null =
-  null;
+let listener: {
+  stop: () => void;
+  session: number;
+  lost?: boolean;
+  running?: boolean;
+} | null = null;
 /** The earliest time a helper may be started again after one ended. */
 let listenAfter = 0;
 /** Why the window falls back to the held request, said in the next Status; null when it was said or none. */
@@ -4990,7 +4996,7 @@ async function listen($: Engine, now: number): Promise<boolean> {
   // Taken before the first wait, so a second call meanwhile starts none.
   let run: ReturnType<Engine["process"]["spawn"]> | null = null;
   const life = sessionNo;
-  const mine = {
+  const mine: NonNullable<typeof listener> = {
     stop: () => void run?.return({ code: null, signal: null }),
     session: life,
   };
@@ -5026,6 +5032,7 @@ async function listen($: Engine, now: number): Promise<boolean> {
   } catch {
     return none("no-process");
   }
+  mine.running = true;
   const stream = run;
   void (async () => {
     let pending = "";
@@ -10246,7 +10253,14 @@ async function mirrorOpened(
   // Nothing of a chat the window mirrored before goes into this one.
   leaveMirror();
   // Its held request hears for the window now, with the chat's state: the
-  // helper's socket would take its wakes past it (`listen`).
+  // helper's socket would take its wakes past it (`listen`). While a helper
+  // ran, nothing else asked (`hold` and `carryOn` leave to it), and one
+  // stopped here hands nothing back as one that ends does, so the asking
+  // starts again below, once the chat is mirrored: an idle window holds with
+  // it. Without that, a window that rejoined its chat at a reload heard
+  // nothing until its next turn, and its chat lapsed offline. One stopped
+  // before its child started left its caller to hold, which it does.
+  const parked = listener?.running === true;
   stopListening();
   mirror = {
     thread: body.chat.thread,
@@ -10274,6 +10288,11 @@ async function mirrorOpened(
     unsent: [],
     lookTries: 0,
   };
+  // A hold put off before (one that failed or answered at once while no chat
+  // was mirrored) would put off the chat's, which is what keeps it online:
+  // the next ask holds, at once after a helper, else at the poll's next.
+  holdAfter = 0;
+  if (parked) askIn($, 0, true);
   void $.session
     .id()
     .then((id) => $.store.set(mirroredKey(id), body.chat!.thread))
