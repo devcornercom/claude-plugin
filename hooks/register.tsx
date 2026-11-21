@@ -25,6 +25,7 @@ import type {
   StatusWait,
   StatusWake,
 } from "../types";
+import { DEVCORNER_TOOL, SESSION_TOOL } from "./session-tools";
 
 const status = atom({ plugin: "devcorner", key: "status" } as const, null);
 const dismissed = atom({ plugin: "devcorner", key: "dismissed" } as const, []);
@@ -74,7 +75,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.87.0";
+export const PLUGIN_VERSION = "0.88.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -4020,11 +4021,12 @@ async function heardClaim($: Engine, sent: string, s: Status): Promise<void> {
 }
 
 /**
- * Any of devcorner's tools, on a server named for devcorner, as `CARRIER`'s
- * are: a call of the main conversation's that names the session
- * it is made as tells the window its session.
+ * devcorner's tools whose input takes `session`, on a server named for
+ * devcorner, and any of devcorner's tools by name: kept in `./session-tools`,
+ * where a test of devcorner's own holds them to its tool schemas, so the list
+ * cannot drift from the server.
  */
-export const DEVCORNER_TOOL = /^mcp__[\w-]*devcorner[\w-]*__[\w-]+$/i;
+export { DEVCORNER_TOOL, SESSION_TOOL } from "./session-tools";
 
 /**
  * The session a devcorner call names as the one it is made as,
@@ -4034,6 +4036,37 @@ export const DEVCORNER_TOOL = /^mcp__[\w-]*devcorner[\w-]*__[\w-]+$/i;
 export function namedSession(call: { session?: unknown }): string | null {
   const named = typeof call.session === "string" ? call.session.trim() : "";
   return CLAIMED.test(named) ? named : null;
+}
+
+/** The session devcorner accepted for this window, as a Status read said (`claimTaken`); null for none. */
+async function takenClaimOf($: Engine): Promise<string | null> {
+  try {
+    const id = await $.session.id();
+    return claimTaken?.id === id ? claimTaken.session : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A devcorner call of the main conversation's that names no session, sent as
+ * the one this window states it runs as and devcorner accepted (`claimTaken`,
+ * from a Status read): a reload reconnects to devcorner, and the new
+ * connection holds no session, so a call that named none was refused as if
+ * the window had none while its session was live and its mail still arrived.
+ * A start is its own (`STARTER`), which binds the connection; a call that
+ * names a session, a tool that takes none, a subagent's call and a window
+ * whose session devcorner has not accepted go as they were made.
+ */
+async function withWindowSession<
+  E extends { tool: string; agentId?: string; session?: unknown },
+>($: Engine, e: E): Promise<E> {
+  if (e.agentId !== undefined) return e;
+  if (!SESSION_TOOL.test(e.tool)) return e;
+  // A session the agent passed, blank or malformed, goes as it was made.
+  if (Object.hasOwn(e, "session")) return e;
+  const here = await takenClaimOf($);
+  return here === null ? e : { ...e, session: here };
 }
 
 /** How a Status's `where` says a session runs in the cloud: "cloud", or "cloud · <routine>". */
@@ -13142,6 +13175,15 @@ export const register: Register = (on) => {
     }
     return ran;
   }).catch(($, e, next) => next(e));
+  // A devcorner call of the main conversation's that names no session goes
+  // as the one this window states it runs as and devcorner took, so a window
+  // that reconnects (a plugin reload) still acts as its session though its
+  // new connection holds none. Only a tool that takes a session is given
+  // one, and a start, a call that names a session, a subagent's call and a
+  // window whose session devcorner has not taken go as they were made.
+  on("tool.call", { tool: DEVCORNER_TOOL }, async ($, e, next) =>
+    next(await withWindowSession($, e)),
+  ).catch(($, e, next) => next(e));
 
   // The session wrote a paste for its person (dc-t490): the transcript says so
   // in one line the model never reads, and /dc paste copies it.

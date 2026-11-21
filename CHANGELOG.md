@@ -2,6 +2,10 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.88.0 — 2026-11-21
+
+- A devcorner call that names no session now goes as the session the window already works as, so a plugin reload no longer leaves a window looking signed out: its new connection holds no session, and before this its calls were refused as if none were open while its session was live and its mail still arrived. It is filled only with the session devcorner accepted for the window, only on a tool that takes one, and only when the call has no session: a start, a call that names its session (a typo included), a subagent's call and a window whose session devcorner has not taken are sent as they were made.
+
 ## 0.87.0 — 2026-11-21
 
 - A model switch sent from a window chat's page no longer waits in the window with nothing said. When Claude Code would ask to confirm it there, because the switch re-reads the whole cached conversation, the page asks instead, in Claude Code's own words and with its two choices, "Yes, switch to <model>" and "No, go back"; a yes switches with no dialog in the window, and a no leaves the model as it was. A switch with nothing cached goes at once. A `/model` or `/effort` from the page still waiting on its confirmation in the window after 3 seconds, which the plugin cannot answer from the page (`/effort`'s, or a Claude Code without the PreModelSwitch hook), shows on the page as waiting at the laptop, with what it asks.

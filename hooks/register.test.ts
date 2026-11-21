@@ -7287,6 +7287,140 @@ describe("the window states the session it runs as (dc-t588)", () => {
   });
 });
 
+describe("a devcorner call that names no session goes as this window's", () => {
+  const CLAIMS = "/home/ann/.cache/devcorner/claims/conversation-1.claim";
+  const started = (id: string) =>
+    `devcorner · session ${id} · no ticket\n\nYour instructions …`;
+  /** A Status whose claim devcorner took. */
+  const accepted = (session: string): Status => ({
+    ...waiting(0, null),
+    claim: { session, outcome: "kept", was: null, why: null, final: false },
+  });
+
+  test("a call that names no session carries the one this window states", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = accepted("acm-s4");
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      tool: "mcp__Devcorner__check",
+      session: "acm-s4",
+    });
+  });
+
+  test("a session the agent passed, blank or malformed, is left as it was made", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = accepted("acm-s4");
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    await $.tool.call({
+      tool: "mcp__Devcorner__note",
+      text: "x",
+      session: " ",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      tool: "mcp__Devcorner__note",
+      text: "x",
+      session: " ",
+    });
+    // A typo is the agent's, refused by devcorner, never replaced.
+    await $.tool.call({
+      tool: "mcp__Devcorner__finish",
+      outcome: "done",
+      session: "acm-s9x",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ session: "acm-s9x" });
+  });
+
+  test("a tool that takes no session is left as it was made", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = accepted("acm-s4");
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    for (const tool of ["board", "workspace", "usage", "help", "code"]) {
+      await $.tool.call({ tool: `mcp__Devcorner__${tool}` });
+      expect(seen.toolCalls.at(-1), tool).not.toHaveProperty("session");
+    }
+  });
+
+  test("a window that reloaded keeps acting as its session, read back from its file", async ($, on) => {
+    // A reload makes a new module over a new connection that holds no
+    // session; the one this window stated is kept in its file and devcorner
+    // takes it at the first Status.
+    const { clock, seen } = world(on, {
+      tools: true,
+      home: "/home/ann",
+      files: [[CLAIMS, "acm-s4\n"]],
+    });
+    seen.answer = accepted("acm-s4");
+    await $.session.start(START);
+    await clock.settle();
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ session: "acm-s4" });
+    await $.tool.call({ tool: "mcp__Devcorner__show", id: "dc-t1" });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      id: "dc-t1",
+      session: "acm-s4",
+    });
+  });
+
+  test("a session a call guessed is never filled until devcorner takes it", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    // The window states none, and devcorner ties it to none.
+    seen.answer = { ...base };
+    await $.session.start(START);
+    await clock.settle();
+    // A call that names its session makes a guess, which devcorner has not
+    // taken: the Status says no claim.
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s4" });
+    await clock.settle();
+    expect(seen.statusBodies.at(-1)).toMatchObject({ claim: "acm-s4" });
+    await $.tool.call({ tool: "mcp__Devcorner__note", text: "x" });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("session");
+  });
+
+  test("a start, a call that names a session and a subagent's call go as they were made", async ($, on) => {
+    const { clock, seen } = world(on, {
+      tools: true,
+      home: "/home/ann",
+      files: [[CLAIMS, "acm-s4\n"]],
+    });
+    seen.answer = accepted("acm-s4");
+    await $.session.start(START);
+    await clock.settle();
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Again" });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("session");
+    await $.tool.call({ tool: "mcp__Devcorner__check", session: "acm-s9" });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ session: "acm-s9" });
+    await $.tool.call({
+      tool: "mcp__Devcorner__check",
+      agentId: "agent-1",
+    } as never);
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("session");
+    // Another server's tool is never devcorner's.
+    await $.tool.call({ tool: "mcp__linear__check" });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("session");
+  });
+
+  test("a window that states no session sends the call as it was made", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    await $.tool.call({ tool: "mcp__Devcorner__check" });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("session");
+  });
+});
+
 describe("the window's label: its machine and place, before the session's id (dc-t589)", () => {
   /** A window on MacBook Air 1, in the repo's project Web, as devcorner labels it. */
   const LABELLED: Status = {
