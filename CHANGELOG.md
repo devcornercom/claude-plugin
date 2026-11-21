@@ -2,6 +2,23 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.87.0 — 2026-11-21
+
+- A model switch sent from a window chat's page no longer waits in the window with nothing said. When Claude Code would ask to confirm it there, because the switch re-reads the whole cached conversation, the page asks instead, in Claude Code's own words and with its two choices, "Yes, switch to <model>" and "No, go back"; a yes switches with no dialog in the window, and a no leaves the model as it was. A switch with nothing cached goes at once. A `/model` or `/effort` from the page still waiting on its confirmation in the window after 3 seconds, which the plugin cannot answer from the page (`/effort`'s, or a Claude Code without the PreModelSwitch hook), shows on the page as waiting at the laptop, with what it asks.
+
+## 0.86.0 — 2026-11-21
+
+- An idle window no longer asks devcorner anything on a timer. The plugin starts one small helper for each window, run with `node` (Node 22 or later) and ended with the window or a reload, which holds a sleeping socket to devcorner and wakes the window the moment a message, a launch, a reload ask or a change of its session comes. The helper reconnects by itself after a deploy or a lost connection, waiting longer after each failure. While its socket is open, devcorner counts the window as live, for `mine`, its name and a launch from the page, with no sighting written.
+- Where no `node` runs it (Claude Code's native install has none on its PATH, and the login shell finds none), or the helper ends, the window keeps the 25 s held request as before, and says why once in its next status read, so devcorner counts how often. A window that mirrors a window chat keeps the held request too, which carries the chat's state.
+
+## 0.85.0 — 2026-11-21
+
+- A window chat's page shows every subagent its window starts, from its start to its end, as a line under the thread: `Subagent "<what it does>" running`. A subagent run in the background used to show nothing, and one run in the foreground showed only once it had held the turn for 10 seconds, as a command holding the window. Now each shows the same way from the moment it starts, whether or not it calls devcorner, and once: a subagent in the foreground is no longer shown as a hold too. One in the foreground leaves the list when it returns; one in the background when Claude Code says it ended, as a background command does.
+
+## 0.84.0 — 2026-11-21
+
+- A window whose chat its person moves to devcorner now ends its own Claude Code session, so the chat has one place to answer it. devcorner tells the window on its held request, naming the chat alone; the plugin mirrors that chat no more, aborts the turn the window runs, forgets the chat so a restart does not rejoin it, and runs Claude Code's own `/exit` once the hook that asked has returned. A window that hears it at a post instead, because it was in a turn, is refused with the same words and code and ends the same way. Where Claude Code will not exit, the window says so and gives the command to type. devcorner's page says before the move that its window is told to stop and its session ends.
+
 ## 0.83.0 — 2026-11-21
 
 - An idle window's held request stays at 25 s, under the 30 s after which Claude Code's fetch gives up on it. A hold cut on the way after devcorner held it whole is held again at once rather than waiting the poll's five minutes; one that fails sooner still leaves the poll, as before.

@@ -74,7 +74,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.83.0";
+export const PLUGIN_VERSION = "0.87.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -1821,6 +1821,7 @@ export type Held =
   | { kind: "chat"; chat: string }
   | { kind: "launch"; launch: string }
   | { kind: "reload" }
+  | { kind: "stop"; chat: string }
   | { kind: "empty" }
   | { kind: "failed" }
   | { kind: "updating"; after: number };
@@ -1850,6 +1851,10 @@ export function readHeld(text: string): Held {
     // Its person asked this window to reload its plugin: a Status
     // says the ask, which `reloadWhenIdle` takes.
     if (typeof o.reload === "string") return { kind: "reload" };
+    // devcorner's page moves the window chat this window mirrors to
+    // devcorner and its person stopped this window first: the
+    // chat alone, which `stopForMove` acts on.
+    if (typeof o.stop === "string") return { kind: "stop", chat: o.stop };
     return { kind: "empty" };
   } catch {
     return { kind: "failed" };
@@ -3012,6 +3017,7 @@ async function signOut($: Engine): Promise<string> {
   await markOffered($, base);
   stopAsking();
   stopFresh();
+  stopListening();
   await update($, status, () => null);
   await setSignIn($, { step: "out" });
   return `Signed out: ${said}, and the plugin forgot it. /dc login signs in again.`;
@@ -4241,16 +4247,16 @@ async function readVersionOnDisk($: Engine): Promise<string | null> {
 }
 
 /**
- * Idle, as a wake waits for: no turn, no background command open, nothing
- * typed in the prompt box, and nothing under way that a reload would cut
- * off: a wake or the page's words submitted whose turn has not begun, a
- * command from the page, words of the page waiting to be typed, or an ask
- * of a window chat still open.
+ * Idle, as a wake waits for: no turn, no background command or subagent
+ * open, nothing typed in the prompt box, and nothing under way that a reload
+ * would cut off: a wake or the page's words submitted whose turn has not
+ * begun, a command from the page, words of the page waiting to be typed, or
+ * an ask of a window chat still open.
  */
 async function reloadIdle($: Engine): Promise<boolean> {
   if (
     (await read($, turn)) !== null ||
-    backgroundRunning.size > 0 ||
+    runningWork.size > 0 ||
     wokeAt !== null ||
     typedHolding(await $.clock.now()) ||
     commandFromPage !== null ||
@@ -4437,6 +4443,9 @@ async function fetchStatus(
     // conversation, and the reload ask this copy's load answers.
     const saysPlugin = pluginTaken !== sessionId;
     const reloaded = saysPlugin ? await reloadedFor($, sessionId) : null;
+    // Why the window holds no socket of its own, said once, so devcorner
+    // counts how often a window falls back to the held request.
+    const telling = listenFellBack;
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -4457,8 +4466,14 @@ async function fetchStatus(
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
         ...(light ? { light: true } : {}),
+        ...(telling !== null ? { delivery: telling } : {}),
       }),
     });
+    // Said once: a helper that ended again is said again.
+    if (telling !== null && res.ok) {
+      if (telling !== "ended") listenTold.add(telling);
+      if (listenFellBack === telling) listenFellBack = null;
+    }
     if (res.status === 401 && held.from === "store") {
       // The machine was revoked on the connections page: its token is
       // forgotten, and the row says how to sign in again.
@@ -4629,12 +4644,45 @@ let wakingFor: string | null = null;
 /** Counts the sessions this module has seen begin or end: a late answer belongs to the one it was asked in (`keepLate`). */
 let sessionNo = 0;
 
+// The window's own sockets. While no window chat is mirrored, an
+// idle window holds no request and asks nothing on a timer: one helper
+// (hooks/listen.mjs, run with `node` by `$.process.spawn`) holds a sleeping
+// socket to each store a held request would wait on, and prints each frame
+// it is sent, which `actOn` takes as it takes a held request's answer. The
+// helper reconnects by itself; the child is killed when this module's loop
+// ends or the module unloads, so a reload or a closed window leaves none.
+// With no node, no `$.process` or a helper that ended, the held request
+// takes over, and the next Status says why once (`listenFellBack`).
+
+/**
+ * The helper, while it runs or starts: how to stop it, the session it was
+ * started for, and whether its sockets were lost since they last opened.
+ */
+let listener: { stop: () => void; session: number; lost?: boolean } | null =
+  null;
+/** The earliest time a helper may be started again after one ended. */
+let listenAfter = 0;
+/** Why the window falls back to the held request, said in the next Status; null when it was said or none. */
+let listenFellBack: ListenFallback | null = null;
+/** The lasting reasons said already in this load (no node, no process), never said twice. */
+const listenTold = new Set<ListenFallback>();
+/** The node the helper runs with: a path, null where none runs it, undefined until looked for. */
+let listenNode: string | null | undefined;
+/** Why a window holds no socket of its own, as its Status says it (`DELIVERY_FALLBACKS` in src/mcp/handler.ts). */
+type ListenFallback = "no-node" | "no-process" | "ended";
+/** The oldest Node whose own WebSocket the helper uses. */
+const LISTEN_NODE_MAJOR = 22;
+/** Where the store keeps the node the helper ran with last. */
+const LISTEN_NODE_KEY = "listenNode";
+
 /** Whether a prompt the plugin submitted lately still waits for its turn to begin (`wokeAt`). */
 const settling = (now: number) =>
   wokeAt !== null && now - wokeAt < WAKE_SETTLE_MS;
 
 /** A new or ended session starts clean: nothing of the last one carries over. */
 function forgetSession(): void {
+  stopListening();
+  listenAfter = 0;
   claimTaken = undefined;
   quick = 0;
   holdFailures = 0;
@@ -4643,6 +4691,7 @@ function forgetSession(): void {
   failures = 0;
   wokeAt = null;
   wakingFor = null;
+  stoppingForMove = false;
   typedWait?.cancel();
   typedWait = undefined;
   lateLines.clear();
@@ -4704,6 +4753,9 @@ async function hold($: Engine): Promise<void> {
     while (mine === epoch) {
       if ((await read($, turn)) !== null) return;
       if (await superseded($)) return;
+      // The window's own sockets hear for it now, or again once a helper
+      // that ended may be tried again: nothing is held here.
+      if (await listen($, await $.clock.now())) return;
       const began = await $.clock.now();
       const held = await waitOnce($);
       if (mine !== epoch) return;
@@ -4739,36 +4791,21 @@ async function hold($: Engine): Promise<void> {
       if (held.kind === "empty" || held.kind === "chat")
         quick = quickly ? quick + 1 : 0;
       if (held.kind === "empty" && quick < QUICK_MAX) continue;
-      if (held.kind === "notice") {
-        // Mail the conversation is told of without a turn (dc-t312): a fresh
-        // Status puts it in the hooks' marker, so the next prompt's hook
-        // hands it, and the person is told it waits. Held again at once.
-        quick = 0;
-        await refresh($, true);
-        if (mine !== epoch) return;
-        $.ui.toast(noticeToast(held.id));
-        continue;
+      if (held.kind === "stop") {
+        // The loop leaves here, so the hold the Hub keeps answering with the
+        // stop is not asked for again, and `/exit` is run once.
+        await actOn($, held);
+        return;
       }
-      if (held.kind === "claim" || held.kind === "reload") {
-        // devcorner asks for the session this window runs as (dc-t588): a
-        // fresh Status states it, and the row shows what it works as now.
-        // Or its person asked it to reload its plugin, which that
-        // Status says and the window does while idle. Held again at once,
-        // unless the reload tore this copy down. A changed tie is news even
-        // where the claim was taken, so it is stated again, which asks
-        // devcorner to check and repair it.
+      if (
+        held.kind === "notice" ||
+        held.kind === "claim" ||
+        held.kind === "reload" ||
+        held.kind === "launch"
+      ) {
+        // Acted on, then held again at once.
         quick = 0;
-        if (held.kind === "claim") forgetClaimTaken();
-        await refresh($, true);
-        if (mine !== epoch) return;
-        continue;
-      }
-      if (held.kind === "launch") {
-        // A window chat to start on this machine: taken by the first window
-        // that asks, and started by this script, never the model. Held again
-        // once it is done.
-        quick = 0;
-        await takeLaunch($, held.launch);
+        await actOn($, held);
         if (mine !== epoch) return;
         continue;
       }
@@ -4785,15 +4822,10 @@ async function hold($: Engine): Promise<void> {
       if (mine !== epoch) return;
       if (held.kind === "wake" && held.id !== wokeFor) {
         quick = 0;
-        // A message that wakes the session waits: the prompt's hook asks.
-        await markWaiting($, 1, ++learnt);
-        if (mine !== epoch) return;
-        // The wake itself goes by a fresh Status (dc-t204), which names what
-        // came and says whether it is still unread: a hook may have handed
-        // it over since. The held request is not opened again here, so a
-        // wake submitted but not yet begun is never followed by another.
+        // The held request is not opened again here, so a wake submitted
+        // but not yet begun is never followed by another.
         holdAfter = now;
-        void ask($);
+        await actOn($, held);
         return;
       }
       if (held.kind === "updating") {
@@ -4838,12 +4870,258 @@ async function hold($: Engine): Promise<void> {
 }
 
 /**
- * Keeps asking: the held request where it may be tried, else the poll in
+ * What an idle window does with a frame devcorner sent it, by its held
+ * request or its own socket (`listen`):
+ * - `wake`, a message that wakes it: the hooks' marker says one waits, and
+ *   the wake itself goes by a fresh Status (dc-t204), which names what came
+ *   and says whether it is still unread, since a hook may have handed it
+ *   over since. One it woke for already is passed over.
+ * - `notice`, mail it is told of without a turn (dc-t312): a fresh Status
+ *   puts it in the hooks' marker, so the next prompt's hook hands it, and
+ *   the person is told it waits.
+ * - `claim`, devcorner asks for the session this window runs as (dc-t588):
+ *   a fresh Status states it again, which asks devcorner to check and repair
+ *   the tie, even where the claim was taken, and the row shows what it works
+ *   as now. `reload`, its person asked it to reload its plugin, which that
+ *   Status says and the window does while idle.
+ * - `launch`, a window chat to start on this machine: taken by the first
+ *   window that asks, and started by this script, never the model.
+ * - `stop`, devcorner's page moved the window chat this window holds to
+ *   devcorner and its person stopped it first: the chat is mirrored no
+ *   more and this session ends (`stopForMove`).
+ * Any other is left to its caller.
+ */
+async function actOn($: Engine, held: Held): Promise<void> {
+  if (held.kind === "wake") {
+    if (held.id === (await read($, woke))) return;
+    await markWaiting($, 1, ++learnt);
+    void ask($);
+  } else if (held.kind === "notice") {
+    await refresh($, true);
+    $.ui.toast(noticeToast(held.id));
+  } else if (held.kind === "claim" || held.kind === "reload") {
+    if (held.kind === "claim") forgetClaimTaken();
+    await refresh($, true);
+  } else if (held.kind === "launch") {
+    await takeLaunch($, held.launch);
+  } else if (held.kind === "stop") {
+    stopForMove(
+      $,
+      `${held.chat} moved to devcorner, so this window no longer mirrors it.`,
+    );
+  }
+}
+
+/**
+ * The node the helper runs with: the one kept from the last time, else the
+ * one on Claude Code's own PATH, else the one the person's login shell
+ * finds (nvm puts it there alone), when it is `LISTEN_NODE_MAJOR` or later;
+ * null where none is. Looked for once in a load.
+ */
+async function listenNodeOf($: Engine): Promise<string | null> {
+  if (listenNode !== undefined) return listenNode;
+  const runs = async (path: string) => {
+    try {
+      const v = nodeVersionOf((await nodeAt($, path)).version);
+      return v !== null && v[0] >= LISTEN_NODE_MAJOR;
+    } catch {
+      return false;
+    }
+  };
+  const kept = await $.store.get(LISTEN_NODE_KEY).catch(() => null);
+  let found: string | null = null;
+  if (typeof kept === "string" && (await runs(kept))) found = kept;
+  else if (await runs("node")) found = "node";
+  else {
+    const path = await loginShellNode($).catch(() => null);
+    if (path !== null && (await runs(path))) found = path;
+  }
+  if (found !== null && found !== kept)
+    await $.store.set(LISTEN_NODE_KEY, found).catch(() => undefined);
+  listenNode = found;
+  return found;
+}
+
+/**
+ * Starts the window's helper (`listener`) where it may run: an idle window
+ * that draws, signed in, mirroring no window chat, with the plugin's folder,
+ * `$.process` and a node that runs it. True while one runs, its own or one
+ * just started; false where the held request goes on, with why kept to say
+ * once (`listenFellBack`).
+ */
+async function listen($: Engine, now: number): Promise<boolean> {
+  // A mirrored window chat's held request says the chat's state, so it holds.
+  if (mirror !== null) return false;
+  if (listener !== null) return true;
+  if (now < listenAfter) return false;
+  // Taken before the first wait, so a second call meanwhile starts none.
+  let run: ReturnType<Engine["process"]["spawn"]> | null = null;
+  const life = sessionNo;
+  const mine = {
+    stop: () => void run?.return({ code: null, signal: null }),
+    session: life,
+  };
+  listener = mine;
+  const none = (why?: ListenFallback): false => {
+    if (listener === mine) listener = null;
+    return why === undefined ? false : fellBack(why);
+  };
+  const token = (await tokenOf($))?.token;
+  const root: unknown = $.plugin.root;
+  if (!token || typeof root !== "string" || root === "") return none();
+  const node = await listenNodeOf($);
+  if (node === null) return none("no-node");
+  const conversation = await $.session.id();
+  const input = JSON.stringify({
+    base: await baseOf($),
+    token,
+    conversation,
+    cursors: await read($, cursors),
+    launcher: true,
+    revive: true,
+  });
+  // Stopped meanwhile (the session ended, a newer copy, a mirror).
+  if (listener !== mine) return false;
+  try {
+    run = $.process.spawn({
+      argv: [node, `${root}/hooks/listen.mjs`],
+      // Laid over the session's environment: the helper has the token on
+      // standard input alone.
+      env: { DEVCORNER_TOKEN: "" },
+      input,
+    });
+  } catch {
+    return none("no-process");
+  }
+  const stream = run;
+  void (async () => {
+    let pending = "";
+    let ended: string | null = null;
+    try {
+      // `return()` on the stream kills the child (the runtime's contract
+      // for `$.process.spawn`); leaving this loop does too, so one stopped
+      // whose `return()` waited behind a pending read ends at its next line.
+      for await (const chunk of stream) {
+        if (listener !== mine) break;
+        if (chunk.stream !== "stdout") continue;
+        pending += chunk.text;
+        let at: number;
+        while ((at = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, at);
+          pending = pending.slice(at + 1);
+          ended = (await heardListen($, line, mine)) ?? ended;
+        }
+      }
+    } catch {
+      // It could not start: the held request takes over below.
+    }
+    if (listener !== mine) return;
+    listener = null;
+    // A node with no WebSocket of its own is no node for it; any other end
+    // (a refused token, a conversation devcorner does not know) is tried
+    // again after a while.
+    if (ended === "no-websocket") listenNode = null;
+    listenFellBack = ended === "no-websocket" ? "no-node" : "ended";
+    try {
+      listenAfter = (await $.clock.now()) + WAIT_RETRY_MS;
+      if (life !== sessionNo || (await superseded($))) return;
+      askIn($, 0, true);
+    } catch {
+      // The module unloaded with it: nothing is left to ask.
+    }
+  })();
+  return true;
+}
+
+/** Keeps why the window holds no socket of its own, to say once in this load, and answers false. */
+function fellBack(why: ListenFallback): false {
+  if (!listenTold.has(why)) listenFellBack = why;
+  return false;
+}
+
+/** Stops the window's helper, which closes its sockets. */
+function stopListening(): void {
+  const was = listener;
+  listener = null;
+  was?.stop();
+}
+
+/**
+ * One line the helper printed (hooks/listen.mjs), read: it ends and why,
+ * its sockets are open (`connected`) or lost for a while (`down`), or a
+ * frame one was sent, read as a held request's answer is (`readHeld`).
+ * Null for anything else.
+ */
+export type ListenLine =
+  | { kind: "end"; why: string }
+  | { kind: "connected" }
+  | { kind: "down" }
+  | { kind: "frame"; held: Held };
+
+export function readListenLine(line: string): ListenLine | null {
+  let said: Record<string, unknown>;
+  try {
+    said = JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (said === null || typeof said !== "object") return null;
+  if (typeof said.end === "string") return { kind: "end", why: said.end };
+  if (said.connected !== undefined) return { kind: "connected" };
+  if (said.down !== undefined) return { kind: "down" };
+  if (said.frame !== undefined)
+    return { kind: "frame", held: readHeld(JSON.stringify(said.frame)) };
+  return null;
+}
+
+/**
+ * One line the helper printed, acted on while it is this module's helper,
+ * the window mirroring nothing (a mirrored chat's held request hears for
+ * it). A frame is taken as a held request's answer is (`actOn`) while the
+ * window is idle; a launch during a turn too, since nothing tells it again,
+ * and the rest wait for the turn's end, whose Status reads them. Back after
+ * a gap (a deploy closes every socket), what came meanwhile that no frame
+ * tells as a socket opens (a notice, a reload ask) is read in one light
+ * Status, which wakes for mail as an ask does. Answers why, when the line
+ * says the helper ends, else null.
+ */
+async function heardListen(
+  $: Engine,
+  line: string,
+  from: NonNullable<typeof listener>,
+): Promise<string | null> {
+  const said = readListenLine(line);
+  if (said?.kind === "end") return said.why;
+  if (said === null || listener !== from) return null;
+  try {
+    if (said.kind === "down") {
+      from.lost = true;
+      return null;
+    }
+    if (await superseded($)) return null;
+    const idle = (await read($, turn)) === null;
+    if (said.kind === "connected") {
+      if (from.lost && idle) void ask($, undefined, true);
+      from.lost = false;
+      return null;
+    }
+    if (mirror !== null) return null;
+    if (idle || said.held.kind === "launch") await actOn($, said.held);
+  } catch {
+    /* stay silent */
+  }
+  return null;
+}
+
+/**
+ * Keeps asking: nothing while the window's own sockets hear for it
+ * (`listen`), else the held request where it may be tried, else the poll in
  * `ms`. Never the held request while a wake's turn has not begun (`wokeAt`,
  * dc-t204): it would hand back at once a message that came meanwhile.
  */
 async function carryOn($: Engine, ms: number): Promise<void> {
   const now = await $.clock.now();
+  if (await listen($, now)) return;
   if (!settling(now) && now >= holdAfter) void hold($);
   // The held request is what it waits for: the poll in between asks the
   // light status, since nothing changed while it waits.
@@ -4909,6 +5187,7 @@ async function superseded($: Engine): Promise<boolean> {
   if (newest === null || newest === GENERATION) return false;
   stopAsking();
   stopFresh();
+  stopListening();
   if (mirror !== null) {
     leaveMirror();
     mirror = null;
@@ -5052,8 +5331,14 @@ async function ask($: Engine, given?: Read, light = false): Promise<void> {
     }
     // Never over what the person is typing: their own prompt's hook hands
     // the message over, and if they leave the draft, the next ask wakes.
+    // Nor while a command from the page runs alone: a switch it asks the
+    // page about holds its turn until the person answers there.
     const draft = await $.prompt.read();
-    if (draft.text.trim() === "" && (await read($, turn)) === null) {
+    if (
+      draft.text.trim() === "" &&
+      (await read($, turn)) === null &&
+      commandFromPage === null
+    ) {
       // The session, or the conversation with none (dc-t312): `nextStep`
       // woke for one of them.
       const woken = wokenOf(s)!;
@@ -5926,7 +6211,7 @@ interface Mirror {
   tasksSent: string;
   /** This window's own commands as devcorner last took them (`windowCommands`, as JSON), so a post sends them only when they changed; null before it took any. */
   commandsSent: string | null;
-  /** The background commands that run as devcorner last took them (`backgroundRunning`, as JSON), so a post sends them only when they changed; null before it took any, when the next post sends them, none too. */
+  /** What runs (background commands and subagents) as devcorner last took them (`runningWork`, as JSON), so a post sends them only when they changed; null before it took any, when the next post sends them, none too. */
   runningSent: string | null;
   /** The last turn whose beginning devcorner took (its post answered), which a terminate from the page stops; null before any. */
   taken: string | null;
@@ -6031,6 +6316,12 @@ let pageHeld: Set<string> | null = null;
 let stoppedFromPage: string | null = null;
 /** The turn stopped in the window whose end is not answered yet, by the key its end is posted under (`Mirror.key`): the words its answer names are those that waited at the stop, and are held. */
 let stoppedInWindow: string | null = null;
+/**
+ * Whether this window was told to stop for its chat's move to devcorner
+ *: its session ends once, whichever tells it first, the stop on
+ * its held request or the refusal of its next post.
+ */
+let stoppingForMove = false;
 /**
  * The mirrored turn whose `turn.complete` is under way, until its end is
  * posted; null otherwise. The turn is over here as that event begins, so the
@@ -7244,11 +7535,11 @@ async function saysOfWindow(
   commands?: WindowCommand[];
   running?: WindowRunning[];
 }> {
-  // Any post says the background commands that run, once they changed: a
-  // command goes to the background mid-turn, and its end begins a turn. A
+  // Any post says what runs (`runningWork`), once it changed: a subagent or a
+  // command starts mid-turn, and a background one's end begins a turn. A
   // mirror's first post says them even when none runs, so a list a window
   // of this chat sent before a restart is not left standing.
-  const running = [...backgroundRunning.values()];
+  const running = [...runningWork.values()];
   const runningChanged = JSON.stringify(running) !== m.runningSent;
   const ran = runningChanged ? { running } : {};
   if (!payload.begin && !payload.end) return ran;
@@ -7316,26 +7607,37 @@ async function postMirror(
       if (await superseded($)) return true;
       if (mirror === m) {
         const under = m.turn;
+        const why = typeof body.error === "string" ? body.error : null;
         // This copy is the window's newest, yet another copy holds the
         // chat: said, and kept for a restart's rejoin.
         if (body.code === "laptop-superseded") {
-          stopMirror($, typeof body.error === "string" ? body.error : null);
+          stopMirror($, why);
           return true;
         }
-        stopMirror($, typeof body.error === "string" ? body.error : null);
-        // A chat this window no longer holds is not rejoined after a restart.
-        void $.session
-          .id()
-          .then((id) => $.store.delete(mirroredKey(id)))
-          .catch(() => undefined);
-        // A chat its person terminated from the page stops the turn it
-        // mirrored, as the page's Stop does; the window itself stays open.
-        // Only a turn devcorner took the beginning of: one it never took
-        // began after the terminate, in the window alone (an idle window
-        // that missed the frame), and runs on. Stopped once the mirror is
-        // gone, so the turn's end posts nothing.
-        if (body.code === "laptop-ended" && under !== null && m.taken === under)
-          await $.turn.abort({ turnId: under }).catch(() => undefined);
+        // Its person moved this chat to devcorner and told the window to stop
+        // first: this session ends. Every other refusal only stops
+        // the mirror.
+        if (body.code === "laptop-stopped") stopForMove($, why);
+        else {
+          stopMirror($, why);
+          // A chat this window no longer holds is not rejoined after a restart.
+          void $.session
+            .id()
+            .then((id) => $.store.delete(mirroredKey(id)))
+            .catch(() => undefined);
+          // A chat its person terminated from the page stops the turn it
+          // mirrored, as the page's Stop does; the window itself stays open.
+          // Only a turn devcorner took the beginning of: one it never took
+          // began after the terminate, in the window alone (an idle window
+          // that missed the frame), and runs on. Stopped once the mirror is
+          // gone, so the turn's end posts nothing.
+          if (
+            body.code === "laptop-ended" &&
+            under !== null &&
+            m.taken === under
+          )
+            await $.turn.abort({ turnId: under }).catch(() => undefined);
+        }
       }
       return true;
     }
@@ -7711,6 +8013,48 @@ function stopMirror($: Engine, why: string | null): void {
     $.ui.toast(`dc: this window no longer mirrors its window chat. ${why}`);
 }
 
+/**
+ * devcorner's page moves the window chat this window mirrors to devcorner
+ * and its person stops this window, so nothing is answered twice:
+ * the chat is mirrored no more, the turn the window runs is aborted, and its
+ * own Claude Code session ends. A window the ask reaches on its held request
+ * comes here, and so does one that hears it at a post instead, refused
+ * `laptop-stopped`.
+ */
+function stopForMove($: Engine, why: string | null): void {
+  if (stoppingForMove) return;
+  stoppingForMove = true;
+  const running = mirror?.turn ?? null;
+  stopMirror($, why);
+  // A chat this window no longer mirrors is not rejoined after a restart.
+  void $.session
+    .id()
+    .then((id) => $.store.delete(mirroredKey(id)))
+    .catch(() => undefined);
+  if (running !== null)
+    void $.turn.abort({ turnId: running }).catch(() => undefined);
+  $.ui.toast("dc: this chat is devcorner's now, so this window's session ends");
+  endSession($);
+}
+
+/**
+ * Ends this window's Claude Code session with Claude Code's own `/exit`, once
+ * the hook that asked has returned: a command run from inside one waits on
+ * the turn it holds (dc-t226), and Claude Code tears this copy down with the
+ * session. One Claude Code refuses is said in the window, with what to type.
+ */
+function endSession($: Engine): void {
+  $.clock.after(0, async () => {
+    try {
+      await $.command.run({ command: "exit" });
+    } catch (error) {
+      $.ui.toast(
+        `dc: could not end this session (${commandRefused(error)}): type /exit to end it`,
+      );
+    }
+  });
+}
+
 // ---- Asks in a window chat ----
 //
 // While its turn runs, the window may stop on its person: a tool's
@@ -7788,8 +8132,13 @@ interface PendingAsk {
 const asks = new Map<string, PendingAsk>();
 /** The line a turn the plugin begins for a subagent's ask while no turn is mirrored is kept as (`beginAskTurn`). */
 export const BACKGROUND_ASK_LINE = "A background agent waits on your answer";
-/** The mirrored turn the plugin began for asks (`beginAskTurn`), by its id, and how each ask closed in it, its reply's lines; null while none is under way. */
-let askTurn: { id: string; said: string[] } | null = null;
+/**
+ * The mirrored turn the plugin began for asks (`beginAskTurn`), by its id,
+ * and how each ask closed in it, its reply's lines; null while none is under
+ * way. A page command's (`command`) does not end as its last ask closes: the
+ * command ends it with what it came to (`endAskTurn`).
+ */
+let askTurn: { id: string; said: string[]; command: boolean } | null = null;
 /** Names the turns begun for asks, with the clock's time, so no two share a key. */
 let askTurns = 0;
 let askLook: Timer | undefined;
@@ -7857,29 +8206,47 @@ function openAsk(
  * harness's line, as a turn a background task's end begins, beating as any
  * turn does; it ends once its last ask closes (`endAskTurn`), or as the
  * window begins a turn of its own. Whether it began one.
+ *
+ * With `command`, the turn is a page command's, begun before it ends since
+ * it waits on its person (`switchOnPage`, `dialogOnPage`): under the key its
+ * whole post would take (`commandTurn`), as the person's line taking their
+ * words, and ended by the command (`runPageCommand`); begun with no wait, so
+ * its caller's check of the command still holds.
  */
-async function beginAskTurn($: Engine): Promise<boolean> {
+async function beginAskTurn(
+  $: Engine,
+  command?: { key: string; line: string },
+): Promise<boolean> {
   if (mirror === null || mirror.turn !== null) return false;
-  const now = await $.clock.now();
+  const id =
+    command === undefined
+      ? `asks-${await $.clock.now()}-${++askTurns}`
+      : `page-command-${command.key}`;
   const m = mirror;
   if (m === null || m.turn !== null) return false;
-  const id = `asks-${now}-${++askTurns}`;
-  askTurn = { id, said: [] };
+  askTurn = { id, said: [], command: command !== undefined };
+  if (command !== undefined) commandTurnsBegun.add(command.key);
   m.turn = id;
   m.part = 0;
   m.parts = [];
-  beginPart($, m, id, {
-    text: BACKGROUND_ASK_LINE,
-    from: "harness",
-    took: [],
-    images: [],
-  });
+  beginPart(
+    $,
+    m,
+    id,
+    command === undefined
+      ? { text: BACKGROUND_ASK_LINE, from: "harness", took: [], images: [] }
+      : { text: command.line, from: "page", took: [command.key], images: [] },
+  );
   mirrorBeat($);
   return true;
 }
 
-/** Ends the turn begun for asks (`beginAskTurn`) while it is the mirrored one, its reply saying how each ask closed, and any still open that the turn after it asks again. */
-function endAskTurn($: Engine): void {
+/**
+ * Ends the turn begun for asks (`beginAskTurn`) while it is the mirrored one,
+ * its reply saying how each ask closed, or for a page command what it came
+ * to (`end`), and any still open that the turn after it asks again.
+ */
+function endAskTurn($: Engine, end?: CommandEnd): void {
   const m = mirror;
   const ending = askTurn;
   askTurn = null;
@@ -7890,7 +8257,12 @@ function endAskTurn($: Engine): void {
   m.beat?.cancel();
   void mirrorPost($, {
     turn: m.key,
-    end: { text: [...ending.said, ...open].join("\n"), outcome: "done" },
+    end: {
+      text: [...(end === undefined ? ending.said : [end.text]), ...open].join(
+        "\n",
+      ),
+      outcome: end?.outcome ?? "done",
+    },
   });
   m.turn = null;
   m.key = null;
@@ -8002,7 +8374,8 @@ function closeAsk(
   asks.delete(id);
   looseAsks.delete(id);
   pending.done(null);
-  // The last ask of a turn begun for asks ends it, its end post saying this.
+  // The last ask of a turn begun for asks ends it, its end post saying this;
+  // a page command's ends as the command does.
   const asking = askTurn !== null && askTurn.id === mirror?.turn;
   if (asking) {
     const closed =
@@ -8011,7 +8384,7 @@ function closeAsk(
         : `${how.said || "answered"} ${how.by === "page" ? "from the page" : "in the window"}`;
     askTurn!.said.push(`- ${askWhat(pending.ask)}: ${closed}`);
   }
-  const last = asking && asks.size === 0;
+  const last = asking && asks.size === 0 && !askTurn!.command;
   sayAsk(
     $,
     how === "expired"
@@ -8163,7 +8536,8 @@ export const BACKGROUND_LINE =
  * What one tool call of the main loop holds, from what `classic.PreToolUse`
  * gives: a dialog only the window answers, a command (a foreground Bash call
  * may go to the background), or nothing, for one that never holds the turn
- * (a Bash call already in the background, a question the page shows).
+ * (a Bash call already in the background, a question the page shows) or the
+ * page lists apart (a subagent).
  */
 export function holdOf(tool: string, input: unknown): Hold | null {
   const args =
@@ -8187,6 +8561,9 @@ export function holdOf(tool: string, input: unknown): Hold | null {
         }
       : null;
   if (tool === "Bash" && args.run_in_background === true) return null;
+  // A subagent is the page's line from its start (`agentOf`), in the
+  // foreground or the background, so it is shown once, never as a hold too.
+  if (tool === "Agent") return null;
   return {
     kind: "command",
     tool: shortToolName(tool),
@@ -8341,22 +8718,104 @@ async function backgroundFromPage(
   });
 }
 
-/** A command of the main loop's that runs in the background, as a window chat's page shows it while it runs: its task's id and one short label. */
+/**
+ * What a window chat's page lists while it runs, by its id, with one short
+ * label: a command of the main loop's in the background, by its task's id,
+ * or a subagent the main loop started, in the foreground or the background.
+ */
 export interface WindowRunning {
   id: string;
   label: string;
+  kind: "command" | "subagent";
 }
 
 /**
- * The background commands of this window's main loop that still run, by
- * their task ids, in the order they went there: each Bash call whose result
- * names its background task (started there, or moved there by Ctrl+B or
- * from the page) until its task's notification comes, a call of the main
- * loop says it ended (`endedBy`), or a stop of the main loop no longer
- * counts it in flight (`endedAtStop`). Every post of the window chat says
- * them once they changed (`saysOfWindow`).
+ * What this window's main loop runs that its page lists, in the order each
+ * began. Each Bash call whose result names its background task (started
+ * there, or moved there by Ctrl+B or from the page), by that task's id. Each
+ * subagent an Agent call of the main loop starts (`agentOf`), from the call's
+ * `classic.PreToolUse`, by the call's id while the call runs (`agentCalls`):
+ * one run in the foreground leaves at the call's result, or at its turn's
+ * end; one launched in the background goes on by its agent's id
+ * (`launchedOf`), which its task's notification names. A background task
+ * leaves at its notification, at a call of the main loop that says it ended
+ * (`endedBy`), or at a stop of the main loop that no longer counts it in
+ * flight (`endedAtStop`). Every post of the window chat says them once they
+ * changed (`saysOfWindow`).
  */
-const backgroundRunning = new Map<string, WindowRunning>();
+const runningWork = new Map<string, WindowRunning>();
+
+/** The Agent calls of the main loop whose subagent `runningWork` holds by the call's id, until the call's result or its turn's end. */
+const agentCalls = new Set<string>();
+
+/**
+ * Lets go of the subagents still listed by their call's id: the main loop
+ * went on, or its turn ended, so each call came back or never will. One
+ * launched in the background was moved to its agent's id at its result.
+ */
+function endAgentCalls(): void {
+  for (const id of agentCalls) runningWork.delete(id);
+  agentCalls.clear();
+}
+
+/** A line's label: its first line, with no paths, cut as `taskLine` cuts one. */
+function runningLabel(named: string): string {
+  return withoutPaths(named.split("\n")[0]!).trim().slice(0, MAX_LABEL);
+}
+
+/** What names a subagent in its line, as Claude Code's notification of its end does: its call's description, else its type. */
+function agentLabel(input: unknown): string {
+  const args = (input ?? {}) as {
+    description?: unknown;
+    subagent_type?: unknown;
+  };
+  return runningLabel(
+    typeof args.description === "string" && args.description.trim() !== ""
+      ? args.description
+      : typeof args.subagent_type === "string"
+        ? args.subagent_type
+        : "",
+  );
+}
+
+/**
+ * The subagent an Agent call of the main loop starts, by the call's id, as
+ * it is about to run: shown the same way whether it runs in the foreground
+ * or the background, and whether or not it ever calls devcorner. Null for
+ * any other call.
+ */
+export function agentOf(
+  tool: unknown,
+  id: string,
+  input: unknown,
+): WindowRunning | null {
+  if (tool !== "Agent" || id === "") return null;
+  return { id, label: agentLabel(input), kind: "subagent" };
+}
+
+/**
+ * The subagent an Agent call's result says goes on in the background
+ * (`async_launched`), by its agent's id, which its task's notification and
+ * a stop's list of work in flight name; null for a call whose subagent ran
+ * in the foreground and has ended, and for any other call.
+ */
+export function launchedOf(
+  tool: unknown,
+  input: unknown,
+  response: unknown,
+): WindowRunning | null {
+  if (tool !== "Agent") return null;
+  const result = response as { status?: unknown; agentId?: unknown } | null;
+  if (
+    result === null ||
+    typeof result !== "object" ||
+    result.status !== "async_launched" ||
+    typeof result.agentId !== "string" ||
+    result.agentId === ""
+  )
+    return null;
+  return { id: result.agentId, label: agentLabel(input), kind: "subagent" };
+}
 
 /**
  * The background command a Bash call's result says it runs as, labelled as
@@ -8387,7 +8846,8 @@ export function runningOf(
         : "";
   return {
     id: result.backgroundTaskId,
-    label: withoutPaths(named.split("\n")[0]!).trim().slice(0, MAX_LABEL),
+    label: runningLabel(named),
+    kind: "command",
   };
 }
 
@@ -9278,12 +9738,22 @@ const takenAlone = new Set<string>();
  * The command from the page running in the window now, by the name the
  * window lists it by, and the line and key the turn its prompt begins takes
  * as the page's: the `prompt.submit` hook hands them over (`typedFromPage`)
- * as Claude Code submits that prompt. Null while none runs.
+ * as Claude Code submits that prompt. Null while none runs. For `/model`,
+ * whether its run is under way (`runs`), so its PreModelSwitch hook takes
+ * that switch alone and never one the person makes in the window meanwhile,
+ * the switch the hook held back to ask the page first (`switching`), and
+ * whether the person said yes there (`confirmed`).
  */
 let commandFromPage: {
   name: string;
   typed: TypedPageWords;
+  runs: boolean;
+  switching: ModelSwitch | null;
+  confirmed: boolean;
 } | null = null;
+
+/** The keys of the page's commands whose turn began before they ended, as they waited on their person (`beginAskTurn`): each ends as that turn, never posted whole. */
+const commandTurnsBegun = new Set<string>();
 
 /** What the page is told of words that begin with a slash but are no command devcorner marked. */
 const SLASH_WORDS =
@@ -9318,7 +9788,12 @@ async function runPageCommand($: Engine, words: PageWords): Promise<void> {
       : (reload?.end ?? (await runInWindow($, words.key, command, line)));
   // Its prompt was submitted: the turn it begins takes the line.
   if (end === null) return;
-  if (mirror !== null && mirror === from)
+  // One whose turn began as it waited on its person ends as that turn, and
+  // as nothing once the window's own turn ended it.
+  if (commandTurnsBegun.delete(words.key)) {
+    endHold($, `dialog-${words.key}`);
+    if (askTurn?.id === `page-command-${words.key}`) endAskTurn($, end);
+  } else if (mirror !== null && mirror === from)
     await mirrorPost($, { whole: commandTurn(mirror, words.key, line, end) });
   if (reload !== null && reload.run !== null) {
     // Only once devcorner heard the line: a new copy would find it waiting
@@ -9492,7 +9967,14 @@ async function runInWindow(
     prompt: "",
     since: await $.clock.now(),
   };
-  commandFromPage = { name: command.name, typed };
+  const running: NonNullable<typeof commandFromPage> = {
+    name: command.name,
+    typed,
+    runs: false,
+    switching: null,
+    confirmed: false,
+  };
+  commandFromPage = running;
   try {
     const found = pageCommandIn(
       command.name,
@@ -9503,36 +9985,204 @@ async function runInWindow(
         text: `Not run in the window: ${found.refused}.`,
         outcome: "failed",
       };
-    commandFromPage = { name: found.name, typed };
+    running.name = found.name;
     wokeAt = await $.clock.now();
     wakingFor = null;
-    let end: { text: string; outcome: "done" | "failed" };
-    try {
-      const ran = await $.command.run({
-        command: found.name,
-        ...(command.args === "" ? {} : { args: command.args }),
-      });
-      end = { text: commandOutcome(line, ran), outcome: "done" };
-      // The effort is known only from a model call (`turn.step`), so the one
-      // `/effort` set is what the chat's head is told now, with this post.
-      windowEffort = effortSet(found.name, command.args) ?? windowEffort;
-    } catch (error) {
-      // A skill's prompt the `prompt.submit` hook handed over as the page's
-      // line, then refused (a later hook blocked it), begins no turn to take
-      // it: left handed over, it would hold the page's words and take the
-      // next turn begun in the window for this line.
-      if (typedFromPage === typed) typedFromPage = null;
-      end = {
-        text: `Not run in the window: ${commandRefused(error)}.`,
-        outcome: "failed",
-      };
-    }
+    // Claude Code may ask its person to confirm a switch in the window, where
+    // no hook of the plugin's sees it: the page is told once it waits.
+    const dialog = CONFIRMED_BUILTINS.has(found.name)
+      ? $.clock.after(COMMAND_DIALOG_MS, () => dialogOnPage($, running, line))
+      : undefined;
+    let end = await runOnce($, running, command.args, line);
+    dialog?.cancel();
     if (typedFromPage === typed) return null;
     wokeAt = null;
+    if (running.switching !== null)
+      end = await switchOnPage($, key, line, running.switching, () => {
+        running.confirmed = true;
+        return runOnce($, running, command.args, line);
+      });
     return end;
   } finally {
     commandFromPage = null;
   }
+}
+
+/** What a command from the page came to, as its turn's end says it. */
+type CommandEnd = { text: string; outcome: "done" | "failed" };
+
+/**
+ * Runs a command from the page once, as `runInWindow` found it: what it came
+ * to, or why it did not run. A skill's prompt the `prompt.submit` hook handed
+ * over as the page's line, then refused (a later hook blocked it), begins no
+ * turn to take it: left handed over, it would hold the page's words and take
+ * the next turn begun in the window for this line.
+ */
+async function runOnce(
+  $: Engine,
+  running: NonNullable<typeof commandFromPage>,
+  args: string,
+  line: string,
+): Promise<CommandEnd> {
+  running.runs = true;
+  try {
+    const ran = await $.command.run({
+      command: running.name,
+      ...(args === "" ? {} : { args }),
+    });
+    // The effort is known only from a model call (`turn.step`), so the one
+    // `/effort` set is what the chat's head is told now, with this post.
+    windowEffort = effortSet(running.name, args) ?? windowEffort;
+    return { text: commandOutcome(line, ran), outcome: "done" };
+  } catch (error) {
+    if (typedFromPage === running.typed) typedFromPage = null;
+    return {
+      text: `Not run in the window: ${commandRefused(error)}.`,
+      outcome: "failed",
+    };
+  } finally {
+    running.runs = false;
+  }
+}
+
+// ---- A page command Claude Code asks to confirm ----
+//
+// `/model` and `/effort` switch what the window's next request runs on, and
+// with a prompt cache still warm Claude Code asks its person in the window
+// first, since the switch re-reads the whole conversation uncached
+// ("Switch model?", "Yes, switch to <model>" or "No, go back"). Sent from the
+// page, that dialog would wait in a window nobody watches. A model switch
+// raises Claude Code's PreModelSwitch hook before its dialog, whose answer
+// decides it: allow switches with no dialog, deny cancels. That hook times
+// out after 30 s, so it never waits on the page: it holds the switch back
+// (`commandFromPage.switching`) and the page is asked in the command's own
+// turn, with the window's two choices (`switchOnPage`), and a yes runs the
+// command again, which the hook then lets through. A switch with nothing
+// cached goes at once. Where no hook reaches the dialog (`/effort`'s, or a
+// Claude Code with no PreModelSwitch), a command still running after
+// `COMMAND_DIALOG_MS` is said on the page as waiting at the laptop
+// (`dialogOnPage`), never a silent wait.
+
+/** The built-ins of `PAGE_BUILTINS` Claude Code may ask its person to confirm in the window before they run. */
+const CONFIRMED_BUILTINS: ReadonlySet<string> = new Set(["model", "effort"]);
+/** How long a page's `/model` or `/effort` may run before the page is told the window waits on its person: either ends at once unless Claude Code asks to confirm it. */
+export const COMMAND_DIALOG_MS = 3_000;
+/** The page's answer to a switch held back that keeps the window's model, as Claude Code's dialog words it. */
+export const SWITCH_NO = "No, go back";
+
+/** A model switch the window's PreModelSwitch hook held back for its person's word on the page: from and to which model, and how many tokens of context it re-reads. */
+interface ModelSwitch {
+  from: string;
+  to: string;
+  tokens: number;
+}
+
+/**
+ * The switch a PreModelSwitch hook's input names, held back to ask the page,
+ * or null when the window would not ask: nothing cached to lose, or a model
+ * it does not name.
+ */
+function switchToAsk(input: unknown): ModelSwitch | null {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  if (raw.prompt_cache_warm !== true || typeof raw.to_model !== "string")
+    return null;
+  return {
+    from: typeof raw.from_model === "string" ? raw.from_model : "",
+    to: raw.to_model,
+    tokens:
+      typeof raw.context_tokens === "number" && raw.context_tokens > 0
+        ? Math.round(raw.context_tokens)
+        : 0,
+  };
+}
+
+/** The page's ask for a switch held back, in Claude Code's own words and with its two choices. */
+function switchAsk(sw: ModelSwitch): Ask {
+  const tokens =
+    sw.tokens > 0 ? ` (about ${sw.tokens.toLocaleString("en-US")} tokens)` : "";
+  return {
+    kind: "question",
+    questions: [
+      {
+        header: "Switch model?",
+        question: `This conversation is cached for the current model${sw.from === "" ? "" : `, ${sw.from}`}. Switching to ${sw.to} means the full history gets re-read${tokens}: your next response will be slower and use more tokens.`,
+        options: [
+          { label: `Yes, switch to ${sw.to}`, description: "" },
+          { label: SWITCH_NO, description: "" },
+        ],
+        multi: false,
+      },
+    ],
+  };
+}
+
+/**
+ * Asks the page about a switch the PreModelSwitch hook held back, in the
+ * command's own turn, and makes it on a yes (`again`); what it came to. No
+ * answer, as the page stopped it or the mirror ended, switches nothing.
+ */
+async function switchOnPage(
+  $: Engine,
+  key: string,
+  line: string,
+  sw: ModelSwitch,
+  again: () => Promise<CommandEnd>,
+): Promise<CommandEnd> {
+  const kept = `Not switched: the window stays on ${sw.from || "its model"}.`;
+  // Its turn may have begun already, for a dialog hold the hooks beneath
+  // were slow enough to raise (`dialogOnPage`): the ask takes its place.
+  const begun =
+    askTurn?.id === `page-command-${key}` && mirror?.turn === askTurn.id;
+  if (!begun && !(await beginAskTurn($, { key, line })))
+    return {
+      text: `Not run in the window: Claude Code asks there to confirm it, as the switch re-reads the whole conversation. Type ${line} in the window.`,
+      outcome: "failed",
+    };
+  endHold($, `dialog-${key}`);
+  const id = `switch-${key}`;
+  const page = openAsk($, id, switchAsk(sw), null);
+  void holdForPage($, id);
+  const answer = await page;
+  const chosen =
+    answer !== null && "answers" in answer ? answer.answers[0]?.[0] : undefined;
+  if (chosen === undefined) {
+    closeAsk($, id, "expired");
+    return { text: kept, outcome: "done" };
+  }
+  closeAsk($, id, { by: "page", said: chosen });
+  return chosen === SWITCH_NO ? { text: kept, outcome: "done" } : again();
+}
+
+/**
+ * Tells the page that a command of `CONFIRMED_BUILTINS` it sent still runs
+ * once `COMMAND_DIALOG_MS` passed, so Claude Code waits on its person in the
+ * window: a dialog hold in the command's own turn, which ends as the command
+ * does (`runPageCommand`). Only while that command still runs, checked with
+ * no wait before its turn begins, so a command that ended meanwhile, posted
+ * whole, begins none.
+ */
+async function dialogOnPage(
+  $: Engine,
+  running: NonNullable<typeof commandFromPage>,
+  line: string,
+): Promise<void> {
+  const key = running.typed.keys[0]!;
+  if (commandFromPage !== running || !(await beginAskTurn($, { key, line })))
+    return;
+  const held: HeldCall = {
+    id: `dialog-${key}`,
+    turn: mirror!.turn!,
+    hold: {
+      kind: "dialog",
+      tool: `/${running.name}`,
+      label: `Claude Code asks there to confirm ${line}, as the switch re-reads the whole conversation`,
+      background: false,
+    },
+    told: false,
+    timer: null,
+  };
+  holds.set(held.id, held);
+  tellHold($, held);
 }
 
 /**
@@ -9562,6 +10212,9 @@ async function mirrorOpened(
   const began = mirror === null;
   // Nothing of a chat the window mirrored before goes into this one.
   leaveMirror();
+  // Its held request hears for the window now, with the chat's state: the
+  // helper's socket would take its wakes past it (`listen`).
+  stopListening();
   mirror = {
     thread: body.chat.thread,
     background,
@@ -10730,6 +11383,27 @@ async function newerNodeBeside(
   return null;
 }
 
+/** The person's login shell, which finds the node a version manager puts on its PATH alone. */
+async function loginShellOf($: Engine): Promise<string> {
+  return (await $.env.get("SHELL")) || "/bin/sh";
+}
+
+/** The path of the node the person's login shell finds, or null when it finds none. */
+async function loginShellNode($: Engine): Promise<string | null> {
+  const where = await $.process.run(
+    [await loginShellOf($), "-ilc", "command -v node"],
+    { timeoutMs: 15_000 },
+  );
+  // An interactive shell may print its own lines first: the path is the
+  // last line that is one.
+  const path = where.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("/"))
+    .at(-1);
+  return where.exitCode !== 0 || path === undefined ? null : path;
+}
+
 /**
  * The Node the launcher runs on: the path kept, while it is there and runs
  * the local agent, else the one the person's login shell finds (nvm puts it
@@ -10748,18 +11422,9 @@ async function localNodeOf(
     keptNode = await nodeAt($, kept);
     if (nodeRunsLocalAgent(keptNode.version)) return keptNode;
   }
-  const shell = (await $.env.get("SHELL")) || "/bin/sh";
-  const where = await $.process.run([shell, "-ilc", "command -v node"], {
-    timeoutMs: 15_000,
-  });
-  // An interactive shell may print its own lines first: the path is the
-  // last line that is one.
-  const path = where.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("/"))
-    .at(-1);
-  if (where.exitCode !== 0 || path === undefined)
+  const shell = await loginShellOf($);
+  const path = await loginShellNode($);
+  if (path === null)
     return `Local subagents need Node ${LOCAL_AGENT_NODE.join(".")} or later, and your login shell (${shell}) finds no node.`;
   const found = path === keptNode?.path ? keptNode : await nodeAt($, path);
   const node = nodeRunsLocalAgent(found.version)
@@ -11664,11 +12329,8 @@ export const register: Register = (on) => {
     // A background command killed with no word to the main loop (from
     // Claude Code's tasks dialog) leaves the list here, so the turn's end
     // tells the page.
-    for (const id of endedAtStop(
-      backgroundRunning.keys(),
-      stop.background_tasks,
-    ))
-      backgroundRunning.delete(id);
+    for (const id of endedAtStop(runningWork.keys(), stop.background_tasks))
+      runningWork.delete(id);
     carryOnAtStop(ran, stop.last_assistant_message);
     return handedAtStop($, ran);
   });
@@ -11705,8 +12367,17 @@ export const register: Register = (on) => {
       e.tool_use_id !== undefined &&
       mainCalls.has(e.tool_use_id) &&
       ran.deny === undefined
-    )
-      beginHold($, e.tool_use_id, e.tool, callArguments(e));
+    ) {
+      const args = callArguments(e);
+      beginHold($, e.tool_use_id, e.tool, args);
+      // A subagent is listed from its start, told to the page at once.
+      const agent = agentOf(e.tool, e.tool_use_id, args);
+      if (agent !== null) {
+        runningWork.set(agent.id, agent);
+        agentCalls.add(agent.id);
+        mirrorSoon($);
+      }
+    }
     return ran;
   });
   on("classic.PostToolUse", async ($, e, next) => {
@@ -11714,10 +12385,15 @@ export const register: Register = (on) => {
       // What the call printed, kept before the turn that follows tells the page.
       keepOutput($, e, false);
       keepMoved(e.tool_response);
-      const running = runningOf(e.tool_name, e.tool_input, e.tool_response);
-      if (running !== null) backgroundRunning.set(running.id, running);
+      // A subagent's call has ended: one run in the foreground ended with
+      // it, and one launched in the background goes on by its agent's id.
+      if (agentCalls.delete(e.tool_use_id)) runningWork.delete(e.tool_use_id);
+      const running =
+        runningOf(e.tool_name, e.tool_input, e.tool_response) ??
+        launchedOf(e.tool_name, e.tool_input, e.tool_response);
+      if (running !== null) runningWork.set(running.id, running);
       const ended = endedBy(e.tool_name, e.tool_input, e.tool_response);
-      if (ended !== null) backgroundRunning.delete(ended);
+      if (ended !== null) runningWork.delete(ended);
       endHold($, e.tool_use_id);
     }
     return toastHandOvers($, await next(e));
@@ -11726,6 +12402,7 @@ export const register: Register = (on) => {
     if (e.agent_id === undefined) {
       // A call that failed came back with what it refused with.
       keepOutput($, e, true);
+      if (agentCalls.delete(e.tool_use_id)) runningWork.delete(e.tool_use_id);
       endHold($, e.tool_use_id);
     }
     return next(e);
@@ -11924,7 +12601,7 @@ export const register: Register = (on) => {
     // joins a turn under way or begins one; the window's next post tells
     // the page.
     if (e.origin?.kind === "task-notification")
-      for (const id of endedTasks(e.text)) backgroundRunning.delete(id);
+      for (const id of endedTasks(e.text)) runningWork.delete(id);
     noteSubmitted(submitted, {
       text: e.text,
       origin: e.origin ?? null,
@@ -11966,7 +12643,7 @@ export const register: Register = (on) => {
     if (page !== null) heldUntil(page.keys, await $.clock.now());
     // A background command's end begins a turn with its notification: it
     // runs no more, which this turn's beginning tells the page.
-    for (const id of endedTasks(e.text)) backgroundRunning.delete(id);
+    for (const id of endedTasks(e.text)) runningWork.delete(id);
     // The note of a move to the background, submitted alone, is the page's
     // doing, kept as the harness's line, never as the person's words.
     const carried = carryingOn;
@@ -12031,8 +12708,13 @@ export const register: Register = (on) => {
     // waited on was answered; and after a stop a stop hook carried on, that
     // the next part begins.
     if (mirror !== null) closeLooseAsks($, e.agentId ?? null);
-    // The main loop going on means its calls before ended: none holds it.
-    if (e.agentId === undefined) endHolds($);
+    // The main loop going on means its calls before ended: none holds it,
+    // and a subagent call of them that never came back (its permission
+    // denied) runs no more.
+    if (e.agentId === undefined) {
+      endHolds($);
+      endAgentCalls();
+    }
     const going = mirrored();
     if (going !== null) nextPart($, going);
     for await (const chunk of next(e)) {
@@ -12058,6 +12740,9 @@ export const register: Register = (on) => {
       return next(e);
     }
     stopFresh();
+    // A subagent call still listed by its own id never came back (the turn
+    // was stopped): it runs no more.
+    endAgentCalls();
     // Until its end is posted, this event alone types the page's words
     // (`endingTurn`).
     if (mirror?.turn === e.turnId) endingTurn = e.turnId;
@@ -12297,6 +12982,33 @@ export const register: Register = (on) => {
             behavior: "deny" as const,
             message: "The person denied it from devcorner's page.",
           },
+    };
+  });
+
+  // A model switch the page's `/model` makes, after any settings hook had its
+  // say: one Claude Code would confirm in the window, its cache still warm,
+  // is held back to ask the page first (`switchOnPage`), and goes with no
+  // dialog once the page said yes, or at once with nothing cached to lose.
+  // Any other switch, the person's own in the window, is left as it was.
+  on("classic.PreModelSwitch", async ($, e, next) => {
+    const settled = await next(e);
+    const running = commandFromPage;
+    if (
+      mirror === null ||
+      running?.name !== "model" ||
+      !running.runs ||
+      settled.permissionDecision !== undefined
+    )
+      return settled;
+    const switching = running.confirmed ? null : switchToAsk(e);
+    if (switching === null)
+      return { ...settled, permissionDecision: "allow" as const };
+    running.switching = switching;
+    return {
+      ...settled,
+      permissionDecision: "deny" as const,
+      permissionDecisionReason:
+        "asked on devcorner's page first, as the switch re-reads the whole conversation",
     };
   });
 

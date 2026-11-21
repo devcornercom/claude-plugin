@@ -75,6 +75,7 @@ import {
   noticeToast,
   pendingOf,
   readHeld,
+  readListenLine,
   withLight,
   LAUNCHER_NAME,
   LAUNCHER_PIN,
@@ -108,6 +109,8 @@ import {
   seenFor,
   turnWords,
   runningOf,
+  agentOf,
+  launchedOf,
   endedBy,
   endedAtStop,
   endedTasks,
@@ -131,6 +134,8 @@ import {
   CARRIED_ON_LINE,
   LAPTOP_CHAT_INSTRUCTION,
   ASK_LOOK_MS,
+  COMMAND_DIALOG_MS,
+  SWITCH_NO,
   BACKGROUND_ASK_HOLD_MS,
   BACKGROUND_ASK_LINE,
   BACKGROUND_LINE,
@@ -1264,6 +1269,12 @@ function world(
      * token it begins a sign-in itself. Unless told, it ran before.
      */
     firstRun?: boolean;
+    /**
+     * What `node --version` prints on Claude Code's PATH: with
+     * one, the window's helper is spawned (`seen.listens`) and prints the
+     * lines a test feeds it. Unless told, no node runs.
+     */
+    node?: string;
   } = {},
 ) {
   const beforeNow = options.beforeNow;
@@ -1387,6 +1398,16 @@ function world(
     pollBodies: [] as Record<string, unknown>[],
     /** The commands run, with what each was given on standard input. */
     runs: [] as { argv: readonly string[]; stdin?: string; cwd?: string }[],
+    /** Each helper spawned, as it was started. */
+    listens: [] as {
+      argv: readonly string[];
+      env?: Record<string, string>;
+      input?: string;
+    }[],
+    /** The lines each helper prints before it ends. */
+    listenLines: [] as unknown[],
+    /** Run as a helper starts, before its lines. */
+    onListen: null as (() => void) | null,
     /** What a `claude` command prints (`claude --bg`, `claude agents`, `claude stop`), as the laptop launcher runs it. */
     claudeRun: {
       exitCode: 0,
@@ -1690,8 +1711,32 @@ function world(
     );
     return { value: { status: 200, ok: true, headers: {}, text } };
   });
+  // The window's helper: it prints the lines the test queued,
+  // then ends, as one that lost its sockets for good does. A child kept
+  // running past them is not one the test kit's stream holds.
+  on("process.spawn", async function* (_$, e) {
+    seen.listens.push({
+      argv: e.argv,
+      env: e.env ? { ...e.env } : undefined,
+      input: e.input,
+    });
+    seen.onListen?.();
+    for (const line of seen.listenLines)
+      yield { stream: "stdout" as const, text: `${JSON.stringify(line)}\n` };
+    return { value: { code: 0, signal: null } } as never;
+  });
   on("process.run", async (_$, e) => {
     seen.runs.push({ argv: e.argv, stdin: e.init?.stdin, cwd: e.init?.cwd });
+    if (e.argv[1] === "--version" && options.node !== undefined)
+      return {
+        value: {
+          exitCode: 0,
+          stdout: `${options.node}\n`,
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
     if (e.argv[0] === "env" || e.argv[0] === "claude")
       return {
         value: {
@@ -2804,6 +2849,124 @@ describe("while devcorner is updating, after a deploy", () => {
 const flush = async (clock: { settle: () => Promise<void> }) => {
   for (let i = 0; i < 5; i++) await clock.settle();
 };
+
+describe("the window's own sockets", () => {
+  test("an idle window starts its helper, not a held request, and a frame it prints wakes by Status", async ($, on) => {
+    const { clock, seen } = world(on, { node: "v24.7.0", hold: true });
+    // The helper's socket is sent a wake as it connects, then it ends.
+    seen.onListen = () => {
+      seen.answer = waiting(1, "dc-m1");
+    };
+    seen.listenLines = [
+      { connected: 2 },
+      { frame: { wake: "dc-s7", id: "dc-m1" } },
+      { frame: { wake: "dc-s7", id: "dc-m1" } },
+    ];
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.listens).toHaveLength(1);
+    const [listen] = seen.listens;
+    // Started by its argv with no shell, the token on standard input alone.
+    expect(listen!.argv[0]).toBe("node");
+    expect(listen!.argv[1]).toMatch(/\/hooks\/listen\.mjs$/);
+    expect(listen!.env).toEqual({ DEVCORNER_TOKEN: "" });
+    expect(JSON.parse(listen!.input!)).toEqual({
+      base: "http://dc.test",
+      token: "dch_test",
+      conversation: "conversation-1",
+      cursors: [],
+      launcher: true,
+      revive: true,
+    });
+    // The wake went by a fresh Status, once for the message.
+    expect(seen.submitted).toEqual([WAKE()]);
+    // No held request was opened while the helper ran.
+    expect(seen.waitBodies).toHaveLength(0);
+  });
+
+  test("a stop frame the helper hears ends the idle window's session, as a held request's does", async ($, on) => {
+    const ran: string[] = [];
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    const { clock, seen } = world(on, { node: "v24.7.0", hold: true });
+    seen.listenLines = [{ connected: 1 }, { frame: { stop: "me-k3" } }];
+    await $.session.start(START);
+    await flush(clock);
+    expect(ran).toEqual(["exit"]);
+    expect(seen.toasts.at(-1)).toBe(
+      "dc: this chat is devcorner's now, so this window's session ends",
+    );
+  });
+
+  test("reads the helper's lines: its end, its sockets open or lost, and each frame as a held answer", () => {
+    expect(readListenLine('{"end":"refused"}')).toEqual({
+      kind: "end",
+      why: "refused",
+    });
+    expect(readListenLine('{"connected":2}')).toEqual({ kind: "connected" });
+    expect(readListenLine('{"down":"closed","retry":1000}')).toEqual({
+      kind: "down",
+    });
+    expect(readListenLine('{"frame":{"wake":"me-h1","id":"me-m7"}}')).toEqual({
+      kind: "frame",
+      held: { kind: "wake", session: "me-h1", id: "me-m7" },
+    });
+    expect(readListenLine('{"frame":{"launch":"7"}}')).toEqual({
+      kind: "frame",
+      held: { kind: "launch", launch: "7" },
+    });
+    expect(readListenLine("not json")).toBeNull();
+    expect(readListenLine("{}")).toBeNull();
+  });
+
+  test("a helper that ends hands the window to the held request, and Status says so once", async ($, on) => {
+    const { clock, seen } = world(on, { node: "v24.7.0", hold: true });
+    seen.listenLines = [{ connected: 2 }, { end: "refused" }];
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    expect(seen.statusBodies.filter((b) => b.delivery !== undefined)).toEqual([
+      expect.objectContaining({ delivery: "ended" }),
+    ]);
+    // No new helper until WAIT_RETRY_MS has passed; then the next hold
+    // round tries one again.
+    expect(seen.listens).toHaveLength(1);
+    await clock.advance(WAIT_RETRY_MS);
+    seen.held.shift()!("{}");
+    await flush(clock);
+    expect(seen.listens).toHaveLength(2);
+  });
+
+  test("with no node the held request goes on, and Status says why once", async ($, on) => {
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.listens).toHaveLength(0);
+    expect(seen.waitBodies).toHaveLength(1);
+    // Two wakes, each read by a Status: the first says why, the second not.
+    for (const id of ["dc-m1", "dc-m2"]) {
+      seen.answer = waiting(1, id);
+      seen.held.shift()!(JSON.stringify({ wake: "dc-s7", id }));
+      await flush(clock);
+      await $.turn.start({ text: "x", turnId: id });
+      await $.turn.complete(done(id));
+      await flush(clock);
+    }
+    expect(seen.statusBodies.filter((b) => b.delivery !== undefined)).toEqual([
+      expect.objectContaining({ delivery: "no-node" }),
+    ]);
+  });
+
+  test("a node older than 22 is no node for the helper", async ($, on) => {
+    const { clock, seen } = world(on, { node: "v20.11.0", hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.listens).toHaveLength(0);
+    expect(seen.waitBodies).toHaveLength(1);
+  });
+});
 
 describe("the held request", () => {
   const wake = (id: string) => JSON.stringify({ wake: "dc-s7", id });
@@ -8269,7 +8432,7 @@ describe("a window chat's mirror", () => {
         { command: "sleep 60", description: "Wait one minute" },
         { backgroundTaskId: "bq2x8f1" },
       ),
-    ).toEqual({ id: "bq2x8f1", label: "Wait one minute" });
+    ).toEqual({ id: "bq2x8f1", label: "Wait one minute", kind: "command" });
     // Moved there from the foreground, with no description: its command's
     // first line, with no paths.
     expect(
@@ -8278,7 +8441,7 @@ describe("a window chat's mirror", () => {
         { command: "tail -f /var/log/app.log\nmore" },
         { backgroundTaskId: "bg7", backgroundedByUser: true },
       ),
-    ).toEqual({ id: "bg7", label: "tail -f …" });
+    ).toEqual({ id: "bg7", label: "tail -f …", kind: "command" });
     expect(runningOf("Bash", { command: "ls" }, { stdout: "a" })).toBeNull();
     expect(
       runningOf("Read", { file_path: "a" }, { backgroundTaskId: "x" }),
@@ -10883,6 +11046,90 @@ describe("a window chat's mirror", () => {
     expect(parts(seen)).toHaveLength(1);
   });
 
+  test("a stop from devcorner names the chat alone on its held request", () => {
+    expect(readHeld('{"stop":"me-k3"}')).toEqual({
+      kind: "stop",
+      chat: "me-k3",
+    });
+    expect(readHeld('{"stop":3}')).toEqual({ kind: "empty" });
+  });
+
+  /** The window's own `/exit`, which its plugin ends a stopped session with; what it ran, in order. */
+  const ending = (on: On) => {
+    const ran: string[] = [];
+    on("command.run", async (_$, e) => {
+      ran.push(e.command);
+      return {};
+    });
+    return ran;
+  };
+
+  test("a stop from devcorner ends the session of a window that hears it at its post", async ($, on) => {
+    const ran = ending(on);
+    const { clock, seen, stored } = await mirrored($, on);
+    expect(stored.get("laptopChat:conversation-1")).toBe("me-k3");
+    seen.chatAnswers.push({
+      status: 409,
+      body: {
+        error:
+          "me-k3 was moved to devcorner by its person: its window stops mirroring it and its Claude Code session ends.",
+        code: "laptop-stopped",
+      },
+    });
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    // Its turn is aborted, the chat is forgotten, and the session ends.
+    expect(seen.aborted).toEqual(["t1"]);
+    expect(stored.has("laptopChat:conversation-1")).toBe(false);
+    expect(ran).toEqual(["exit"]);
+    expect(seen.toasts).toEqual([
+      expect.stringContaining("me-k3 was moved to devcorner"),
+      "dc: this chat is devcorner's now, so this window's session ends",
+    ]);
+    await $.turn.complete({ ...done("t1"), answer: "done" });
+    await $.turn.start({ text: "more", turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen)).toHaveLength(1);
+  });
+
+  test("a stop frame ends an idle window's session at once, with no turn to abort, and leaves the hold loop", async ($, on) => {
+    const ran = ending(on);
+    const { clock, seen } = await mirrored($, on, { hold: true });
+    expect(seen.waitBodies).toHaveLength(1);
+    seen.held.pop()!(JSON.stringify({ stop: "me-k3" }));
+    await flush(clock);
+    expect(ran).toEqual(["exit"]);
+    expect(seen.aborted).toEqual([]);
+    expect(seen.toasts).toEqual([
+      "dc: this window no longer mirrors its window chat. me-k3 moved to devcorner, so this window no longer mirrors it.",
+      "dc: this chat is devcorner's now, so this window's session ends",
+    ]);
+    // The loop left at the stop: no second held request, which the Hub would
+    // answer with the same stop again, and no second `/exit` or toast.
+    await clock.advance(5 * IDLE_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    expect(ran).toEqual(["exit"]);
+    expect(seen.toasts).toHaveLength(2);
+    await $.turn.start({ text: "more", turnId: "t2" });
+    await flush(clock);
+    expect(parts(seen)).toHaveLength(0);
+  });
+
+  test("a session Claude Code will not exit is said, with what to type", async ($, on) => {
+    on("command.run", async () => {
+      throw new Error("no command named /exit here");
+    });
+    const { clock, seen } = await mirrored($, on, { hold: true });
+    seen.held.pop()!(JSON.stringify({ stop: "me-k3" }));
+    await flush(clock);
+    // What Claude Code refused it with is said in its own words, and the
+    // command to type ends the line.
+    expect(seen.toasts.at(-1)).toMatch(
+      /^dc: could not end this session \(.+\): type \/exit to end it$/,
+    );
+  });
+
   test("a chat terminated from the page stops the turn it mirrored and the mirror, and the window posts nothing more", async ($, on) => {
     const { clock, seen, stored } = await mirrored($, on);
     await $.turn.start({ text: "work", turnId: "t1" });
@@ -11885,6 +12132,243 @@ describe("a window chat's mirror", () => {
     });
   });
 
+  /**
+   * A window whose `/model` raises the PreModelSwitch hook before it switches,
+   * as Claude Code does, from Opus with 120,000 tokens of context: the hook's
+   * allow switches with no dialog, its deny cancels the switch, and with
+   * neither the window's own dialog waits there, answered by nobody. Each
+   * decision the hook made, in order.
+   */
+  const modelWindow = (
+    $: Parameters<TestBody>[0],
+    on: On,
+    warm: boolean,
+  ): unknown[] => {
+    const decided: unknown[] = [];
+    on("command.list", async () => ({
+      value: [{ name: "model", description: "", source: "builtin" }],
+    }));
+    // No settings hook decides beneath.
+    on("classic.PreModelSwitch", async () => ({}));
+    on("command.run", async (_$, e) => {
+      const hook = (await $.classic.PreModelSwitch({
+        from_model: "claude-opus-4-8",
+        to_model: e.args,
+        requested_model: e.args,
+        source: "command",
+        context_tokens: 120_000,
+        prompt_cache_warm: warm,
+        cache_ttl: "1h",
+        estimated_cache_write_usd: 0.45,
+        pricing: "catalog",
+      } as never)) as { permissionDecision?: string };
+      decided.push(hook.permissionDecision);
+      if (hook.permissionDecision === "deny")
+        throw new Error("devcorner: $.command.run: model switch blocked");
+      if (hook.permissionDecision === "allow")
+        return { text: `Set model to ${e.args}` };
+      return new Promise<object>(() => undefined);
+    });
+    return decided;
+  };
+  const SONNET = "claude-sonnet-4-6";
+  const pageModel = command("c1", "model", SONNET);
+
+  test("a page /model Claude Code would confirm is asked on the page with the window's own choices, and a yes switches with no dialog", async ($, on) => {
+    const decided = modelWindow($, on, true);
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [pageModel] },
+    });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    // The hook held the switch back, so no dialog waits in the window: the
+    // page is asked in the command's own turn, as the person's line.
+    expect(decided).toEqual(["deny"]);
+    const said = () => parts(seen).filter((p) => p.turn === "page-command-c1");
+    expect(said()[0]).toMatchObject({
+      begin: { text: `/model ${SONNET}`, from: "page", took: ["c1"] },
+    });
+    expect(said()[0]?.end).toBeUndefined();
+    expect(asksTold(seen)).toEqual([
+      {
+        id: "switch-c1",
+        state: "open",
+        ask: {
+          kind: "question",
+          questions: [
+            {
+              header: "Switch model?",
+              question: `This conversation is cached for the current model, claude-opus-4-8. Switching to ${SONNET} means the full history gets re-read (about 120,000 tokens): your next response will be slower and use more tokens.`,
+              options: [
+                { label: `Yes, switch to ${SONNET}`, description: "" },
+                { label: SWITCH_NO, description: "" },
+              ],
+              multi: false,
+            },
+          ],
+        },
+      },
+    ]);
+    // While the page is asked, a switch the person makes in the window is
+    // Claude Code's to confirm, never held back for the page.
+    expect(
+      await $.classic.PreModelSwitch({
+        from_model: "claude-opus-4-8",
+        to_model: "claude-haiku-4-5",
+        prompt_cache_warm: true,
+      } as never),
+    ).not.toHaveProperty("permissionDecision");
+    // The page's yes runs it again, which the hook lets through.
+    seen.chatAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        answers: [
+          {
+            id: "switch-c1",
+            answer: { answers: [[`Yes, switch to ${SONNET}`]] },
+          },
+        ],
+      },
+    };
+    await clock.advance(ASK_LOOK_MS);
+    await flush(clock);
+    expect(decided).toEqual(["deny", "allow"]);
+    expect(asksTold(seen).at(-1)).toEqual({
+      id: "switch-c1",
+      state: "answered",
+      by: "page",
+      said: `Yes, switch to ${SONNET}`,
+    });
+    expect(said().at(-1)).toMatchObject({
+      end: { text: `Set model to ${SONNET}`, outcome: "done" },
+    });
+    expect(said().filter((p) => p.end !== undefined)).toHaveLength(1);
+  });
+
+  test("a no from the page keeps the window's model; a switch with nothing cached, and the window's own, ask nothing", async ($, on) => {
+    let warm = true;
+    const decided: unknown[] = [];
+    on("command.list", async () => ({
+      value: [{ name: "model", description: "", source: "builtin" }],
+    }));
+    on("classic.PreModelSwitch", async () => ({}));
+    on("command.run", async (_$, e) => {
+      const hook = (await $.classic.PreModelSwitch({
+        from_model: "claude-opus-4-8",
+        to_model: e.args,
+        context_tokens: 0,
+        prompt_cache_warm: warm,
+      } as never)) as { permissionDecision?: string };
+      decided.push(hook.permissionDecision);
+      if (hook.permissionDecision === "deny") throw new Error("blocked");
+      return { text: `Set model to ${e.args}` };
+    });
+    const { clock, seen } = await mirrored($, on);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [pageModel] },
+    });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    seen.chatAnswer = {
+      status: 200,
+      body: {
+        ok: true,
+        answers: [{ id: "switch-c1", answer: { answers: [[SWITCH_NO]] } }],
+      },
+    };
+    await clock.advance(ASK_LOOK_MS);
+    await flush(clock);
+    // Run once: the no keeps the model, said as the command's outcome.
+    expect(decided).toEqual(["deny"]);
+    expect(
+      parts(seen)
+        .filter((p) => p.turn === "page-command-c1")
+        .at(-1),
+    ).toMatchObject({
+      end: {
+        text: "Not switched: the window stays on claude-opus-4-8.",
+        outcome: "done",
+      },
+    });
+    // With nothing cached the switch goes at once, with no dialog and no ask.
+    warm = false;
+    seen.chatAnswer = { status: 200, body: { ok: true } };
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c2", "model", SONNET)] },
+    });
+    await $.turn.start({ text: "more", turnId: "t2" });
+    await flush(clock);
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    expect(decided).toEqual(["deny", "allow"]);
+    expect(asksTold(seen).some((a) => a.id === "switch-c2")).toBe(false);
+    expect(parts(seen).find((p) => p.turn === "page-command-c2")).toMatchObject(
+      { end: { text: `Set model to ${SONNET}`, outcome: "done" } },
+    );
+    // A switch the person makes in the window is Claude Code's to confirm.
+    warm = true;
+    expect(
+      await $.classic.PreModelSwitch({
+        from_model: "claude-opus-4-8",
+        to_model: SONNET,
+        prompt_cache_warm: true,
+      } as never),
+    ).not.toHaveProperty("permissionDecision");
+  });
+
+  test("a page /effort the window still runs after COMMAND_DIALOG_MS is said on the page as waiting at the laptop", async ($, on) => {
+    const window = commands(on);
+    const { clock, seen } = await mirrored($, on);
+    window.answers.effort = "held";
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    seen.chatAnswers.push({
+      status: 200,
+      body: { ok: true, words: [command("c1", "effort", "high")] },
+    });
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    await clock.advance(COMMAND_DIALOG_MS - 1);
+    await flush(clock);
+    expect(holdsTold(seen)).toEqual([]);
+    await clock.advance(1);
+    await flush(clock);
+    expect(holdsTold(seen)).toEqual([
+      {
+        id: "dialog-c1",
+        state: "held",
+        hold: {
+          kind: "dialog",
+          tool: "/effort",
+          label:
+            "Claude Code asks there to confirm /effort high, as the switch re-reads the whole conversation",
+          background: false,
+        },
+      },
+    ]);
+    // Its end, once answered in the window, ends the hold and the turn.
+    window.held.shift()!({ text: "Set effort level to high" });
+    await flush(clock);
+    expect(holdsTold(seen).at(-1)).toEqual({ id: "dialog-c1", state: "over" });
+    const said = parts(seen).filter((p) => p.turn === "page-command-c1");
+    expect(said[0]).toMatchObject({
+      begin: { text: "/effort high", from: "page", took: ["c1"] },
+    });
+    expect(said.at(-1)).toMatchObject({
+      end: { text: "Set effort level to high", outcome: "done" },
+    });
+    expect(said.filter((p) => p.end !== undefined)).toHaveLength(1);
+  });
+
   /** Every state of a hold the turn's posts told the page, in order. */
   const holdsTold = (seen: { chats: Record<string, unknown>[] }) =>
     parts(seen).flatMap((p) =>
@@ -12056,7 +12540,7 @@ describe("a window chat's mirror", () => {
     const said = posts(seen).filter((post) => "running" in post);
     expect(said.map((post) => post.running)).toEqual([
       [],
-      [{ id: "bg7", label: "pnpm dev" }],
+      [{ id: "bg7", label: "pnpm dev", kind: "command" }],
     ]);
     await $.turn.complete({ ...done("t2"), answer: "Added it." });
     await flush(clock);
@@ -12091,8 +12575,8 @@ describe("a window chat's mirror", () => {
         .filter((post) => "running" in post)
         .at(-1)?.running,
     ).toEqual([
-      { id: "bg1", label: "pnpm dev" },
-      { id: "bg2", label: "pnpm test --watch" },
+      { id: "bg1", label: "pnpm dev", kind: "command" },
+      { id: "bg2", label: "pnpm test --watch", kind: "command" },
     ]);
     // The first one's notification comes while the turn runs.
     await $.prompt.submit({
@@ -12156,8 +12640,168 @@ describe("a window chat's mirror", () => {
     await flush(clock);
     expect(parts(seen).at(-1)).toMatchObject({
       turn: "t1",
-      running: [{ id: "bg2", label: "pnpm test --watch" }],
+      running: [{ id: "bg2", label: "pnpm test --watch", kind: "command" }],
     });
+  });
+
+  test("a subagent the main loop starts is told by its call, labelled by its description else its type, and one in the background goes on by its agent's id", () => {
+    const args = {
+      description: "Check the date",
+      prompt: "Run date.",
+      subagent_type: "general-purpose",
+    };
+    expect(agentOf("Agent", "toolu_1", args)).toEqual({
+      id: "toolu_1",
+      label: "Check the date",
+      kind: "subagent",
+    });
+    expect(
+      agentOf("Agent", "toolu_1", { prompt: "x", subagent_type: "Explore" }),
+    ).toMatchObject({ label: "Explore" });
+    expect(agentOf("Bash", "toolu_1", { command: "date" })).toBeNull();
+    expect(
+      launchedOf("Agent", args, {
+        status: "async_launched",
+        agentId: "a9f3c2e1b0d4f5a6b",
+        description: "Check the date",
+      }),
+    ).toEqual({
+      id: "a9f3c2e1b0d4f5a6b",
+      label: "Check the date",
+      kind: "subagent",
+    });
+    // One that ran in the foreground has ended with its call.
+    expect(
+      launchedOf("Agent", args, { status: "completed", agentId: "a1" }),
+    ).toBeNull();
+    // Shown as its line alone, never as a hold too.
+    expect(holdOf("Agent", args)).toBeNull();
+  });
+
+  test("every subagent the main loop starts is on the page from its start to its end, in the foreground or the background, and never as a hold", async ($, on) => {
+    on("tool.call", () => new Promise(() => undefined) as never);
+    on("classic.PostToolUse", async () => ({}));
+    on("classic.Stop", async () => ({}));
+    const { clock, seen } = await mirrored($, on);
+    const running = () =>
+      parts(seen)
+        .filter((post) => "running" in post)
+        .at(-1)?.running;
+    await $.turn.start({ text: "check the date, and wait", turnId: "t1" });
+    await flush(clock);
+    const date = {
+      description: "Check the date",
+      prompt: "Run date.",
+      subagent_type: "general-purpose",
+    };
+    const wait = {
+      description: "Wait a minute",
+      prompt: "Sleep 55 s, then answer.",
+      subagent_type: "general-purpose",
+      run_in_background: true,
+    };
+    seen.chunks = [
+      { kind: "tool", index: 0, id: "toolu_1", name: "Agent" },
+      { kind: "input", index: 0, json: JSON.stringify(date) },
+      { kind: "tool", index: 1, id: "toolu_2", name: "Agent" },
+      { kind: "input", index: 1, json: JSON.stringify(wait) },
+      { kind: "stop", stopReason: "tool_use", usage: null },
+    ];
+    await stream($, { turnId: "t1" });
+    for (const [args, id] of [
+      [date, "toolu_1"],
+      [wait, "toolu_2"],
+    ] as const)
+      $.tool
+        .call({ tool: "Agent", ...args, tool_use_id: id } as never)
+        .catch(() => undefined);
+    await clock.advance(MIRROR_BATCH_MS);
+    await flush(clock);
+    // Both from their start, whatever they will call.
+    expect(running()).toEqual([
+      { id: "toolu_1", label: "Check the date", kind: "subagent" },
+      { id: "toolu_2", label: "Wait a minute", kind: "subagent" },
+    ]);
+    await clock.advance(HOLD_AFTER_MS);
+    await flush(clock);
+    expect(holdsTold(seen)).toEqual([]);
+    // The one in the background is launched, and the other returns.
+    await $.classic.PostToolUse({
+      tool_name: "Agent",
+      tool_input: wait,
+      tool_response: {
+        status: "async_launched",
+        agentId: "a9f3c2e1b0d4f5a6b",
+        description: "Wait a minute",
+      },
+      tool_use_id: "toolu_2",
+    });
+    await $.classic.PostToolUse({
+      tool_name: "Agent",
+      tool_input: date,
+      tool_response: { status: "completed", content: [] },
+      tool_use_id: "toolu_1",
+    });
+    await $.classic.Stop({
+      stop_hook_active: false,
+      background_tasks: [
+        {
+          id: "a9f3c2e1b0d4f5a6b",
+          type: "local_agent",
+          status: "running",
+          description: "Wait a minute",
+        },
+      ],
+    } as never);
+    await $.turn.complete({ ...done("t1"), answer: "Started." });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({
+      turn: "t1",
+      running: [
+        { id: "a9f3c2e1b0d4f5a6b", label: "Wait a minute", kind: "subagent" },
+      ],
+    });
+    // Its end's notification begins a turn: it runs no more.
+    await $.turn.start({
+      text: [
+        "<task-notification>",
+        "<task-id>a9f3c2e1b0d4f5a6b</task-id>",
+        "<status>completed</status>",
+        '<summary>Agent "Wait a minute" completed</summary>',
+        "</task-notification>",
+      ].join("\n"),
+      turnId: "t2",
+    });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ turn: "t2", running: [] });
+    // A call that never came back (its permission denied) runs no more once
+    // the main loop goes on, and one stopped with its turn once it ends.
+    const agentStep = async (id: string) => {
+      seen.chunks = [
+        { kind: "tool", index: 0, id, name: "Agent" },
+        { kind: "input", index: 0, json: JSON.stringify(date) },
+        { kind: "stop", stopReason: "tool_use", usage: null },
+      ];
+      await stream($, { turnId: "t2" });
+      $.tool
+        .call({ tool: "Agent", ...date, tool_use_id: id } as never)
+        .catch(() => undefined);
+      await clock.advance(MIRROR_BATCH_MS);
+      await flush(clock);
+      expect(running()).toEqual([
+        { id, label: "Check the date", kind: "subagent" },
+      ]);
+    };
+    await agentStep("toolu_3");
+    await agentStep("toolu_4");
+    await $.turn.complete({
+      ...done("t2"),
+      answer: "",
+      isAborted: true,
+      reason: "aborted",
+    });
+    await flush(clock);
+    expect(parts(seen).at(-1)).toMatchObject({ turn: "t2", running: [] });
   });
 
   test("with no words waiting, the note alone tells the model to carry on, kept on the page as the harness's line", async ($, on) => {
