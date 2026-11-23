@@ -26,6 +26,11 @@ import type {
   StatusWake,
 } from "../types";
 import { DEVCORNER_TOOL, SESSION_TOOL } from "./session-tools";
+import {
+  PAGE_FILE_SCRIPT,
+  PAGE_FILE_SECONDS,
+  pageFileProblem,
+} from "./page-file";
 
 const status = atom({ plugin: "devcorner", key: "status" } as const, null);
 const dismissed = atom({ plugin: "devcorner", key: "dismissed" } as const, []);
@@ -75,7 +80,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.89.0";
+export const PLUGIN_VERSION = "0.90.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -9191,9 +9196,11 @@ export function pageFilePath(
 
 /**
  * Fetches a file the page sent from devcorner (`ChatFile`, of the chat this
- * window holds) and keeps it where `pageFilePath` says, readable by its
- * owner alone and written whole: the line the typed words name it by, its
- * path, or why it was not fetched, so the words still go.
+ * window holds, its bytes themselves) and keeps it where `pageFilePath`
+ * says, readable by its owner alone and written whole, by curl, so no byte
+ * passes through this module (`PAGE_FILE_SCRIPT`): the line the typed words
+ * name it by, its path, or why it was not fetched (`pageFileProblem`), so
+ * the words still go.
  */
 async function fetchPageFile(
   $: Engine,
@@ -9203,37 +9210,42 @@ async function fetchPageFile(
   const missed = (why: string) => `- ${file.name} (not fetched: ${why})`;
   const held = await tokenOf($).catch(() => null);
   if (!held) return missed("this machine is not signed in to devcorner");
-  const path = pageFilePath(await stateEnvOf($), await $.session.id(), file);
+  const conversation = await $.session.id();
+  const path = pageFilePath(await stateEnvOf($), conversation, file);
   if (!path) return missed("no folder to keep it in");
+  const event = JSON.stringify({
+    hook_event_name: "ChatFile",
+    thread,
+    file: file.id,
+    raw: true,
+    generation: GENERATION,
+    session_id: conversation,
+  });
   try {
-    const res = await postEvent($, held.token, {
-      hook_event_name: "ChatFile",
-      thread,
-      file: file.id,
-      generation: GENERATION,
-    });
-    const body = JSON.parse(res.text) as { base64?: unknown; error?: unknown };
-    if (res.status !== 200 || typeof body.base64 !== "string")
-      return missed(
-        typeof body.error === "string"
-          ? body.error
-          : `devcorner answered ${res.status}`,
-      );
-    const wrote = await $.process.run(
+    const ran = await $.process.run(
       [
         "sh",
         "-c",
-        'umask 077 && mkdir -p "${1%/*}" && base64 --decode >"$1.new" && mv -f "$1.new" "$1"',
+        PAGE_FILE_SCRIPT,
         "sh",
         path,
+        `${await baseOf($)}/mcp/hooks/claude-code`,
+        event,
+        String(PAGE_FILE_SECONDS),
       ],
-      { stdin: body.base64, timeoutMs: 30_000 },
+      {
+        stdin: `Authorization: Bearer ${held.token}\ncontent-type: application/json\n`,
+        // curl gives up first, and says so.
+        timeoutMs: (PAGE_FILE_SECONDS + 15) * 1000,
+      },
     );
-    return wrote.exitCode === 0
-      ? `- ${path}`
-      : missed("it could not be written");
-  } catch {
-    return missed("devcorner could not be reached");
+    const problem = pageFileProblem(ran);
+    return problem === null ? `- ${path}` : missed(problem);
+  } catch (error) {
+    // The run itself was refused or cut ($.process is the CLI's alone).
+    return missed(
+      `it could not be fetched on this machine (${error instanceof Error ? error.message : String(error)})`,
+    );
   }
 }
 

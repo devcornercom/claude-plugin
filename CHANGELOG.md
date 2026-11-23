@@ -2,6 +2,11 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.90.0 — 2026-11-23
+
+- A large file sent with words from a window chat's page now reaches the laptop. The window fetches each file as its bytes themselves, which curl writes straight to the file, so a screen recording of several megabytes, up to devcorner's 10 MB attachment cap, lands and its path is named in the words typed in. Before, the file came as base64 inside JSON through Claude Code's plugin fetch, which could not hand over a few megabytes, and the words said "(not fetched: devcorner could not be reached)".
+- A file that still is not fetched says why: devcorner's own words when it refused it, that it timed out, that it could not be written, that curl is not installed, or that devcorner could not be reached, which now means only that the request never connected. The hook token goes to curl on its standard input, never in a command line.
+
 ## 0.89.0 — 2026-11-21
 
 - A window chat no longer goes offline after its window reloads the plugin. When an idle window takes its chat back after a reload, or opens one with `/dc chat`, it stops its background helper, since a chat's state goes on devcorner's held request, and now holds that request at once. Before, nothing listened for the window until its next turn: after two minutes its chat showed offline, the page's words did not reach it, and nothing woke it.

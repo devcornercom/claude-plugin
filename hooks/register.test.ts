@@ -189,6 +189,7 @@ import {
   whoText,
   PLUGIN_VERSION,
 } from "./register";
+import { PAGE_FILE_SCRIPT } from "./page-file";
 
 const base = {
   repo: "a/b",
@@ -1752,6 +1753,39 @@ function world(
           isStderrTruncated: false,
         },
       };
+    // The fetch of a file the page sent (PAGE_FILE_SCRIPT, which
+    // test/page-file.test.ts runs for real): its event is answered as any
+    // window chat event is, a 200's body written to the file, and anything
+    // else as the script says it.
+    if (e.argv[0] === "sh" && e.argv[2] === PAGE_FILE_SCRIPT) {
+      seen.chats.push(JSON.parse(e.argv[6]!) as Record<string, unknown>);
+      const next = seen.chatAnswers.shift() ?? seen.chatAnswer;
+      const answer =
+        next === "held"
+          ? await new Promise<{ status: number; body: unknown }>((resolve) =>
+              seen.heldChats.push(resolve),
+            )
+          : next;
+      const ran = (exitCode: number, stdout: string, stderr: string) => ({
+        value: {
+          exitCode,
+          stdout,
+          stderr,
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      });
+      if (answer === "down")
+        return ran(
+          7,
+          "",
+          "curl: (7) Failed to connect to dc.test port 80: Connection refused\n",
+        );
+      if (answer.status !== 200)
+        return ran(121, `${answer.status}\n${JSON.stringify(answer.body)}`, "");
+      seen.files.set(e.argv[4]!, String(answer.body));
+      return ran(0, "", "");
+    }
     // The hand-over to the hooks (a shell that writes standard input to its
     // file) and its removal, as the files they leave.
     if (e.argv[0] === "sh") seen.files.set(e.argv[4]!, e.init?.stdin ?? "");
@@ -9559,22 +9593,22 @@ describe("a window chat's mirror", () => {
         ],
       },
     };
-    seen.chatAnswers.push(
-      said,
-      {
-        status: 200,
-        body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-      },
-      said,
-    );
+    seen.chatAnswers.push(said, { status: 200, body: "PNG bytes" }, said);
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     expect(seen.submitted).toEqual([]);
+    // Its bytes themselves, which curl writes as they come, never through
+    // the plugin; the token on standard input, never in a command line.
     expect(seen.chats.at(-1)).toMatchObject({
       hook_event_name: "ChatFile",
       thread: "me-k3",
       file: "dc-k3-a1",
+      raw: true,
     });
+    const fetch = seen.runs.find((run) => run.argv[2] === PAGE_FILE_SCRIPT)!;
+    expect(fetch.argv[5]).toMatch(/\/mcp\/hooks\/claude-code$/);
+    expect(fetch.stdin).toMatch(/^Authorization: Bearer \S+\n/);
+    expect(fetch.argv.join(" ")).not.toContain("Bearer");
     await $.turn.complete(done("t1"));
     await flush(clock);
     const path =
@@ -9582,11 +9616,7 @@ describe("a window chat's mirror", () => {
     expect(
       seen.chats.filter((post) => post.hook_event_name === "ChatFile"),
     ).toHaveLength(1);
-    // Written whole, by its owner alone, from the bytes devcorner gave.
-    expect(seen.files.get(path)).toBe("iVBORw0=");
-    expect(seen.runs.find((run) => run.argv[0] === "sh")!.argv[2]).toContain(
-      "umask 077",
-    );
+    expect(seen.files.get(path)).toBe("PNG bytes");
     expect(seen.submitted).toEqual([
       `> The cart drops items.\n\nFix that\n\nFiles sent from devcorner:\n- ${path}`,
     ]);
@@ -9599,6 +9629,43 @@ describe("a window chat's mirror", () => {
     expect(
       pageFilePath({ home: "/Users/ann" }, "../c", { id: "../x", name: "a/b" }),
     ).toBe("/Users/ann/.cache/devcorner/laptop-files/__c/__x-a_b");
+  });
+
+  test("a file not fetched says why, in devcorner's words or curl's, and the words still go", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { home: "/Users/ann" });
+    const file = (id: string, name: string) => ({
+      id,
+      name,
+      type: "application/octet-stream",
+      size: 7_000_000,
+    });
+    const said = {
+      status: 200,
+      body: {
+        ok: true,
+        words: [
+          {
+            key: "w1",
+            text: "Fix that",
+            files: [file("dc-k3-a1", "a.png"), file("dc-k3-a2", "b.mov")],
+          },
+        ],
+      },
+    };
+    const refused = "dc-k3-a1 is not a file of this chat.";
+    seen.chatAnswers.push(
+      said,
+      { status: 409, body: { error: refused } },
+      "down",
+      said,
+    );
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.submitted).toEqual([
+      `Fix that\n\nFiles sent from devcorner:\n- a.png (not fetched: ${refused})\n- b.mov (not fetched: devcorner could not be reached (Failed to connect to dc.test port 80: Connection refused))`,
+    ]);
   });
 
   test("words whose files are being fetched as mirroring stops are never typed in", async ($, on) => {
@@ -9623,10 +9690,7 @@ describe("a window chat's mirror", () => {
     expect(seen.chats.at(-1)).toMatchObject({ hook_event_name: "ChatFile" });
     await $.command.run({ command: "dc", args: "chat off" } as never);
     await flush(clock);
-    seen.heldChats.shift()!({
-      status: 200,
-      body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-    });
+    seen.heldChats.shift()!({ status: 200, body: "PNG bytes" });
     await flush(clock);
     expect(seen.submitted).toEqual([]);
   });
@@ -9666,10 +9730,7 @@ describe("a window chat's mirror", () => {
     await $.turn.complete(done("t2"));
     await flush(clock);
     expect(seen.submitted).toEqual([]);
-    seen.heldChats.shift()!({
-      status: 200,
-      body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-    });
+    seen.heldChats.shift()!({ status: 200, body: "PNG bytes" });
     await flush(clock);
     expect(seen.submitted).toEqual(["and the docs"]);
   });
@@ -10065,14 +10126,7 @@ describe("a window chat's mirror", () => {
         ],
       },
     };
-    seen.chatAnswers.push(
-      said,
-      {
-        status: 200,
-        body: { ok: true, name: shot.name, base64: "iVBORw0=" },
-      },
-      said,
-    );
+    seen.chatAnswers.push(said, { status: 200, body: "PNG bytes" }, said);
     await $.turn.start({ text: "work", turnId: "t1" });
     await flush(clock);
     await $.turn.complete(done("t1"));
