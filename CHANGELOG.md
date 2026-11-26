@@ -2,6 +2,19 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.91.0 — 2026-11-26
+
+- A window chat's page words reach its window at the next status poll when no held request is open. After three holds in a row that failed or answered at once, the window polls with pauses of a minute, two, four, up to five; a message said from the page meanwhile waited until a hold happened to reopen. A status now names the chat whose page words wait and the mark's stamp (`waitingChat`, `waitingChatAt`), read beside the cached status so a poll costs it nothing while nothing waits; the window opens its held request at once once for each stamp, and a mark that stays, as a word it cannot take, falls back to the ordinary backoff rather than spinning a hold at every poll.
+- A chat frame is never dropped when a window falls back to the poll: its look goes too, so the words it tells of are fetched. The hold backoff clears at a turn's start and after a post that went. A hold that throws says why in the transcript and arms the poll again, rather than leaving the window with neither a hold nor a poll.
+
+## 0.90.2 — 2026-11-24
+
+- A session a launch started ends by itself when devcorner refuses its join, so "Continue on my laptop" pressed while the window was still there no longer leaves a stray background session running. `/dc chat --launch <n>` and `/dc continue <id> --launch <n>` post their opening, and when devcorner answers with a refusal (a 4xx) the plugin says so and ends the session with Claude Code's own `/exit`. An answer it could not give, such as an updating or unreachable devcorner, or a server error, leaves the session up, since it may still join; so does a 408 or 429, which may pass. This is a patch on 0.90.1 and stays below 0.92.0, the first version whose windows run shell lines.
+
+## 0.90.1 — 2026-11-24
+
+- A window whose devcorner session has ended no longer asks devcorner again every 25 seconds for the rest of its life. When the held request's answer says the session it works as is not live, the plugin says once in the transcript why delivery for it stopped and leaves that session out of its next holds, while it still holds the conversation, so mail to the conversation still wakes it. Its next turn or session tries the session again. A window whose plugin does not read that answer keeps the held request as before, so the conversation is held every 25 seconds. This is a patch on 0.90.0, below 0.92.0, the first version whose windows run shell lines.
+
 ## 0.90.0 — 2026-11-23
 
 - A large file sent with words from a window chat's page now reaches the laptop. The window fetches each file as its bytes themselves, which curl writes straight to the file, so a screen recording of several megabytes, up to devcorner's 10 MB attachment cap, lands and its path is named in the words typed in. Before, the file came as base64 inside JSON through Claude Code's plugin fetch, which could not hand over a few megabytes, and the words said "(not fetched: devcorner could not be reached)".

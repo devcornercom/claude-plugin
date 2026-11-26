@@ -6,6 +6,20 @@ export type Status = {
   projects: number;
   session: StatusSession | null;
   /**
+   * The window chat whose page's words wait for this window's next post, by
+   * its id as the person's page shows it: a poll names it, so an
+   * idle window opens its held request at once rather than at its next
+   * backoff tick. Null when none waits, and absent from an older devcorner.
+   */
+  waitingChat?: string | null;
+  /**
+   * That chat's mark (`chat_laptops.words_at`), which tells one waiting mark
+   * from the next: the plugin opens its hold at once once for each stamp and
+   * falls back to its ordinary backoff for a mark answered again. Null when
+   * none waits, and absent from an older devcorner.
+   */
+  waitingChatAt?: number | null;
+  /**
    * The conversation, when it works as no live session (dc-t312): the mail
    * that waits for it, and what of it wakes it. Null with a session, whose
    * counts hold it, and absent from an older devcorner.
@@ -159,6 +173,9 @@ export type StatusLight = {
   repo: string;
   /** The session the conversation works as, as a full Status gives it. */
   session: StatusSession | null;
+  /** The window chat whose page's words wait, and its mark's stamp, as a full Status names them. */
+  waitingChat?: string | null;
+  waitingChatAt?: number | null;
   /** The conversation, when it works as no live session (dc-t312). */
   conversation?: StatusConversation | null;
   /** When this window's person asked it to reload its plugin (dc-t588). */

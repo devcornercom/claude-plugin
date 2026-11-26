@@ -80,7 +80,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.90.0";
+export const PLUGIN_VERSION = "0.91.0";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -1819,6 +1819,9 @@ export function nextStep(
  * or a failure that hands the conversation to the Status poll: no answer, a
  * refusal, an answer not understood, or a conversation devcorner does not
  * know. Or that devcorner is updating, and asks to be left alone `after` ms.
+ * Or that the session the conversation works as is not live any more
+ * (`notLive`), so nothing would wake it: the window leaves it out of its
+ * holds until its next turn or session.
  */
 export type Held =
   | { kind: "wake"; session: string; id: string }
@@ -1828,6 +1831,7 @@ export type Held =
   | { kind: "launch"; launch: string }
   | { kind: "reload" }
   | { kind: "stop"; chat: string }
+  | { kind: "not-live"; session: string }
   | { kind: "empty" }
   | { kind: "failed" }
   | { kind: "updating"; after: number };
@@ -1840,6 +1844,11 @@ export function readHeld(text: string): Held {
     }
     const o = v as Record<string, unknown>;
     if ("session" in o && o.session === null) return { kind: "failed" };
+    // The session this conversation works as has ended: no hold would ever
+    // wake it, so the window leaves it out of its holds until its next turn
+    // or session.
+    if (typeof o.notLive === "string")
+      return { kind: "not-live", session: o.notLive };
     if (typeof o.wake === "string" && typeof o.id === "string") {
       return { kind: "wake", session: o.wake, id: o.id };
     }
@@ -1901,6 +1910,8 @@ export function withLight(
     ...before,
     repo: light.repo,
     session: light.session,
+    waitingChat: light.waitingChat ?? null,
+    waitingChatAt: light.waitingChatAt ?? null,
     conversation: light.conversation ?? null,
     ...(light.reload !== undefined ? { reload: light.reload } : {}),
   };
@@ -4484,6 +4495,10 @@ async function fetchStatus(
     // Why the window holds no socket of its own, said once, so devcorner
     // counts how often a window falls back to the held request.
     const telling = listenFellBack;
+    // Only an idle window that mirrors a chat can use the waiting chat, so
+    // only it asks devcorner to read the mark: a Status without this makes no
+    // such read at all (a turn's keepFresh, /dc, every older plugin).
+    const idleMirror = mirror !== null && (await read($, turn)) === null;
     const res = await $.http.fetch(`${base}/mcp/hooks/claude-code`, {
       method: "POST",
       headers: {
@@ -4503,6 +4518,7 @@ async function fetchStatus(
         ...(asks.picture ? { expanded: true } : {}),
         ...(asks.now ? { now: true } : {}),
         ...(asks.others ? { others: true } : {}),
+        ...(idleMirror ? { waitingChat: true } : {}),
         ...(light ? { light: true } : {}),
         ...(telling !== null ? { delivery: telling } : {}),
       }),
@@ -4663,6 +4679,21 @@ let quick = 0;
 let holdFailures = 0;
 /** The earliest time a held request may be tried again. */
 let holdAfter = 0;
+/**
+ * The waiting mark the poll opened a hold for at once (`chat:at`, the status's
+ * `waitingChatAt`): only a mark not seen before opens one, so a mark that
+ * stays, as a word the window cannot take, falls back to the ordinary
+ * backoff rather than spinning a hold at every poll.
+ */
+let cuedMark: string | null = null;
+/**
+ * The session a held request said is not live, which its next holds leave out
+ * (`aside`) while the conversation alone is held. Null when none was refused;
+ * a turn or a new session tries it again.
+ */
+let sessionAside: string | null = null;
+/** The ended sessions whose stop was said in the transcript already, once each in a load. */
+const holdTold = new Set<string>();
 /** The earliest time devcorner may be asked again after a failure. */
 let askAfter = 0;
 /**
@@ -4723,6 +4754,21 @@ const LISTEN_NODE_KEY = "listenNode";
 const settling = (now: number) =>
   wokeAt !== null && now - wokeAt < WAKE_SETTLE_MS;
 
+/**
+ * A held request said the session this conversation works as is not live:
+ * its next holds leave it out (`sessionAside`) and hold the conversation
+ * alone, whose mail still wakes the window, and the transcript says so once
+ * for it. A turn or a session puts it back.
+ */
+function asideEndedSession($: Engine, session: string): void {
+  sessionAside = session;
+  if (holdTold.has(session)) return;
+  holdTold.add(session);
+  $.ui.log(
+    `devcorner: delivery for ${session} stopped: that session has ended. This window hears its conversation until you send a message or start a new session.`,
+  );
+}
+
 /** A new or ended session starts clean: nothing of the last one carries over. */
 function forgetSession(): void {
   stopListening();
@@ -4731,6 +4777,9 @@ function forgetSession(): void {
   quick = 0;
   holdFailures = 0;
   holdAfter = 0;
+  cuedMark = null;
+  sessionAside = null;
+  holdTold.clear();
   askAfter = 0;
   failures = 0;
   wokeAt = null;
@@ -4775,6 +4824,13 @@ async function waitOnce($: Engine): Promise<Held> {
         // The window chat it mirrors, which only this copy keeps online, and
         // the turn it still owes devcorner.
         ...(said !== null ? { mirror: said } : {}),
+        // This plugin reads the answer that says the session it works as is
+        // not live (`{notLive}`), and leaves that session out of its next
+        // holds (`aside`).
+        readsNotLive: true,
+        // The session devcorner said is not live, left out of the hold while
+        // the conversation alone is held (`sessionAside`).
+        ...(sessionAside !== null ? { aside: sessionAside } : {}),
         ...(from ? { cursor: from } : {}),
         // The newest woken for in each store (dc-t312): the held request
         // holds on two, each of which reads only its own ids.
@@ -4819,6 +4875,20 @@ async function hold($: Engine): Promise<void> {
           held.kind !== "failed" && held.kind !== "updating",
         );
       if (mine !== epoch) return;
+      // The session the conversation works as ended: nothing would ever wake
+      // it, so its next holds leave it out (`aside`) and hold the
+      // conversation alone, whose mail still wakes the window. A turn or a
+      // session tries it again. Said once for each session, and counted as a
+      // quick answer, so one that keeps coming despite the aside falls to the
+      // poll below rather than looping.
+      if (held.kind === "not-live") {
+        asideEndedSession($, held.session);
+        quick = quickly ? quick + 1 : 0;
+        if (quick < QUICK_MAX) {
+          holdAfter = now;
+          continue;
+        }
+      }
       // A failed hold that ran its whole length was cut on the way (the
       // client's fetch or a proxy between) after devcorner held it, not
       // devcorner failing: held again at once, as an empty answer is. One that
@@ -4853,14 +4923,16 @@ async function hold($: Engine): Promise<void> {
         if (mine !== epoch) return;
         continue;
       }
-      if (held.kind === "chat" && quick < QUICK_MAX) {
+      if (held.kind === "chat") {
         // The person's words from devcorner's page wait for this window's
         // window chat: fetched and typed in as theirs while the window is
-        // idle, the look's post ending devcorner's frames for them. Held
-        // again at once.
+        // idle, the look's post ending devcorner's frames for them. The look
+        // goes even on the frame that hands the window to the poll below: a
+        // frame is never dropped, or its words wait for the hold to happen
+        // to reopen.
         await mirrorPost($, { look: true });
         if (mine !== epoch) return;
-        continue;
+        if (quick < QUICK_MAX) continue;
       }
       const wokeFor = held.kind === "wake" ? await read($, woke) : null;
       if (mine !== epoch) return;
@@ -4908,8 +4980,21 @@ async function hold($: Engine): Promise<void> {
       }
       return;
     }
-  } catch {
-    /* stay silent */
+  } catch (error) {
+    // A hold that throws leaves the window with neither a hold nor a poll
+    // unless one is armed here: say why in the transcript, and ask again as
+    // the poll does.
+    const why = error instanceof Error ? error.message : String(error);
+    $.ui.log(
+      `devcorner: the held request failed: ${why}. This window polls devcorner again.`,
+    );
+    try {
+      const ms = await pollMs($);
+      if (mine === epoch) askIn($, ms, true);
+    } catch {
+      // The read that says how long to wait failed too: the idle poll's own.
+      if (mine === epoch) askIn($, IDLE_MS, true);
+    }
   }
 }
 
@@ -5361,6 +5446,30 @@ async function ask($: Engine, given?: Read, light = false): Promise<void> {
     askAfter = 0;
     const step = nextStep(s, await read($, woke));
     if (step === null) return;
+    const now = await $.clock.now();
+    // A status that says a page message waits for this window's chat opens
+    // the held request at once, once for each mark: the mark's stamp tells a
+    // new word from the same one answered again, which falls back to the
+    // ordinary backoff below rather than spinning a hold at every poll. The
+    // hold is what says the chat, and its frame fetches the words.
+    const cue =
+      s.waitingChat && typeof s.waitingChatAt === "number"
+        ? `${s.waitingChat}:${s.waitingChatAt}`
+        : null;
+    if (cue === null) cuedMark = null;
+    if (
+      "after" in step &&
+      mirror !== null &&
+      cue !== null &&
+      cue !== cuedMark &&
+      !settling(now)
+    ) {
+      cuedMark = cue;
+      holdAfter = 0;
+      quick = 0;
+      void hold($);
+      return;
+    }
     if ("after" in step) {
       await carryOn($, step.after);
       return;
@@ -5369,7 +5478,6 @@ async function ask($: Engine, given?: Read, light = false): Promise<void> {
     // prompt hook hands over whatever waits then, this message too, so no
     // second wake goes before it (dc-t204). Asked again in a while, or at
     // the turn's end.
-    const now = await $.clock.now();
     if (settling(now)) {
       askIn($, WAITING_MS);
       return;
@@ -7539,6 +7647,13 @@ async function sendMirror(
 ): Promise<boolean> {
   const went = await postMirror($, m, payload);
   if (mirror === m) await mirrorReached($, went);
+  // A post that went shows devcorner takes this window's posts: the holds
+  // that failed or answered at once before it are over, as a hold that ran
+  // its length shows.
+  if (went) {
+    holdFailures = 0;
+    holdAfter = 0;
+  }
   return went;
 }
 
@@ -8378,6 +8493,10 @@ async function holdWhile(
     // Whatever ended the hold, the look takes any answer the page gave.
     await mirrorPost($, {});
     quickly = fast ? quickly + 1 : 0;
+    if (held.kind === "not-live") {
+      asideEndedSession($, held.session);
+      if (quickly < QUICK_MAX) continue;
+    }
     if (
       held.kind === "failed" ||
       held.kind === "updating" ||
@@ -10909,6 +11028,14 @@ export function launchArg(words: string): {
   };
 }
 
+/**
+ * Whether devcorner refused a launch's join: a 4xx other than 408 and 429,
+ * which say to ask again rather than that the join is over.
+ */
+function refusedJoin(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
 /** /dc chat [title] and /dc chat off. */
 async function chatHere($: Engine, words: string): Promise<string> {
   // A session a launch started names it, and the chat it begins joins it.
@@ -10962,6 +11089,17 @@ async function chatHere($: Engine, words: string): Promise<string> {
     commands,
     await background,
   );
+  // A session a launch started exists only to join its chat. Once devcorner
+  // refused that join it would run on unseen, so it ends itself. A 5xx, an
+  // updating devcorner or no answer leaves it up: it may still join, or its
+  // card gives the command that stops it. A 408 or 429 may pass, so it is
+  // worth asking again.
+  if (launch !== null && refusedJoin(posted.status)) {
+    $.ui.toast(
+      "dc: devcorner refused this session's join to its chat, so it ends",
+    );
+    endSession($);
+  }
   return launch === null ? withRename(said, posted) : said;
 }
 
@@ -11025,6 +11163,17 @@ async function continueHere($: Engine, words: string): Promise<string> {
     commands,
     await background,
   );
+  // A session a launch started exists only to join its chat. Once devcorner
+  // refused that join it would run on unseen, so it ends itself. A 5xx, an
+  // updating devcorner or no answer leaves it up: it may still join, or its
+  // card gives the command that stops it. A 408 or 429 may pass, so it is
+  // worth asking again.
+  if (launch !== null && refusedJoin(posted.status)) {
+    $.ui.toast(
+      `dc: devcorner refused this session's join to ${thread}, so it ends`,
+    );
+    endSession($);
+  }
   await briefWindow($, posted.body);
   return launch === null ? withRename(said, posted) : said;
 }
@@ -12682,6 +12831,15 @@ export const register: Register = (on) => {
     // call's, and its run is a part of the turn under way.
     if (e.agentId !== undefined) return next(e);
     stopAsking();
+    // A turn begins the holds again: its session may be tied to a live one,
+    // and its start is a fresh attempt after a window chat's hold failed or
+    // answered at once in a row. Only that backoff: a held request left to
+    // rest after it answered at once is not reopened by a turn's end.
+    sessionAside = null;
+    if (mirror !== null) {
+      holdFailures = 0;
+      holdAfter = 0;
+    }
     // A wake's turn has begun: its prompt hook hands over what waits.
     wokeAt = null;
     const woke = wakeBy(wakingFor);

@@ -1709,6 +1709,8 @@ function world(
             session: answer.session,
             conversation: answer.conversation,
             reload: answer.reload,
+            waitingChat: answer.waitingChat ?? null,
+            waitingChatAt: answer.waitingChatAt ?? null,
           }
         : typeof sent.branch === "string" && seen.takesBranch
           ? { ...answer, branch: sent.branch }
@@ -3065,6 +3067,7 @@ describe("the held request", () => {
         timeout: HOLD_MS,
         launcher: true,
         revive: true,
+        readsNotLive: true,
       },
     ]);
     const atStart = seen.asks;
@@ -3306,6 +3309,62 @@ describe("the held request", () => {
     await clock.advance(DOWN_MS);
     expect(seen.asks).toBe(asks + 1);
     expect(seen.waitBodies).toHaveLength(1);
+  });
+
+  test("a session its store says is not live is left out of the holds, once said, until a turn or a session", async ($, on) => {
+    expect(readHeld('{"notLive":"dc-s7"}')).toEqual({
+      kind: "not-live",
+      session: "dc-s7",
+    });
+    expect(readHeld('{"notLive":7}')).toEqual({ kind: "empty" });
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(1);
+    expect(seen.waitBodies[0]!.readsNotLive).toBe(true);
+    expect(seen.waitBodies[0]!.aside).toBeUndefined();
+    const said = seen.logs.length;
+    seen.held.shift()!('{"notLive":"dc-s7"}');
+    await flush(clock);
+    // One line in the transcript, naming the session, and no more.
+    expect(seen.logs.slice(said)).toEqual([expect.stringContaining("dc-s7")]);
+    expect(seen.logs.at(-1)).toMatch(/delivery for dc-s7 stopped/);
+    // The conversation is held still, and the session is left out of every
+    // hold after it: the conversation's own mail wakes the window.
+    expect(seen.waitBodies).toHaveLength(2);
+    expect(seen.waitBodies[1]).toMatchObject({ aside: "dc-s7" });
+    seen.held.at(-1)!("{}");
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(3);
+    expect(
+      seen.waitBodies.slice(1).every((body) => body.aside === "dc-s7"),
+    ).toBe(true);
+    expect(seen.logs).toHaveLength(said + 1);
+    // A turn tries the session again, and says nothing more of the stop.
+    await $.turn.start({ text: "again", turnId: "t1" });
+    seen.answer = waiting(0, null);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    expect(seen.waitBodies.at(-1)!.aside).toBeUndefined();
+    expect(seen.logs).toHaveLength(said + 1);
+  });
+
+  test("a Worker that keeps saying a session is not live is not asked again at once", async ($, on) => {
+    const { clock, seen } = world(on, { hold: true });
+    await $.session.start(START);
+    await flush(clock);
+    // The aside does not stop it (an id form that does not match, say): the
+    // answer counts as a quick one, so after QUICK_MAX the poll and its
+    // back-off have the window, and the line is still said once.
+    for (let i = 0; i < QUICK_MAX; i++) {
+      seen.held.at(-1)!('{"notLive":"dc-s7"}');
+      await flush(clock);
+    }
+    const held = seen.waitBodies.length;
+    await clock.advance(WAIT_RETRY_MS - 1);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(held);
+    expect(seen.logs.filter((line) => line.includes("dc-s7"))).toHaveLength(1);
   });
 });
 
@@ -10155,8 +10214,12 @@ describe("a window chat's mirror", () => {
   });
 
   /** A window that mirrors a chat, idle after a turn, holding its request. */
-  const holding = async ($: Parameters<TestBody>[0], on: On) => {
-    const w = world(on, { hold: true });
+  const holding = async (
+    $: Parameters<TestBody>[0],
+    on: On,
+    options: { beforeNow?: () => Promise<void> | undefined } = {},
+  ) => {
+    const w = world(on, { hold: true, ...options });
     w.seen.answer = {
       ...base,
       session: null,
@@ -10220,12 +10283,183 @@ describe("a window chat's mirror", () => {
       expect(seen.waitBodies).toHaveLength(waits + i);
     }
     await frame();
-    expect(seen.chats).toHaveLength(looks + QUICK_MAX - 1);
+    // The frame is never dropped: its look goes even on the one that hands
+    // the window to the poll, which only the hold waits for.
+    expect(seen.chats).toHaveLength(looks + QUICK_MAX);
     expect(seen.waitBodies).toHaveLength(waits + QUICK_MAX - 1);
     // The poll's next ask holds again.
     await clock.advance(DOWN_MS);
     await flush(clock);
     expect(seen.waitBodies).toHaveLength(waits + QUICK_MAX);
+  });
+
+  test("a poll whose answer says a page message waits opens the hold at once, not at the next backoff tick", async ($, on) => {
+    const { clock, seen, waits } = await holding($, on);
+    const fail = async (then?: number) => {
+      seen.held.at(-1)!("not json");
+      await flush(clock);
+      if (then !== undefined) {
+        await clock.advance(then);
+        await flush(clock);
+      }
+    };
+    // Three failed holds in a row: the next one is two minutes off, and the
+    // poll asks a minute in.
+    await fail(DOWN_MS);
+    await fail(DOWN_MS);
+    await fail();
+    expect(seen.waitBodies).toHaveLength(waits + 2);
+    // The poll's answer names the chat whose page words wait: the window
+    // opens its hold at once, though the backoff has a minute left.
+    seen.answer = {
+      ...(seen.answer as Status),
+      waitingChat: "me-k3",
+      waitingChatAt: 7,
+    };
+    await clock.advance(DOWN_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(waits + 3);
+  });
+
+  test("a status from an idle window that mirrors a chat asks for the waiting chat", async ($, on) => {
+    const { seen } = await holding($, on);
+    // The turn's end, idle and mirroring: the flag that asks for the mark.
+    expect(seen.statusBodies.at(-1)).toMatchObject({ waitingChat: true });
+  });
+
+  test("a turn's start clears the hold backoff, so the turn's end holds at once", async ($, on) => {
+    const { clock, seen, waits } = await holding($, on);
+    const failNext = async () => {
+      seen.held.at(-1)!("not json");
+      await flush(clock);
+      await clock.advance(DOWN_MS);
+      await flush(clock);
+    };
+    // Three failed holds in a row leave the next one two minutes off.
+    await failNext();
+    await failNext();
+    await failNext();
+    expect(seen.waitBodies).toHaveLength(waits + 2);
+    await $.turn.start({ text: "work", turnId: "t2" });
+    await flush(clock);
+    await $.turn.complete(done("t2"));
+    await flush(clock);
+    // The turn began and ended inside the backoff, and its end holds at once.
+    expect(seen.waitBodies).toHaveLength(waits + 3);
+  });
+
+  test("a post that went clears the hold backoff", async ($, on) => {
+    const { clock, seen, waits } = await holding($, on);
+    const failNext = async () => {
+      seen.held.at(-1)!("not json");
+      await flush(clock);
+      await clock.advance(DOWN_MS);
+      await flush(clock);
+    };
+    // Three failed holds in a row: the next one is two minutes off.
+    await failNext();
+    await failNext();
+    await failNext();
+    // The poll names the chat whose words wait, and the hold opens at once.
+    seen.answer = {
+      ...(seen.answer as Status),
+      waitingChat: "me-k3",
+      waitingChatAt: 7,
+    };
+    await clock.advance(DOWN_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(waits + 3);
+    // A chat frame's look goes, and the post that went clears the backoff: a
+    // failed hold after it waits only the poll's next ask, not four minutes.
+    seen.chatAnswer = { status: 200, body: { ok: true, words: [] } };
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(waits + 4);
+    seen.held.at(-1)!("not json");
+    await flush(clock);
+    await clock.advance(IDLE_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(waits + 5);
+  });
+
+  test("a stuck mark opens one hold, then falls back to the backoff, and a new mark opens at once", async ($, on) => {
+    const { clock, seen, waits } = await holding($, on);
+    const fail = async (then?: number) => {
+      seen.held.at(-1)!("not json");
+      await flush(clock);
+      if (then !== undefined) {
+        await clock.advance(then);
+        await flush(clock);
+      }
+    };
+    // Three failed holds in a row: the next one is two minutes off.
+    await fail(DOWN_MS);
+    await fail(DOWN_MS);
+    await fail();
+    // A mark that stays: the poll names the chat and the same stamp each time,
+    // and the look keeps failing, so nothing is taken.
+    seen.answer = {
+      ...(seen.answer as Status),
+      waitingChat: "me-k3",
+      waitingChatAt: 7,
+    };
+    seen.chatAnswer = { status: 500, body: {} };
+    let answered = waits;
+    const answerHolds = async () => {
+      for (let i = 0; i < QUICK_MAX; i++) {
+        const at = seen.waitBodies.length - 1;
+        if (at < answered) break;
+        answered = at + 1;
+        seen.held[at]!(JSON.stringify({ chat: "me-k3" }));
+        await flush(clock);
+      }
+    };
+    // Ten minutes of clock, a poll a minute: the cue's one hold, then the
+    // ordinary backoff's, which no poll past the cue reopens.
+    for (let minute = 0; minute < 10; minute++) {
+      await clock.advance(IDLE_MS);
+      await flush(clock);
+      await answerHolds();
+    }
+    const holds = seen.waitBodies.length - waits;
+    // Eleven holds in ten minutes, the cue's and the backoff's, never one per
+    // poll: the same mark does not reopen a hold past the cue.
+    expect(holds).toBeLessThanOrEqual(11);
+    expect(holds).toBeGreaterThan(0);
+    // A new mark opens at once again, though the backoff's next hold is far off.
+    const before = seen.waitBodies.length;
+    seen.answer = {
+      ...(seen.answer as Status),
+      waitingChat: "me-k3",
+      waitingChatAt: 8,
+    };
+    await clock.advance(IDLE_MS);
+    await flush(clock);
+    expect(seen.waitBodies).toHaveLength(before + 1);
+  });
+
+  test("a throw inside the held loop is logged, and its poll re-armed", async ($, on) => {
+    const state = { fail: false };
+    const { clock, seen } = await holding($, on, {
+      beforeNow: () => {
+        if (!state.fail) return;
+        state.fail = false;
+        throw new Error("the clock failed");
+      },
+    });
+    const said = seen.logs.length;
+    // The loop is thrown out of as it turns to hear the frame.
+    state.fail = true;
+    seen.held.at(-1)!(JSON.stringify({ chat: "me-k3" }));
+    await flush(clock);
+    expect(seen.logs.slice(said)).toEqual([
+      expect.stringContaining("the held request failed"),
+    ]);
+    // The window is left with the poll, which asks again without a hold.
+    const asks = seen.asks;
+    await clock.advance(IDLE_MS);
+    await flush(clock);
+    expect(seen.asks).toBeGreaterThan(asks);
   });
 
   test("a look that failed is asked again by itself, and the words its answer carries are typed in", async ($, on) => {
@@ -11323,6 +11557,46 @@ describe("a window chat's mirror", () => {
     expect(seen.toasts.at(-1)).toMatch(
       /^dc: could not end this session \(.+\): type \/exit to end it$/,
     );
+  });
+
+  test("a session a launch started ends itself when devcorner refuses its join", async ($, on) => {
+    const w = world(on);
+    const ran = ending(on);
+    await $.session.start(START);
+    // A join devcorner refused: the session exists only to join its chat.
+    w.seen.chatAnswers.push({
+      status: 409,
+      body: {
+        error: "me-k3 is held by a window on MacBook.",
+        code: "laptop-held",
+      },
+    });
+    await $.command.run({ command: "dc", args: "continue me-k3 --launch 7" });
+    await flush(w.clock);
+    expect(ran).toEqual(["exit"]);
+    expect(w.seen.toasts.at(-1)).toBe(
+      "dc: devcorner refused this session's join to me-k3, so it ends",
+    );
+    // The same without a launch runs nothing: no launch started this session.
+    w.seen.chatAnswers.push({
+      status: 409,
+      body: { error: "me-k3 is held by a window.", code: "laptop-held" },
+    });
+    await $.command.run({ command: "dc", args: "continue me-k3" });
+    await flush(w.clock);
+    expect(ran).toEqual(["exit"]);
+    // A server error, and devcorner not reached, leave it up: it may still join.
+    w.seen.chatAnswers.push({ status: 500, body: { error: "not now" } });
+    await $.command.run({ command: "dc", args: "continue me-k3 --launch 8" });
+    await flush(w.clock);
+    // 429 says to ask again, so it does not end the session either.
+    w.seen.chatAnswers.push({ status: 429, body: { error: "slow down" } });
+    await $.command.run({ command: "dc", args: "continue me-k3 --launch 9" });
+    await flush(w.clock);
+    w.seen.chatAnswers.push("down");
+    await $.command.run({ command: "dc", args: "continue me-k3 --launch 10" });
+    await flush(w.clock);
+    expect(ran).toEqual(["exit"]);
   });
 
   test("a chat terminated from the page stops the turn it mirrored and the mirror, and the window posts nothing more", async ($, on) => {
