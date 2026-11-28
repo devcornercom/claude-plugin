@@ -80,7 +80,7 @@ const DEFAULT_URL = "https://devcorner.devcorner.workers.dev";
  * so devcorner shows which windows run a plugin behind the one
  * on disk, and a reload's new copy confirms the version it loaded.
  */
-export const PLUGIN_VERSION = "0.91.0";
+export const PLUGIN_VERSION = "0.91.2";
 
 /** How often an idle conversation asks devcorner while its session waits on its person. */
 export const WAITING_MS = 15_000;
@@ -3861,6 +3861,37 @@ async function inThisWindow<E>($: Engine, e: E): Promise<E> {
   }
 }
 
+/** devcorner's run tool, on a server named for devcorner, as `STARTER` is. */
+const RUNNER = /^mcp__[\w-]*devcorner[\w-]*__run$/i;
+
+/**
+ * The main conversation's title of the window chat this window mirrors
+ * (`run(action: "title")`) while devcorner has taken no session for this
+ * window (`takenClaimOf`), and the call names none and no harness, sent
+ * naming this window as its `harness`, as a start is (`inThisWindow`):
+ * before the conversation's start its connection holds no session, so
+ * devcorner could not tell which window, and so which chat, the title was
+ * for, and refused the first answer's title. Once a session is taken its
+ * own window decides, so the call goes as it was made, as does any other run
+ * call and one that names a session or a harness. The action and a blank
+ * argument are read as devcorner reads them.
+ */
+async function titleInThisWindow<
+  E extends { action?: unknown; session?: unknown; harness?: unknown },
+>($: Engine, e: E): Promise<E> {
+  const said = (value: unknown) =>
+    typeof value === "string" && value.trim() !== "";
+  if (
+    String(e.action ?? "")
+      .trim()
+      .toLowerCase() !== "title"
+  )
+    return e;
+  if (said(e.session) || said(e.harness)) return e;
+  if ((await takenClaimOf($)) !== null) return e;
+  return inThisWindow($, e);
+}
+
 /** How a child's start line ends: its parent, then its role when it has one. */
 const CHILD_END =
   / · child of [a-z][a-z0-9]*-s\d{1,12}(?:@[a-z0-9-]{1,64})?(?: · [^·]+)?$/i;
@@ -6426,12 +6457,18 @@ function takesTyped(typed: TypedPageWords | null, text: string): boolean {
 /** Whether the page's words a prompt the window holds still wait for its turn (`typedFromPage`), bounded as a wake's is (`WAKE_SETTLE_MS`). */
 const typedHolding = (now: number) =>
   typedFromPage !== null && now - typedFromPage.since < WAKE_SETTLE_MS;
-/** A file the person's words from devcorner's page carry, which the window fetches (`ChatFile`) and names by path. */
+/**
+ * A file the person's words from devcorner's page carry, which the window
+ * fetches (`ChatFile`) and names by path; `tag` is the tag the words place it
+ * with, `image 1`, or null when they do not, which an older
+ * devcorner never says.
+ */
 interface PageFile {
   id: string;
   name: string;
   type: string;
   size: number;
+  tag: string | null;
 }
 
 /** A slash command the person sent from devcorner's page: its name, without the slash, and the words after it. */
@@ -9265,6 +9302,7 @@ function pageWordsOf(given: unknown[]): PageWords[] {
               name: file.name,
               type: typeof file.type === "string" ? file.type : "",
               size: typeof file.size === "number" ? file.size : 0,
+              tag: typeof file.tag === "string" ? file.tag : null,
             },
           ]
         : [];
@@ -9372,7 +9410,9 @@ async function fetchPageFile(
  * The words the window types for one message of the person's from the page:
  * its words as devcorner gave them (what it quotes as Markdown, then the
  * words), and after them the paths of the files it sent, fetched first, so
- * Claude Code reads them.
+ * Claude Code reads them. A file devcorner's words place with a tag is named
+ * by it here, `- [image 1] <path>`, so the model reads the tag where the
+ * person put it; any other is a path a line, as it was.
  */
 async function pageText(
   $: Engine,
@@ -9381,7 +9421,11 @@ async function pageText(
 ): Promise<string> {
   const lines: string[] = [];
   for (const file of message.files)
-    lines.push(await fetchPageFile($, thread, file));
+    lines.push(
+      file.tag === null
+        ? await fetchPageFile($, thread, file)
+        : `- [${file.tag}] ${(await fetchPageFile($, thread, file)).replace(/^- /, "")}`,
+    );
   return [
     message.text,
     lines.length === 0 ? "" : `Files sent from devcorner:\n${lines.join("\n")}`,
@@ -13346,6 +13390,11 @@ export const register: Register = (on) => {
     }
     return ran;
   }).catch(($, e, next) => next(e));
+  // The main conversation's title of its window chat names this window, so
+  // it reaches the chat before the conversation has started a session.
+  on("tool.call", { tool: RUNNER }, async ($, e, next) =>
+    next(e.agentId === undefined ? await titleInThisWindow($, e) : e),
+  ).catch(($, e, next) => next(e));
   // A call of the main conversation's that names its session says it too,
   // while the window states none. What the model reads is left as it was.
   on("tool.call", { tool: DEVCORNER_TOOL }, async ($, e, next) => {

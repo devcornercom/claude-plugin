@@ -2,6 +2,14 @@
 
 The devcorner plugin for Claude Code. A new version comes with a release of devcorner, tagged `plugin-vX.Y.Z`.
 
+## 0.91.2 — 2026-11-28
+
+- A window chat's title set in the window's first answer reaches the chat before the conversation has started a devcorner session. The plugin sends the main conversation's `run(action: "title")` that names no session with this window's harness id, as it already does for `start`, so devcorner finds the chat by the window instead of refusing the title.
+
+## 0.91.1 — 2026-11-26
+
+- A file your words place with a tag is named by that tag in the window, `- [image 1] path` under `Files sent from devcorner:`, so Claude reads where you meant each picture or file. devcorner sends the tag; a devcorner that sends none reads as before.
+
 ## 0.91.0 — 2026-11-26
 
 - A window chat's page words reach its window at the next status poll when no held request is open. After three holds in a row that failed or answered at once, the window polls with pauses of a minute, two, four, up to five; a message said from the page meanwhile waited until a hold happened to reopen. A status now names the chat whose page words wait and the mark's stamp (`waitingChat`, `waitingChatAt`), read beside the cached status so a poll costs it nothing while nothing waits; the window opens its held request at once once for each stamp, and a mark that stays, as a word it cannot take, falls back to the ordinary backoff rather than spinning a hold at every poll.

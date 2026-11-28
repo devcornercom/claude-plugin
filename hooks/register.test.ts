@@ -7002,6 +7002,61 @@ describe("the window states the session it runs as (dc-t588)", () => {
     expect(seen.toolCalls.at(-1)).toMatchObject({ harness: "me-h7" });
   });
 
+  test("the main conversation's title names this window as its harness while it names no session, so a title before start reaches the chat", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    await $.session.start(START);
+    await clock.settle();
+    seen.answer = UNTIED;
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "title",
+      title: "Cart fixes",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      action: "title",
+      title: "Cart fixes",
+      harness: "me-h12",
+    });
+    // The action and a blank session read as devcorner reads them.
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: " Title ",
+      title: "Cart fixes",
+      session: "",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ harness: "me-h12" });
+    // One that names a session or a harness, another action, and a
+    // subagent's are sent as they are.
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "title",
+      title: "Cart fixes",
+      session: "acm-s4",
+    });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "title",
+      title: "Cart fixes",
+      harness: "me-h3",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({ harness: "me-h3" });
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "rename",
+      id: "me-k1",
+      title: "Cart fixes",
+    });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "title",
+      title: "Cart fixes",
+      agentId: "agent-1",
+    } as never);
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
+  });
+
   test("its finish ends the claim, a child's finish does not, and devcorner's final refusal forgets it", async ($, on) => {
     const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
     await $.session.start(START);
@@ -7437,6 +7492,29 @@ describe("a devcorner call that names no session goes as this window's", () => {
       session: "acm-s9x",
     });
     expect(seen.toolCalls.at(-1)).toMatchObject({ session: "acm-s9x" });
+  });
+
+  test("a title once devcorner took this window's session names no harness: its session's window decides", async ($, on) => {
+    const { clock, seen } = world(on, { tools: true, home: "/home/ann" });
+    seen.answer = {
+      ...accepted("acm-s4"),
+      thisConversation: { id: "me-h1", name: null },
+    };
+    await $.session.start(START);
+    await clock.settle();
+    seen.toolText = started("acm-s4");
+    await $.tool.call({ tool: "mcp__Devcorner__start", goal: "Coordinate" });
+    await clock.settle();
+    await $.tool.call({
+      tool: "mcp__Devcorner__run",
+      action: "title",
+      title: "Cart fixes",
+    });
+    expect(seen.toolCalls.at(-1)).toMatchObject({
+      action: "title",
+      session: "acm-s4",
+    });
+    expect(seen.toolCalls.at(-1)).not.toHaveProperty("harness");
   });
 
   test("a tool that takes no session is left as it was made", async ($, on) => {
@@ -9724,6 +9802,35 @@ describe("a window chat's mirror", () => {
     await flush(clock);
     expect(seen.submitted).toEqual([
       `Fix that\n\nFiles sent from devcorner:\n- a.png (not fetched: ${refused})\n- b.mov (not fetched: devcorner could not be reached (Failed to connect to dc.test port 80: Connection refused))`,
+    ]);
+  });
+
+  test("a file the page's words place with a tag is named by it, where the person meant it", async ($, on) => {
+    const { clock, seen } = await mirrored($, on, { home: "/Users/ann" });
+    const shot = {
+      id: "dc-k3-a1",
+      name: "shot.png",
+      type: "image/png",
+      size: 70,
+      tag: "image 1",
+    };
+    const said = {
+      status: 200,
+      body: {
+        ok: true,
+        words: [{ key: "w1", text: "this one [image 1] yes", files: [shot] }],
+      },
+    };
+    seen.chatAnswers.push(said, { status: 200, body: "PNG bytes" }, said);
+    await $.turn.start({ text: "work", turnId: "t1" });
+    await flush(clock);
+    await $.turn.complete(done("t1"));
+    await flush(clock);
+    const path =
+      "/Users/ann/.cache/devcorner/laptop-files/conversation-1/dc-k3-a1-shot.png";
+    expect(seen.files.get(path)).toBe("PNG bytes");
+    expect(seen.submitted).toEqual([
+      `this one [image 1] yes\n\nFiles sent from devcorner:\n- [image 1] ${path}`,
     ]);
   });
 
